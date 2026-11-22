@@ -1,0 +1,116 @@
+"""Pydantic schema exports and forward-reference resolution."""
+
+from __future__ import annotations
+
+from app.schemas.crash import (
+    AIAnalysisRunRead,
+    CrashDetailRead,
+    CrashListResponse,
+    CrashPinRequest,
+    CrashPinResponse,
+    CrashReprocessRequest,
+    CrashReprocessResponse,
+    CrashSSEEvent,
+    CrashSummary,
+    CrashUploadResponse,
+    CrashVerdictNewIssue,
+    CrashVerdictRequest,
+)
+from app.schemas.dashboard import (
+    CrashTrendPoint,
+    DashboardKPIs,
+    DashboardResponse,
+    IssueStatusDistributionItem,
+    VerdictDistributionItem,
+)
+from app.schemas.issue import (
+    ClusterListResponse,
+    CrashClusterRead,
+    IssueCreateRequest,
+    IssueDetailRead,
+    IssueListResponse,
+    IssueMergeRequest,
+    IssueRead,
+    IssueSplitRequest,
+    IssueSplitResponse,
+    IssueUpdateRequest,
+)
+from app.schemas.log import (
+    CrashLogRead,
+    LogAroundTimeResponse,
+    LogLine,
+    LogLinesResponse,
+    LogSearchMatch,
+    LogSearchResponse,
+    LogSummaryResponse,
+)
+from app.schemas.project import (
+    ProjectCreate,
+    ProjectCreateResponse,
+    ProjectRead,
+    ProjectRotateKeyResponse,
+    ProjectUpdate,
+)
+from app.schemas.settings import GCReport, GCRequest, SystemSettingsRead, SystemSettingsUpdate
+from app.schemas.symbol import (
+    MissingSymbolQueueItem,
+    ResymbolicateRequest,
+    ResymbolicateResponse,
+    SymbolListResponse,
+    SymbolRead,
+    SymbolUploadResponse,
+)
+
+IssueDetailRead.model_rebuild(_types_namespace={"CrashSummary": CrashSummary})
+
+__all__ = [
+    "AIAnalysisRunRead",
+    "ClusterListResponse",
+    "CrashClusterRead",
+    "CrashDetailRead",
+    "CrashListResponse",
+    "CrashLogRead",
+    "CrashPinRequest",
+    "CrashPinResponse",
+    "CrashReprocessRequest",
+    "CrashReprocessResponse",
+    "CrashSSEEvent",
+    "CrashSummary",
+    "CrashTrendPoint",
+    "CrashUploadResponse",
+    "CrashVerdictNewIssue",
+    "CrashVerdictRequest",
+    "DashboardKPIs",
+    "DashboardResponse",
+    "GCReport",
+    "GCRequest",
+    "IssueCreateRequest",
+    "IssueDetailRead",
+    "IssueListResponse",
+    "IssueMergeRequest",
+    "IssueRead",
+    "IssueSplitRequest",
+    "IssueSplitResponse",
+    "IssueStatusDistributionItem",
+    "IssueUpdateRequest",
+    "LogAroundTimeResponse",
+    "LogLine",
+    "LogLinesResponse",
+    "LogSearchMatch",
+    "LogSearchResponse",
+    "LogSummaryResponse",
+    "MissingSymbolQueueItem",
+    "ProjectCreate",
+    "ProjectCreateResponse",
+    "ProjectRead",
+    "ProjectRotateKeyResponse",
+    "ProjectUpdate",
+    "ResymbolicateRequest",
+    "ResymbolicateResponse",
+    "SymbolListResponse",
+    "SymbolRead",
+    "SymbolUploadResponse",
+    "SystemSettingsRead",
+    "SystemSettingsUpdate",
+    "VerdictDistributionItem",
+]
