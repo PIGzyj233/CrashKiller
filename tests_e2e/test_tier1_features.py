@@ -1489,6 +1489,7 @@ def test_t1_52_cli_upload_symbols_paired_and_recursive(
     proj = httpx.post(
         f"{live_server}/api/v1/projects",
         json={"key": "cli-sym", "name": "CLI Sym"},
+        auth=isolated_env["admin_auth"],
         timeout=10.0,
     ).json()
 
@@ -1537,6 +1538,7 @@ def test_t1_52_cli_upload_symbols_paired_and_recursive(
     syms = httpx.get(
         f"{live_server}/api/v1/symbols",
         params={"project_id": proj["id"]},
+        auth=isolated_env["admin_auth"],
         timeout=10.0,
     ).json()
     assert syms["total"] == 2
@@ -1558,6 +1560,7 @@ def test_t1_53_cli_upload_crash_wait(
     proj = httpx.post(
         f"{live_server}/api/v1/projects",
         json={"key": "cli-crash", "name": "CLI Crash"},
+        auth=isolated_env["admin_auth"],
         timeout=10.0,
     ).json()
     dmp_path = fake_toolchain.fixtures_dir / "cli_test.dmp"
@@ -1603,6 +1606,7 @@ def test_t1_54_cli_upload_symbols_dry_run(
     proj = httpx.post(
         f"{live_server}/api/v1/projects",
         json={"key": "cli-dry", "name": "CLI Dry"},
+        auth=isolated_env["admin_auth"],
         timeout=10.0,
     ).json()
     build_dir = tmp_path / "dry_build"
@@ -1629,6 +1633,7 @@ def test_t1_54_cli_upload_symbols_dry_run(
     syms = httpx.get(
         f"{live_server}/api/v1/symbols",
         params={"project_id": proj["id"]},
+        auth=isolated_env["admin_auth"],
         timeout=10.0,
     ).json()
     assert syms["total"] == 0

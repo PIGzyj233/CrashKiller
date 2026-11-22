@@ -155,27 +155,24 @@ def main():
         sys.stderr.write(f"dump_syms: corrupt or unrecognized binary format: {fpath}\n")
         return 1
 
-    if pdb_meta is None:
-        sys.stderr.write("dump_syms: no valid PDB file provided\n")
-        return 1
-
-    if pdb_meta.get("corrupt"):
+    input_meta = pdb_meta or pe_meta
+    if input_meta.get("corrupt"):
         sys.stderr.write("dump_syms: simulated corrupt PDB error\n")
         return 1
 
-    debug_file = pdb_meta.get("debug_file", "MyApp.pdb")
-    debug_id = pdb_meta.get("debug_id", "46A0ADB3F299A70B4C4C44205044422E1")
-    code_file = (pe_meta or pdb_meta).get("code_file", "MyApp.exe")
-    code_id = (pe_meta or pdb_meta).get("code_id", "64EC878F867C000")
-    os_name = pdb_meta.get("os", "windows")
-    arch = pdb_meta.get("arch", "x86_64")
+    debug_file = input_meta.get("debug_file", "MyApp.pdb")
+    debug_id = input_meta.get("debug_id", "46A0ADB3F299A70B4C4C44205044422E1")
+    code_file = (pe_meta or input_meta).get("code_file", "MyApp.exe")
+    code_id = (pe_meta or input_meta).get("code_id", "64EC878F867C000")
+    os_name = input_meta.get("os", "windows")
+    arch = input_meta.get("arch", "x86_64")
 
     lines = [f"MODULE {os_name} {arch} {debug_id} {debug_file}"]
     if code_id and code_file:
         lines.append(f"INFO CODE_ID {code_id} {code_file}")
     lines.append("FILE 0 src/app_main.cpp")
 
-    funcs = pdb_meta.get("functions") or [
+    funcs = input_meta.get("functions") or [
         {"addr": "1000", "size": "120", "name": "App::Run()", "line": 42},
         {"addr": "1200", "size": "80", "name": "Renderer::SubmitDrawCall(Mesh*)", "line": 148},
     ]
@@ -943,6 +940,8 @@ def isolated_env(
         "REDIS_URL": "memory://",
         "DATA_DIR": str(data_dir),
         "CRASHKILLER_DATA_PATH": str(data_dir),
+        "ADMIN_USERNAME": "e2e-admin",
+        "ADMIN_PASSWORD": "e2e-admin-secret",
         "DUMP_SYMS_BIN": str(fake_toolchain.dump_syms_bin),
         "MINIDUMP_STACKWALK_BIN": str(fake_toolchain.minidump_stackwalk_bin),
         "ENABLE_PUBLIC_SYMBOLS": "false",
@@ -972,6 +971,7 @@ def isolated_env(
         "db_url": db_url,
         "env_vars": env_vars,
         "proc_env": proc_env,
+        "admin_auth": (env_vars["ADMIN_USERNAME"], env_vars["ADMIN_PASSWORD"]),
     }
 
 
@@ -992,13 +992,14 @@ async def app_instance(isolated_env: dict[str, Any]) -> Any:
 
 
 @pytest.fixture
-async def client(app_instance: Any) -> Any:
+async def client(app_instance: Any, isolated_env: dict[str, Any]) -> Any:
     import httpx
 
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app_instance),
         base_url="http://testserver",
         timeout=30.0,
+        auth=isolated_env["admin_auth"],
     ) as ac:
         yield ac
 

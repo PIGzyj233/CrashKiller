@@ -52,6 +52,7 @@ class ResymbolicateRequest(BaseModel):
     project_id: uuid.UUID | None = None
     debug_id: str | None = None
     crash_ids: list[uuid.UUID] | None = None
+    missing_only: bool = False
 
 
 class ResymbolicateResponse(BaseModel):

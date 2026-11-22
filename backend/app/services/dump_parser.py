@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import shutil
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -270,9 +269,7 @@ async def parse_dump(
     project_id: uuid.UUID | str | None = None,
 ) -> ParsedDumpResult:
     """Decompress .dmp.zst if needed, invoke minidump-stackwalk --json, and normalize output."""
-    staging_dir = storage.partition_path("staging") / f"dmp_{uuid.uuid4().hex}"
-    staging_dir.mkdir(parents=True, exist_ok=True)
-    try:
+    with storage.staging_workspace("dmp") as staging_dir:
         dump_str = str(dump_path)
         if "\x00" in dump_str:
             raise DumpParseError(f"NUL byte in dump path is not allowed: {dump_path!r}")
@@ -349,12 +346,14 @@ async def parse_dump(
                 proc.communicate(),
                 timeout=settings.TOOL_TIMEOUT_SECONDS,
             )
-        except TimeoutError as exc:
+        except (TimeoutError, asyncio.CancelledError) as exc:
             try:
                 proc.kill()
             except ProcessLookupError:
                 pass
             await proc.communicate()
+            if isinstance(exc, asyncio.CancelledError):
+                raise
             raise DumpParseError(
                 f"minidump-stackwalk timed out after {settings.TOOL_TIMEOUT_SECONDS}s"
             ) from exc
@@ -372,8 +371,6 @@ async def parse_dump(
             raise DumpParseError(f"Invalid JSON from minidump-stackwalk: {exc}") from exc
 
         return normalize_stackwalk_json(raw_json)
-    finally:
-        shutil.rmtree(staging_dir, ignore_errors=True)
 
 
 __all__ = [

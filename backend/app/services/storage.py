@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
+import fcntl
 import os
 import shutil
 import tempfile
 import uuid
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping
+from contextlib import asynccontextmanager, contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, BinaryIO
@@ -28,10 +31,15 @@ PARTITIONS: tuple[str, ...] = (
     "dumps",
     "staging",
 )
+ACTIVE_CRASH_STATUSES = ("PENDING", "PARSING", "TRIAGING")
 
 
 class StorageError(Exception):
     """Raised on invalid storage paths, traversal attempts, or I/O failures."""
+
+
+class StorageCapacityError(StorageError):
+    """Raised when an artifact cannot be admitted within its storage budget."""
 
 
 class StorageManager:
@@ -61,6 +69,64 @@ class StorageManager:
         path = self.data_dir / partition
         path.mkdir(parents=True, exist_ok=True)
         return path
+
+    @asynccontextmanager
+    async def shared_lock(self, purpose: str) -> AsyncIterator[None]:
+        """Serialize storage operations across the API and workers sharing DATA_DIR."""
+        with (self.data_dir / f".{purpose}.lock").open("ab") as lock:
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    await asyncio.sleep(0.025)
+                else:
+                    break
+            yield
+
+    @contextmanager
+    def staging_workspace(self, prefix: str) -> Iterator[Path]:
+        """Give a conversion a staging directory that GC cannot evict while in use."""
+        root = self.partition_path("staging")
+        workspace = root / f"{prefix}_{uuid.uuid4().hex}"
+        marker = root / f".tmp_{workspace.name}.lock"
+        with marker.open("xb") as lease:
+            fcntl.flock(lease, fcntl.LOCK_EX)
+            try:
+                workspace.mkdir()
+                yield workspace
+            finally:
+                shutil.rmtree(workspace, ignore_errors=True)
+                marker.unlink(missing_ok=True)
+
+    @staticmethod
+    def _staging_in_use(root: Path, workspace: str) -> bool:
+        try:
+            with (root / f".tmp_{workspace}.lock").open("rb") as lease:
+                fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except FileNotFoundError:
+            return False
+        except BlockingIOError:
+            return True
+        return False
+
+    async def require_capacity(
+        self, session: AsyncSession, additional_bytes: Mapping[str, int]
+    ) -> None:
+        """Check application quotas under the shared capacity lock."""
+        db_used = await self.get_db_size_bytes(session)
+        if db_used and db_used >= self.get_partition_quota_bytes("db"):
+            raise StorageCapacityError("PostgreSQL storage quota reached")
+        sizes = await asyncio.to_thread(
+            lambda: {part: self.partition_used_bytes(part)[0] for part in PARTITIONS}
+        )
+        for partition, incoming in additional_bytes.items():
+            if sizes[partition] + incoming > self.get_partition_quota_bytes(partition):
+                raise StorageCapacityError(f"Storage quota reached for {partition}")
+        if (
+            db_used + sum(sizes.values()) + sum(additional_bytes.values())
+            > int(self.settings.TOTAL_DISK_QUOTA_GB * GIB)
+        ):
+            raise StorageCapacityError("CrashKiller total storage quota reached")
 
     def resolve_path(self, rel_path: str | Path) -> Path:
         """Resolve a relative path safely inside data_dir, preventing traversal."""
@@ -421,10 +487,19 @@ class StorageManager:
         force_emergency: bool = False,
     ) -> dict[str, Any]:
         """Run TTL + LRU garbage collection while protecting pinned crashes & issues."""
+        async with self.shared_lock("capacity"):
+            return await self._run_gc(session, force_emergency)
+
+    async def _run_gc(
+        self, session: AsyncSession, force_emergency: bool
+    ) -> dict[str, Any]:
         self.ensure_directories()
         now = datetime.now(UTC)
         emergency = force_emergency or self.is_host_floor_breached()
         threshold_ratio = self.settings.GC_THRESHOLD_PERCENT / 100.0
+
+        def needs_emergency_reclaim() -> bool:
+            return force_emergency or (emergency and self.is_host_floor_breached())
 
         freed_bytes = 0
         deleted_files_count = 0
@@ -438,12 +513,13 @@ class StorageManager:
         staging_cutoff_ts = (now - timedelta(hours=self.settings.STAGING_TTL_HOURS)).timestamp()
         staging_files = self._iter_files_sorted_by_age(staging_root)
         staging_used = sum(sz for _, _, sz in staging_files)
-        staging_target = (
-            0 if emergency else int(self.get_partition_quota_bytes("staging") * threshold_ratio)
-        )
+        staging_target = int(self.get_partition_quota_bytes("staging") * threshold_ratio)
 
         for ts, path, size in staging_files:
-            if ts < staging_cutoff_ts or emergency or staging_used > staging_target:
+            workspace = path.relative_to(staging_root).parts[0]
+            if self._staging_in_use(staging_root, workspace):
+                continue
+            if ts < staging_cutoff_ts or needs_emergency_reclaim() or staging_used > staging_target:
                 removed = self._safe_unlink(path)
                 if removed > 0 or not path.exists():
                     freed_bytes += removed
@@ -482,6 +558,8 @@ class StorageManager:
             .order_by(CrashReport.created_at.asc())
         )
         for report, issue in (await session.execute(candidate_dumps_stmt)).all():
+            if report.status in ACTIVE_CRASH_STATUSES:
+                continue
             dump_cutoff = retention_by_project.get(
                 report.project_id,
                 (default_dump_cutoff, default_log_cutoff),
@@ -512,6 +590,8 @@ class StorageManager:
             .order_by(CrashReport.created_at.asc())
         )
         for log_row, report, issue in (await session.execute(candidate_logs_stmt)).all():
+            if report.status in ACTIVE_CRASH_STATUSES:
+                continue
             log_cutoff = retention_by_project.get(
                 report.project_id,
                 (default_dump_cutoff, default_log_cutoff),
@@ -543,14 +623,10 @@ class StorageManager:
         # 3a. symbols/public_cache (LRU by filesystem access/mod time)
         pub_root = self.partition_path("symbols/public_cache")
         pub_used, _ = self.partition_used_bytes("symbols/public_cache")
-        pub_target = (
-            0
-            if emergency
-            else int(self.get_partition_quota_bytes("symbols/public_cache") * threshold_ratio)
-        )
-        if pub_used > pub_target:
+        pub_target = int(self.get_partition_quota_bytes("symbols/public_cache") * threshold_ratio)
+        if pub_used > pub_target or needs_emergency_reclaim():
             for _, path, size in self._iter_files_sorted_by_age(pub_root):
-                if pub_used <= pub_target:
+                if pub_used <= pub_target and not needs_emergency_reclaim():
                     break
                 removed = self._safe_unlink(path)
                 if removed > 0:
@@ -562,12 +638,8 @@ class StorageManager:
         # 3b. symbols/raw (LRU by Symbol.last_used_at, preserving .sym)
         raw_root = self.partition_path("symbols/raw")
         raw_used, _ = self.partition_used_bytes("symbols/raw")
-        raw_target = (
-            0
-            if emergency
-            else int(self.get_partition_quota_bytes("symbols/raw") * threshold_ratio)
-        )
-        if raw_used > raw_target:
+        raw_target = int(self.get_partition_quota_bytes("symbols/raw") * threshold_ratio)
+        if raw_used > raw_target or needs_emergency_reclaim():
             raw_syms_stmt = (
                 select(Symbol)
                 .where(Symbol.raw_archive_path.is_not(None))
@@ -584,7 +656,7 @@ class StorageManager:
                     pe_counts[pe_key] = pe_counts.get(pe_key, 0) + 1
 
             for sym in raw_syms:
-                if raw_used <= raw_target:
+                if raw_used <= raw_target and not needs_emergency_reclaim():
                     break
                 orig_raw_rel = sym.raw_archive_path
                 pe_raw_rel: str | None = None
@@ -637,9 +709,9 @@ class StorageManager:
                 sym.raw_size = 0
 
             # Sweep any remaining untracked raw files if still above target
-            if raw_used > raw_target:
+            if raw_used > raw_target or needs_emergency_reclaim():
                 for _, path, size in self._iter_files_sorted_by_age(raw_root):
-                    if raw_used <= raw_target:
+                    if raw_used <= raw_target and not needs_emergency_reclaim():
                         break
                     removed = self._safe_unlink(path)
                     if removed > 0:
@@ -659,8 +731,13 @@ class StorageManager:
             + self.get_partition_quota_bytes("dumps")
             + self.get_partition_quota_bytes("staging")
         )
-        total_target = int(
-            min(total_quota_target, int(self.settings.TOTAL_DISK_QUOTA_GB * GIB)) * threshold_ratio
+        db_used = await self.get_db_size_bytes(session)
+        total_target = max(
+            0,
+            min(
+                int(total_quota_target * threshold_ratio),
+                int(self.settings.TOTAL_DISK_QUOTA_GB * GIB * threshold_ratio) - db_used,
+            ),
         )
 
         def _fs_used() -> int:
@@ -670,7 +747,7 @@ class StorageManager:
         dumps_used, _ = self.partition_used_bytes("dumps")
         dumps_target = int(self.get_partition_quota_bytes("dumps") * threshold_ratio)
         fs_used = _fs_used()
-        if emergency or dumps_used > dumps_target or fs_used > total_target:
+        if needs_emergency_reclaim() or dumps_used > dumps_target or fs_used > total_target:
             dumps_lru_stmt = (
                 select(CrashReport, Issue)
                 .outerjoin(Issue, CrashReport.issue_id == Issue.id)
@@ -678,10 +755,16 @@ class StorageManager:
                 .order_by(CrashReport.created_at.asc())
             )
             for report, issue in (await session.execute(dumps_lru_stmt)).all():
-                if not emergency and dumps_used <= dumps_target and fs_used <= total_target:
+                if (
+                    dumps_used <= dumps_target
+                    and fs_used <= total_target
+                    and not needs_emergency_reclaim()
+                ):
                     break
                 if report.is_pinned or (issue is not None and issue.is_pinned):
                     skipped_pinned_dumps.add(report.id)
+                    continue
+                if report.status in ACTIVE_CRASH_STATUSES:
                     continue
                 if report.dump_path:
                     try:
@@ -701,7 +784,7 @@ class StorageManager:
         logs_used, _ = self.partition_used_bytes("logs")
         logs_target = int(self.get_partition_quota_bytes("logs") * threshold_ratio)
         fs_used = _fs_used()
-        if emergency or logs_used > logs_target or fs_used > total_target:
+        if needs_emergency_reclaim() or logs_used > logs_target or fs_used > total_target:
             logs_lru_stmt = (
                 select(CrashLog, CrashReport, Issue)
                 .join(CrashReport, CrashLog.crash_id == CrashReport.id)
@@ -710,10 +793,16 @@ class StorageManager:
                 .order_by(CrashReport.created_at.asc())
             )
             for log_row, report, issue in (await session.execute(logs_lru_stmt)).all():
-                if not emergency and logs_used <= logs_target and fs_used <= total_target:
+                if (
+                    logs_used <= logs_target
+                    and fs_used <= total_target
+                    and not needs_emergency_reclaim()
+                ):
                     break
                 if report.is_pinned or (issue is not None and issue.is_pinned):
                     skipped_pinned_logs.add(log_row.id)
+                    continue
+                if report.status in ACTIVE_CRASH_STATUSES:
                     continue
                 for rel_attr in (log_row.zst_path, log_row.idx_path):
                     if rel_attr:
@@ -831,4 +920,4 @@ class StorageManager:
         }
 
 
-__all__ = ["GIB", "PARTITIONS", "StorageError", "StorageManager"]
+__all__ = ["GIB", "PARTITIONS", "StorageCapacityError", "StorageError", "StorageManager"]

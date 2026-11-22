@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from app.config import Settings
@@ -887,11 +888,13 @@ async def test_verdict_boolean_confidence_rejected_and_expire_on_commit_refreshe
         assert crash_ok.issue_id is not None
 
 
-async def test_finalize_run_concurrent_known_vs_new_issue_no_split_brain(
+@pytest.mark.parametrize("same_report", [True, False], ids=["same-report", "same-cluster"])
+async def test_finalize_run_concurrent_verdicts_share_one_issue(
     tmp_data_dir: Path,
     tmp_path: Path,
+    same_report: bool,
 ) -> None:
-    """Concurrent _finalize_run (NEW_ISSUE vs KNOWN_ISSUE on FIXED issue) must not split-brain."""
+    """Competing AI completions leave one issue for the first reports in a cluster."""
     from app.db.base import Base
     from app.db.session import create_async_engine_from_url
 
@@ -931,6 +934,7 @@ async def test_finalize_run_concurrent_known_vs_new_issue_no_split_brain(
             seed_sess.add(fixed_issue)
             await seed_sess.flush()
 
+            report_count = 1 if same_report else 2
             cluster = CrashCluster(
                 project_id=proj.id,
                 issue_id=None,
@@ -938,24 +942,27 @@ async def test_finalize_run_concurrent_known_vs_new_issue_no_split_brain(
                 signature_frames_json=[{"module": "app.exe", "function": "RaceFn()"}],
                 signature_text="app.exe!RaceFn()",
                 exception_type="EXCEPTION_ACCESS_VIOLATION_READ",
-                crash_count=1,
+                crash_count=report_count,
             )
             seed_sess.add(cluster)
             await seed_sess.flush()
 
-            crash = CrashReport(
-                project_id=proj.id,
-                cluster_id=cluster.id,
-                issue_id=None,
-                status="TRIAGING",
-                app_version="2.0.0",
-                crash_reason="EXCEPTION_ACCESS_VIOLATION_READ",
-                parsed_stacks_json={"threads": [{"thread_index": 0, "frames": []}]},
-                crash_time=datetime.now(UTC),
-            )
-            seed_sess.add(crash)
+            reports = [
+                CrashReport(
+                    project_id=proj.id,
+                    cluster_id=cluster.id,
+                    status="TRIAGING",
+                    app_version="2.0.0",
+                    crash_reason="EXCEPTION_ACCESS_VIOLATION_READ",
+                    parsed_stacks_json={"threads": [{"thread_index": 0, "frames": []}]},
+                    crash_time=datetime.now(UTC),
+                )
+                for _ in range(report_count)
+            ]
+            seed_sess.add_all(reports)
             await seed_sess.commit()
-            crash_id = crash.id
+            crash_id = reports[0].id
+            competing_crash_id = reports[-1].id
             cluster_id = cluster.id
             fixed_issue_id = fixed_issue.id
 
@@ -963,7 +970,7 @@ async def test_finalize_run_concurrent_known_vs_new_issue_no_split_brain(
 
         async with factory() as s1, factory() as s2:
             c1 = await s1.get(CrashReport, crash_id)
-            c2 = await s2.get(CrashReport, crash_id)
+            c2 = await s2.get(CrashReport, competing_crash_id)
             assert c1 is not None and c2 is not None
 
             entered_refresh = asyncio.Event()
@@ -974,20 +981,21 @@ async def test_finalize_run_concurrent_known_vs_new_issue_no_split_brain(
                 res = await orig_refresh(instance, *args, **kwargs)
                 if isinstance(instance, CrashCluster):
                     entered_refresh.set()
-                    await allow_s2_resume.wait()
+                    await asyncio.wait_for(allow_s2_resume.wait(), timeout=5)
                 return res
 
             s2.refresh = _paused_refresh  # type: ignore[method-assign]
 
-            task_known = asyncio.create_task(
+            competing_task = asyncio.create_task(
                 agent._finalize_run(
                     session=s2,
                     crash_report=c2,
                     model_name="mock",
                     run_status="COMPLETED",
                     result_dict={
-                        "verdict": "KNOWN_ISSUE",
-                        "matched_issue_id": fixed_issue_id,
+                        "verdict": "KNOWN_ISSUE" if same_report else "NEW_ISSUE",
+                        "matched_issue_id": fixed_issue_id if same_report else None,
+                        "suggested_title": "Losing New Issue",
                         "confidence": 0.9,
                         "key_log_patterns": ["PAT_X"],
                     },
@@ -997,7 +1005,7 @@ async def test_finalize_run_concurrent_known_vs_new_issue_no_split_brain(
                     duration_ms=5,
                 )
             )
-            await entered_refresh.wait()
+            await asyncio.wait_for(entered_refresh.wait(), timeout=5)
 
             # Run 1 (NEW_ISSUE) commits first while Run 2 is paused after cluster refresh
             await agent._finalize_run(
@@ -1019,7 +1027,7 @@ async def test_finalize_run_concurrent_known_vs_new_issue_no_split_brain(
             )
 
             allow_s2_resume.set()
-            await task_known
+            await competing_task
 
         async with factory() as verify_sess:
             final_crash = await verify_sess.get(CrashReport, crash_id)
@@ -1031,6 +1039,11 @@ async def test_finalize_run_concurrent_known_vs_new_issue_no_split_brain(
             assert final_crash.issue_id != fixed_issue_id
             assert final_cluster.issue_id == final_crash.issue_id
             assert final_crash.ai_verdict == "NEW_ISSUE"
+            other_report = await verify_sess.get(CrashReport, competing_crash_id)
+            assert other_report.issue_id == final_crash.issue_id
+            winning_issue = await verify_sess.get(Issue, final_crash.issue_id)
+            assert winning_issue.crash_count == report_count
+            assert len((await verify_sess.scalars(select(Issue))).all()) == 2
             assert final_fixed.status == "FIXED"
             assert final_fixed.crash_count == 0
             assert final_fixed.log_patterns_json == []

@@ -903,6 +903,7 @@ sys.stdout.write(json.dumps(payload))
                 transport=httpx.ASGITransport(app=app),
                 base_url="http://testserver",
                 timeout=30.0,
+                auth=isolated_env["admin_auth"],
             ) as ac:
                 proj = await helpers.create_project(
                     ac,
@@ -1089,6 +1090,7 @@ def test_t5_17_cli_multiarch_symbol_dir_no_cross_arch_pe_pairing(
     proj = httpx.post(
         f"{live_server}/api/v1/projects",
         json={"key": "t5-cli-arch", "name": "CLI MultiArch"},
+        auth=isolated_env["admin_auth"],
         timeout=10.0,
     ).json()
 
@@ -1138,6 +1140,7 @@ def test_t5_17_cli_multiarch_symbol_dir_no_cross_arch_pe_pairing(
     items = httpx.get(
         f"{live_server}/api/v1/symbols",
         params={"project_id": proj["id"]},
+        auth=isolated_env["admin_auth"],
         timeout=10.0,
     ).json()["items"]
     by_did = {item["debug_id"]: item for item in items}
@@ -1171,6 +1174,7 @@ async def test_t5_18_seed_script_and_cpp_uploader_strict_compile(
                 transport=httpx.ASGITransport(app=app),
                 base_url="http://testserver",
                 timeout=30.0,
+                auth=isolated_env["admin_auth"],
             ) as ac:
                 dash = (await ac.get("/api/v1/dashboard")).json()
                 assert dash["kpis"]["total_crashes"] == 4

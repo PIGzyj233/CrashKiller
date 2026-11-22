@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
 from app.db.models import AIAnalysisRun, CrashLog, CrashReport, Issue, Project, Symbol
-from app.services.storage import PARTITIONS, StorageError, StorageManager
+from app.services.storage import GIB, PARTITIONS, StorageError, StorageManager
 from tests.conftest import make_disk_usage_fn
 
 
@@ -267,6 +267,49 @@ async def test_gc_protects_pinned_crash_and_pinned_issue(
     assert refreshed_l3.zst_path is None
     assert refreshed_l3.idx_path is None
     assert refreshed_l3.digest_json == {"total_lines": 30}
+
+
+async def test_automatic_gc_stops_at_floor_and_protects_active_work(
+    db_session: AsyncSession, tmp_data_dir: Path, test_settings: Settings
+) -> None:
+    paths: list[Path] = []
+    disk_snapshot = namedtuple("DiskUsage", "total used free")
+
+    def disk_usage(_path: Path | str):
+        free = 50 * GIB - 1 + sum(16 for path in paths if not path.is_file())
+        return disk_snapshot(100 * GIB, 100 * GIB - free, free)
+
+    storage = StorageManager(tmp_data_dir, test_settings, disk_usage_fn=disk_usage)
+    project = Project(key="emergency-gc", name="Emergency GC", api_key_hash="test-key")
+    db_session.add(project)
+    await db_session.flush()
+    now = datetime.now(UTC)
+    for index, crash_status in enumerate(("PARSING", "ANALYZED", "ANALYZED")):
+        crash_id = uuid.uuid4()
+        dump_path = f"dumps/{crash_id}/sample.dmp.zst"
+        paths.append(storage.atomic_write_bytes(dump_path, b"s" * 16))
+        db_session.add(
+            CrashReport(
+                id=crash_id,
+                project_id=project.id,
+                app_version="1.0.0",
+                status=crash_status,
+                created_at=now + timedelta(seconds=index),
+                crash_time=now,
+                dump_path=dump_path,
+            )
+        )
+    await db_session.commit()
+
+    with storage.staging_workspace("parse") as workspace:
+        active_input = workspace / "crash.dmp"
+        active_input.write_bytes(b"active")
+        report = await storage.run_gc(db_session)
+        assert active_input.is_file()
+
+    assert report["emergency_triggered"] is True
+    assert report["freed_bytes"] == 16
+    assert [path.is_file() for path in paths] == [True, False, True]
 
 
 async def test_gc_lru_eviction_by_partition_quota(

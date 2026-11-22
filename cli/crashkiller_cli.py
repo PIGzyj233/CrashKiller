@@ -159,7 +159,7 @@ def _wait_for_crash(
     timeout_sec: float,
 ) -> tuple[str, str | None, str | None]:
     events_url = f"{base_url}/api/v1/crashes/{crash_id}/events"
-    detail_url = f"{base_url}/api/v1/crashes/{crash_id}"
+    status_url = f"{base_url}/api/v1/crashes/{crash_id}/status"
     deadline = time.monotonic() + timeout_sec
 
     try:
@@ -195,12 +195,14 @@ def _wait_for_crash(
         pass
 
     while time.monotonic() < deadline:
-        resp = client.get(detail_url, timeout=15.0)
+        resp = client.get(status_url, timeout=15.0)
+        if resp.is_client_error:
+            resp.raise_for_status()
         if resp.status_code == 200:
             data = resp.json()
             st = str(data.get("status") or "")
             if st in TERMINAL_STATUSES:
-                return st, data.get("ai_verdict"), None
+                return st, data.get("ai_verdict"), data.get("error")
         time.sleep(0.2)
 
     raise TimeoutError(f"Timed out waiting for crash {crash_id} to reach terminal status")
@@ -244,10 +246,12 @@ def _cmd_upload_crash(args: argparse.Namespace) -> int:
                 lfh = stack.enter_context(open(lp, "rb"))
                 multipart_files.append(("log_files", (lp.name, lfh, "text/plain")))
 
-            with httpx.Client(timeout=120.0) as client:
+            with httpx.Client(
+                timeout=120.0,
+                headers={"X-API-Key": args.api_key},
+            ) as client:
                 resp = client.post(
                     upload_url,
-                    headers={"X-API-Key": args.api_key},
                     data=data,
                     files=multipart_files,
                 )
@@ -274,12 +278,12 @@ def _cmd_upload_crash(args: argparse.Namespace) -> int:
                     return 1
 
                 if verdict is None and final_status == "ANALYZED":
-                    detail_resp = client.get(
-                        f"{base_url}/api/v1/crashes/{crash_id}",
+                    status_resp = client.get(
+                        f"{base_url}/api/v1/crashes/{crash_id}/status",
                         timeout=15.0,
                     )
-                    if detail_resp.status_code == 200:
-                        verdict = detail_resp.json().get("ai_verdict")
+                    if status_resp.status_code == 200:
+                        verdict = status_resp.json().get("ai_verdict")
 
                 print(f"crash_id={crash_id} status={final_status} ai_verdict={verdict}")
                 if final_status == "FAILED":

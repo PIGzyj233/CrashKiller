@@ -9,13 +9,14 @@ from pathlib import Path
 from typing import Any
 
 from arq.connections import ArqRedis
-from fastapi import FastAPI, Request, status
+from fastapi import Depends, FastAPI, Request, Response, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.api.deps import require_admin, require_symsrv_access
 from app.api.v1.router import api_v1_router
 from app.api.v1.symbols import symsrv_router
 from app.config import Settings, get_settings
@@ -85,6 +86,7 @@ def create_app(
         application.state.openai_client = openai_client
 
         try:
+            dispatcher.start_memory_recovery()
             yield
         finally:
             await dispatcher.drain_and_cancel(timeout=5.0)
@@ -100,7 +102,7 @@ def create_app(
 
     application.add_middleware(
         CORSMiddleware,
-        allow_origins=list(cfg_init.CORS_ORIGINS),
+        allow_origins=[origin for origin in cfg_init.CORS_ORIGINS if origin != "*"],
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -130,7 +132,15 @@ def create_app(
     async def health() -> dict[str, str]:
         return {"status": "ok"}
 
-    application.include_router(symsrv_router)
+    @application.get(
+        "/internal/admin-auth",
+        dependencies=[Depends(require_admin)],
+        include_in_schema=False,
+    )
+    async def admin_auth() -> Response:
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    application.include_router(symsrv_router, dependencies=[Depends(require_symsrv_access)])
     application.include_router(api_v1_router, prefix=cfg_init.API_V1_PREFIX)
 
     return application

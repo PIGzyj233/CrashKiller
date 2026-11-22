@@ -1110,6 +1110,7 @@ def test_t2_51_cli_missing_dump_and_bad_api_key(
     proj = httpx.post(
         f"{live_server}/api/v1/projects",
         json={"key": "cli-bad", "name": "CLI Bad"},
+        auth=isolated_env["admin_auth"],
         timeout=10.0,
     ).json()
 
@@ -1154,6 +1155,7 @@ def test_t2_52_cli_upload_symbols_fail_on_error(
     proj = httpx.post(
         f"{live_server}/api/v1/projects",
         json={"key": "cli-foe", "name": "CLI FOE"},
+        auth=isolated_env["admin_auth"],
         timeout=10.0,
     ).json()
 

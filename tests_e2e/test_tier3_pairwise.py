@@ -556,6 +556,7 @@ def test_t3_11_project_key_auth_and_rotation_http_and_cli(
     proj = httpx.post(
         f"{live_server}/api/v1/projects",
         json={"key": "t3-11-rot", "name": "Rotate HTTP CLI"},
+        auth=isolated_env["admin_auth"],
         timeout=10.0,
     ).json()
     old_key = proj["api_key"]
@@ -583,7 +584,11 @@ def test_t3_11_project_key_auth_and_rotation_http_and_cli(
         == 403
     )
 
-    new_key = httpx.post(f"{live_server}/api/v1/projects/{proj['id']}/rotate-key", timeout=10.0).json()["api_key"]
+    new_key = httpx.post(
+        f"{live_server}/api/v1/projects/{proj['id']}/rotate-key",
+        auth=isolated_env["admin_auth"],
+        timeout=10.0,
+    ).json()["api_key"]
     assert new_key != old_key
 
     cli_old = helpers.run_cli(
@@ -625,7 +630,9 @@ async def test_t3_12_cli_upload_symbols_and_crash_sse_dashboard(
 ) -> None:
     import httpx
 
-    async with httpx.AsyncClient(base_url=live_server, timeout=20.0) as hc:
+    async with httpx.AsyncClient(
+        base_url=live_server, timeout=20.0, auth=isolated_env["admin_auth"]
+    ) as hc:
         proj = (await hc.post("/api/v1/projects", json={"key": "t3-12-cli", "name": "CLI SSE Dash"})).json()
         build_dir = tmp_path / "cli_build"
         did = "312011112222333344445555666677771"
@@ -967,7 +974,9 @@ async def test_t3_20_mixed_encoding_log_via_cli_and_log_apis(
 ) -> None:
     import httpx
 
-    async with httpx.AsyncClient(base_url=live_server, timeout=20.0) as hc:
+    async with httpx.AsyncClient(
+        base_url=live_server, timeout=20.0, auth=isolated_env["admin_auth"]
+    ) as hc:
         proj = (await hc.post("/api/v1/projects", json={"key": "t3-20-cli-enc", "name": "CLI Enc"})).json()
         dmp_path = tmp_path / "enc.dmp"
         fake_toolchain.make_dump(write_to=dmp_path)
@@ -1138,7 +1147,12 @@ def test_t3_24_cli_upload_symbols_pairing_dry_run_and_errors(
 ) -> None:
     import httpx
 
-    proj = httpx.post(f"{live_server}/api/v1/projects", json={"key": "t3-24-cli", "name": "CLI Sym"}, timeout=10.0).json()
+    proj = httpx.post(
+        f"{live_server}/api/v1/projects",
+        json={"key": "t3-24-cli", "name": "CLI Sym"},
+        auth=isolated_env["admin_auth"],
+        timeout=10.0,
+    ).json()
     bdir = tmp_path / "sym_bundle"
     fake_toolchain.make_pe("a.exe", "CA", "a.pdb", "DA1111111111111111111111111111111", write_to=bdir / "a.exe")
     fake_toolchain.make_pdb("a.pdb", "DA1111111111111111111111111111111", "a.exe", "CA", write_to=bdir / "a.pdb")
@@ -1155,7 +1169,13 @@ def test_t3_24_cli_upload_symbols_pairing_dry_run_and_errors(
         env=isolated_env["proc_env"],
     )
     assert dry.returncode == 0
-    assert httpx.get(f"{live_server}/api/v1/symbols", params={"project_id": proj["id"]}, timeout=10.0).json()["total"] == 0
+    snapshots = httpx.get(
+        f"{live_server}/api/v1/symbols",
+        params={"project_id": proj["id"]},
+        auth=isolated_env["admin_auth"],
+        timeout=10.0,
+    ).json()
+    assert snapshots["total"] == 0
 
     real = helpers.run_cli(
         [
@@ -1165,7 +1185,12 @@ def test_t3_24_cli_upload_symbols_pairing_dry_run_and_errors(
         env=isolated_env["proc_env"],
     )
     assert real.returncode == 0
-    items = httpx.get(f"{live_server}/api/v1/symbols", params={"project_id": proj["id"]}, timeout=10.0).json()["items"]
+    items = httpx.get(
+        f"{live_server}/api/v1/symbols",
+        params={"project_id": proj["id"]},
+        auth=isolated_env["admin_auth"],
+        timeout=10.0,
+    ).json()["items"]
     assert len(items) == 3
     by_name = {s["debug_file"]: s for s in items}
     assert by_name["a.pdb"]["has_pe_unwind"] is True

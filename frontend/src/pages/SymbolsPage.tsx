@@ -601,6 +601,7 @@ export function SymbolsPage() {
                 onClick={() =>
                   resymMutation.mutate({
                     project_id: selectedProjectId || undefined,
+                    missing_only: true,
                   })
                 }
                 className="inline-flex items-center gap-1.5 rounded-md bg-indigo-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-indigo-700 disabled:opacity-50"

@@ -10,6 +10,7 @@ from typing import Any
 
 import httpx
 import pytest
+from sqlalchemy import event
 
 from app.config import Settings, get_settings
 from app.main import create_app
@@ -209,6 +210,8 @@ async def api_harness(tmp_path: Path):
         REDIS_URL="memory://",
         DATA_DIR=str(data_dir),
         CRASHKILLER_DATA_PATH=str(data_dir),
+        ADMIN_USERNAME="fixture-admin",
+        ADMIN_PASSWORD="fixture-admin-secret",
         ARCHIVE_RAW_SYMBOLS=True,
         HOST_SAFETY_FLOOR_GB=50.0,
         TOTAL_DISK_QUOTA_GB=150.0,
@@ -231,6 +234,7 @@ async def api_harness(tmp_path: Path):
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app),
             base_url="http://testserver",
+            auth=(settings.ADMIN_USERNAME, settings.ADMIN_PASSWORD.get_secret_value()),
         ) as client:
             yield SimpleNamespace(
                 app=app,
@@ -246,6 +250,144 @@ async def api_harness(tmp_path: Path):
 
 async def _drain(harness: Any) -> None:
     await harness.app.state.dispatcher.drain_and_cancel(timeout=5.0)
+
+
+async def test_over_quota_uploads_do_not_leave_artifacts(api_harness: Any) -> None:
+    client = api_harness.client
+    project = (await client.post("/api/v1/projects", json={"key": "quota", "name": "Quota"})).json()
+    response = await client.put("/api/v1/settings", json={"total_disk_quota_gb": 16 / (1024**3)})
+    assert response.status_code == 200
+
+    response = await client.post(
+        "/api/v1/crashes/upload",
+        data={"project_key": "quota", "app_version": "1.0"},
+        files={"dump_file": ("sample.dmp", bytes(range(256)))},
+        headers={"X-API-Key": project["api_key"]},
+    )
+
+    assert response.status_code == 507
+    assert not list((api_harness.data_dir / "dumps").rglob("*.zst"))
+    assert (await client.get("/api/v1/crashes")).json()["total"] == 0
+    response = await client.put(
+        "/api/v1/settings",
+        json={"total_disk_quota_gb": 150, "symbols_sym_quota_gb": 16 / (1024**3)},
+    )
+    assert response.status_code == 200
+    response = await client.post(
+        "/api/v1/symbols/upload",
+        data={"project_key": "quota", "app_version": "1.0"},
+        files={"pdb_file": ("sample.pdb", b"PDB fixture")},
+        headers={"X-API-Key": project["api_key"]},
+    )
+    assert response.status_code == 507
+    assert not list((api_harness.data_dir / "symbols" / "sym").rglob("*.sym"))
+    assert (await client.get("/api/v1/symbols")).json()["total"] == 0
+
+
+async def test_admin_auth_denies_anonymous_access_and_untrusted_origin(
+    api_harness: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = api_harness.client
+    assert (await client.get("/health", auth=None)).status_code == 200
+    anonymous = await client.get("/api/v1/projects", auth=None)
+    assert anonymous.status_code == 401
+    assert anonymous.headers["www-authenticate"] == 'Basic realm="CrashKiller", charset="UTF-8"'
+    assert (await client.get("/internal/admin-auth", auth=None)).status_code == 401
+    assert (await client.get("/internal/admin-auth")).status_code == 204
+    assert (await client.post("/api/v1/settings/gc", auth=None)).status_code == 401
+    assert (await client.get("/api/v1/settings", auth=("wrong", "wrong"))).status_code == 401
+    assert (await client.get("/symsrv/pingme.txt", auth=None)).status_code == 401
+
+    project = {"key": "auth-origin", "name": "Auth Origin"}
+    assert (
+        await client.post(
+            "/api/v1/projects", json=project, headers={"Origin": "https://other.example"}
+        )
+    ).status_code == 403
+    assert (
+        await client.post(
+            "/api/v1/projects", json=project, headers={"Origin": "http://testserver"}
+        )
+    ).status_code == 201
+
+    monkeypatch.setattr(api_harness.settings, "ALLOW_UNAUTHENTICATED_SYMSRV", True)
+    assert (await client.get("/symsrv/pingme.txt", auth=None)).status_code == 200
+    monkeypatch.setattr(api_harness.settings, "ADMIN_USERNAME", "")
+    assert (await client.get("/api/v1/projects")).status_code == 403
+    assert (await client.get("/internal/admin-auth")).status_code == 403
+
+
+async def test_crash_status_scopes_project_keys_and_closes_db_before_sse_send(
+    api_harness: Any,
+) -> None:
+    client = api_harness.client
+    owner = (
+        await client.post(
+            "/api/v1/projects",
+            json={"key": "owner", "name": "Owner", "settings_json": {"ai_triage_mode": "MANUAL"}},
+        )
+    ).json()
+    other = (await client.post("/api/v1/projects", json={"key": "other", "name": "Other"})).json()
+    own_key = {"X-API-Key": owner["api_key"]}
+    uploaded = await client.post(
+        "/api/v1/crashes/upload",
+        auth=None,
+        headers=own_key,
+        data={"project_key": owner["key"], "app_version": "1.0.0"},
+        files={"dump_file": ("sample.dmp", b"MDMP_TEST_FIXTURE")},
+    )
+    assert uploaded.status_code == 202
+    crash_id = uploaded.json()["crash_id"]
+    await _drain(api_harness)
+
+    detail_url = f"/api/v1/crashes/{crash_id}"
+    status_url = f"{detail_url}/status"
+    event_url = f"{detail_url}/events"
+    assert (await client.get(detail_url, auth=None, headers=own_key)).status_code == 401
+    for path in (status_url, event_url):
+        assert (await client.get(path, auth=None)).status_code == 401
+        wrong_key = {"X-API-Key": other["api_key"]}
+        assert (await client.get(path, auth=None, headers=wrong_key)).status_code == 403
+
+    snapshot = await client.get(status_url, auth=None, headers=own_key)
+    assert snapshot.status_code == 200
+    assert snapshot.headers["cache-control"] == "no-store"
+    assert snapshot.json() == {
+        "crash_id": crash_id,
+        "status": "ANALYZED",
+        "ai_verdict": None,
+        "error": None,
+    }
+
+    pool = api_harness.app.state.engine.sync_engine.pool
+    checked_out_count = 0
+    counts_during_send: list[int] = []
+
+    @event.listens_for(pool, "checkout")
+    def count_checkout(*_: Any) -> None:
+        nonlocal checked_out_count
+        checked_out_count += 1
+
+    @event.listens_for(pool, "checkin")
+    def count_checkin(*_: Any) -> None:
+        nonlocal checked_out_count
+        checked_out_count -= 1
+
+    async def observe_send(scope: Any, receive: Any, send: Any) -> None:
+        async def record(message: dict[str, Any]) -> None:
+            if message["type"] == "http.response.body" and message.get("body"):
+                counts_during_send.append(checked_out_count)
+            await send(message)
+
+        await api_harness.app(scope, receive, record)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=observe_send), base_url="http://testserver"
+    ) as machine_client:
+        response = await machine_client.get(event_url, headers=own_key)
+    assert response.status_code == 200
+    assert '"status": "ANALYZED"' in response.text
+    assert counts_during_send == [0]
 
 
 async def test_health_projects_auth_and_key_rotation(api_harness: Any) -> None:

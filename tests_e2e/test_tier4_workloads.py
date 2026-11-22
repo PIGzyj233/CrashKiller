@@ -21,7 +21,9 @@ async def test_t4_01_ci_build_publish_to_customer_crash_and_kb(
 ) -> None:
     import httpx
 
-    async with httpx.AsyncClient(base_url=live_server, timeout=30.0) as hc:
+    async with httpx.AsyncClient(
+        base_url=live_server, timeout=30.0, auth=isolated_env["admin_auth"]
+    ) as hc:
         proj = (
             await hc.post("/api/v1/projects", json={"key": "studio-game", "name": "Studio Game"})
         ).json()
@@ -686,7 +688,9 @@ async def test_t4_08_multiproject_isolation_and_key_compromise_recovery(
 ) -> None:
     import httpx
 
-    async with httpx.AsyncClient(base_url=live_server, timeout=20.0) as hc:
+    async with httpx.AsyncClient(
+        base_url=live_server, timeout=20.0, auth=isolated_env["admin_auth"]
+    ) as hc:
         p_win = (await hc.post("/api/v1/projects", json={"key": "game-win", "name": "Game Win"})).json()
         p_mac = (await hc.post("/api/v1/projects", json={"key": "editor-mac", "name": "Editor Mac"})).json()
 

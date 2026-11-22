@@ -6,7 +6,7 @@ import json
 from functools import lru_cache
 from typing import Annotated, Any, Literal
 
-from pydantic import BeforeValidator
+from pydantic import BeforeValidator, SecretStr
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
@@ -35,7 +35,7 @@ StrList = Annotated[list[str], NoDecode, BeforeValidator(_parse_str_list)]
 
 
 class Settings(BaseSettings):
-    """Typed runtime configuration covering all 42 .env.example variables."""
+    """Typed runtime configuration loaded from environment variables and .env."""
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -48,8 +48,11 @@ class Settings(BaseSettings):
     APP_VERSION: str = "0.1.0"
     DEBUG: bool = False
     API_V1_PREFIX: str = "/api/v1"
-    CORS_ORIGINS: StrList = ["*"]
+    CORS_ORIGINS: StrList = []
     HTTP_PORT: int = 8080
+    ADMIN_USERNAME: str = ""
+    ADMIN_PASSWORD: SecretStr = SecretStr("")
+    ALLOW_UNAUTHENTICATED_SYMSRV: bool = False
 
     # --- PostgreSQL ---
     POSTGRES_USER: str = "crashkiller"

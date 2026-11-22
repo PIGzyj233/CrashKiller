@@ -21,7 +21,7 @@ from fastapi import (
     status,
 )
 from fastapi.responses import PlainTextResponse, StreamingResponse
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import (
@@ -43,12 +43,13 @@ from app.schemas.symbol import (
     SymbolUploadResponse,
 )
 from app.services import symbol_service
-from app.services.storage import StorageError, StorageManager
+from app.services.storage import StorageCapacityError, StorageError, StorageManager
 from app.services.symbol_service import (
     SymbolConversionError,
     resolve_symsrv_file,
     stream_decompressed_zst,
 )
+from app.workers.jobs import ACTIVE_CRASH_STATUSES, crash_has_job, stage_crash_job
 from app.workers.worker import TaskDispatcher
 
 router = APIRouter(prefix="/symbols", tags=["symbols"])
@@ -232,16 +233,15 @@ async def upload_symbol(
             detail="app_version must not exceed 128 characters",
         )
 
-    pdb_bytes = await pdb_file.read()
     pdb_name = _sanitize_upload_basename(pdb_file.filename, "upload.pdb")
 
-    pe_bytes: bytes | None = None
     pe_name: str | None = None
     if pe_file is not None:
-        pe_bytes = await pe_file.read()
         pe_name = _sanitize_upload_basename(pe_file.filename, "upload.dll")
 
+    project_uuid = project.id
     effective_app, eff_storage = await get_effective_storage(session, storage, base_settings)
+    await session.rollback()
     exec_fn = getattr(request.app.state, "exec_fn", None)
 
     try:
@@ -249,14 +249,19 @@ async def upload_symbol(
             session=session,
             storage=eff_storage,
             settings=effective_app,
-            project_id=project.id,
+            project_id=project_uuid,
             app_version=cleaned_version,
             pdb_filename=pdb_name,
-            pdb_bytes_or_path=pdb_bytes,
+            pdb_bytes_or_path=pdb_file.file,
             pe_filename=pe_name,
-            pe_bytes_or_path=pe_bytes,
+            pe_bytes_or_path=pe_file.file if pe_file is not None else None,
             exec_fn=exec_fn,
         )
+    except (StorageCapacityError, OSError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_507_INSUFFICIENT_STORAGE,
+            detail=str(exc),
+        ) from exc
     except SymbolConversionError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -341,43 +346,67 @@ async def resymbolicate_crashes(
     payload: ResymbolicateRequest,
     session: AsyncSession = Depends(get_db),
     dispatcher: TaskDispatcher = Depends(get_dispatcher),
+    storage: StorageManager = Depends(get_storage),
 ) -> ResymbolicateResponse:
     if payload.crash_ids is not None and len(payload.crash_ids) == 0:
         return ResymbolicateResponse(queued_count=0, crash_ids=[])
 
-    stmt = select(CrashReport.id, CrashReport.missing_symbols_json).where(
-        CrashReport.dump_path.is_not(None)
-    )
-    if payload.crash_ids is not None:
-        stmt = stmt.where(CrashReport.id.in_(payload.crash_ids))
-    if payload.project_id is not None:
-        stmt = stmt.where(CrashReport.project_id == payload.project_id)
-
-    rows = (await session.execute(stmt)).all()
-    target_debug_id = payload.debug_id.strip().upper() if payload.debug_id else None
-
-    matched_ids: list[uuid.UUID] = []
-    for row_id, missing_json in rows:
-        if target_debug_id:
-            if not any(
-                isinstance(entry, dict)
-                and str(entry.get("debug_id") or "").strip().upper() == target_debug_id
-                for entry in (missing_json or [])
-            ):
-                continue
-        matched_ids.append(row_id)
-
-    if matched_ids:
-        await dispatcher.enqueue(
-            "resymbolicate",
-            [str(cid) for cid in matched_ids],
-            str(payload.project_id) if payload.project_id else None,
-            payload.debug_id,
+    async with storage.shared_lock("capacity"):
+        stmt = select(CrashReport.id, CrashReport.missing_symbols_json).where(
+            CrashReport.dump_path.is_not(None),
+            CrashReport.status.notin_(ACTIVE_CRASH_STATUSES),
+            ~crash_has_job(),
         )
+        if payload.crash_ids is not None:
+            stmt = stmt.where(CrashReport.id.in_(payload.crash_ids))
+        if payload.project_id is not None:
+            stmt = stmt.where(CrashReport.project_id == payload.project_id)
+
+        rows = (await session.execute(stmt)).all()
+        target_debug_id = payload.debug_id.strip().upper() if payload.debug_id else None
+
+        matched_ids: list[uuid.UUID] = []
+        for row_id, missing_json in rows:
+            if payload.missing_only or target_debug_id:
+                if not any(
+                    isinstance(entry, dict)
+                    and (
+                        not target_debug_id
+                        or str(entry.get("debug_id") or "").strip().upper() == target_debug_id
+                    )
+                    for entry in (missing_json or [])
+                ):
+                    continue
+            matched_ids.append(row_id)
+
+        queued_ids: list[uuid.UUID] = []
+        job_ids: list[uuid.UUID] = []
+        for start in range(0, len(matched_ids), 100):
+            batch = matched_ids[start:start + 100]
+            reserved = await session.scalars(
+                update(CrashReport)
+                .where(
+                    CrashReport.id.in_(batch),
+                    CrashReport.dump_path.is_not(None),
+                    CrashReport.status.notin_(ACTIVE_CRASH_STATUSES),
+                    ~crash_has_job(),
+                )
+                .values(status="PENDING")
+                .returning(CrashReport.id)
+            )
+            for crash_id in reserved:
+                queued_ids.append(crash_id)
+                job_ids.append(stage_crash_job(session, crash_id, "resymbolicate"))
+
+        if queued_ids:
+            await session.commit()
+
+    if job_ids:
+        await dispatcher.kick_crash_jobs(job_ids)
 
     return ResymbolicateResponse(
-        queued_count=len(matched_ids),
-        crash_ids=matched_ids,
+        queued_count=len(queued_ids),
+        crash_ids=queued_ids,
     )
 
 

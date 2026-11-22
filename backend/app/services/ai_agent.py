@@ -1025,6 +1025,8 @@ class AITriageAgent:
         crash_report: CrashReport,
         settings_override: dict[str, Any] | None = None,
         openai_client: Any | None = None,
+        *,
+        commit: bool = True,
     ) -> AIAnalysisRun:
         """Execute the ReAct tool-calling triage loop and persist verdict + trace."""
         start_mono = time.monotonic()
@@ -1056,6 +1058,7 @@ class AITriageAgent:
                 prompt_tokens=0,
                 completion_tokens=0,
                 duration_ms=max(0, int((time.monotonic() - start_mono) * 1000)),
+                commit=commit,
             )
 
         project = await session.get(Project, crash_report.project_id)
@@ -1246,6 +1249,7 @@ class AITriageAgent:
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             duration_ms=duration_ms,
+            commit=commit,
         )
 
     async def _finalize_run(
@@ -1260,9 +1264,10 @@ class AITriageAgent:
         prompt_tokens: int,
         completion_tokens: int,
         duration_ms: int,
+        commit: bool = True,
     ) -> AIAnalysisRun:
         await session.flush()
-        await session.refresh(crash_report)
+        await session.refresh(crash_report, with_for_update=True)
 
         verdict = str(result_dict.get("verdict") or "NEEDS_REVIEW")
         confidence = float(result_dict.get("confidence") or 0.0)
@@ -1279,27 +1284,31 @@ class AITriageAgent:
         if cluster is not None:
             await session.refresh(cluster)
 
-        async def _transition_crash_issue(target_id: int) -> bool:
-            if old_issue_id == target_id:
+        async def _transition_crash_issue(target_id: int, previous_id: int | None) -> bool:
+            if previous_id == target_id:
                 await session.refresh(crash_report, attribute_names=["issue_id"])
                 return False
             cond_old = (
                 CrashReport.issue_id.is_(None)
-                if old_issue_id is None
-                else CrashReport.issue_id == old_issue_id
+                if previous_id is None
+                else CrashReport.issue_id == previous_id
             )
             upd_res = await session.execute(
                 update(CrashReport)
-                .where(CrashReport.id == crash_report.id, cond_old)
+                .where(
+                    CrashReport.id == crash_report.id,
+                    cond_old,
+                    CrashReport.is_human_verified.is_(False),
+                )
                 .values(issue_id=target_id)
             )
             if (upd_res.rowcount or 0) <= 0:
                 await session.refresh(crash_report, attribute_names=["issue_id"])
                 return False
-            if old_issue_id is not None:
+            if previous_id is not None:
                 await session.execute(
                     update(Issue)
-                    .where(Issue.id == old_issue_id)
+                    .where(Issue.id == previous_id)
                     .values(
                         crash_count=case(
                             (Issue.crash_count > 0, Issue.crash_count - 1),
@@ -1307,7 +1316,7 @@ class AITriageAgent:
                         )
                     )
                 )
-                old_issue = await session.get(Issue, old_issue_id)
+                old_issue = await session.get(Issue, previous_id)
                 if old_issue is not None:
                     await session.refresh(old_issue, attribute_names=["crash_count"])
             await session.execute(
@@ -1318,19 +1327,23 @@ class AITriageAgent:
             await session.refresh(crash_report, attribute_names=["issue_id"])
             return True
 
-        async def _assign_cluster_issue_if_empty(target_issue_id: int) -> None:
+        async def _assign_cluster_issue_if_empty(target_issue_id: int) -> int | None:
             if cluster is None:
-                return
+                return None
             await session.execute(
                 update(CrashCluster)
                 .where(CrashCluster.id == cluster.id, CrashCluster.issue_id.is_(None))
                 .values(issue_id=target_issue_id)
             )
             await session.refresh(cluster, attribute_names=["issue_id"])
+            return cluster.issue_id
 
         should_write_verdict = True
         matched_issue: Issue | None = None
-        if verdict in {"KNOWN_ISSUE", "REGRESSION"}:
+        if crash_report.is_human_verified:
+            result_dict["matched_issue_id"] = crash_report.issue_id
+            should_write_verdict = False
+        elif verdict in {"KNOWN_ISSUE", "REGRESSION"}:
             if (
                 matched_issue_id is not None
                 and not isinstance(matched_issue_id, bool)
@@ -1349,7 +1362,7 @@ class AITriageAgent:
                 result_dict["verdict"] = "NEEDS_REVIEW"
                 result_dict["matched_issue_id"] = None
             else:
-                await _transition_crash_issue(matched_issue.id)
+                await _transition_crash_issue(matched_issue.id, old_issue_id)
                 await session.refresh(crash_report)
                 won_or_already_owned = crash_report.issue_id == matched_issue.id
                 if won_or_already_owned:
@@ -1400,7 +1413,7 @@ class AITriageAgent:
                     existing_issue is not None
                     and existing_issue.project_id == crash_report.project_id
                 ):
-                    await _transition_crash_issue(existing_issue.id)
+                    await _transition_crash_issue(existing_issue.id, old_issue_id)
                     await session.refresh(crash_report)
                     if crash_report.issue_id == existing_issue.id:
                         await session.refresh(existing_issue)
@@ -1437,12 +1450,20 @@ class AITriageAgent:
                 )
                 session.add(new_issue)
                 await session.flush()
-                transitioned = await _transition_crash_issue(new_issue.id)
+                transitioned = await _transition_crash_issue(new_issue.id, old_issue_id)
                 await session.refresh(crash_report)
                 if transitioned:
-                    await session.refresh(new_issue, attribute_names=["crash_count"])
-                    result_dict["matched_issue_id"] = new_issue.id
-                    await _assign_cluster_issue_if_empty(new_issue.id)
+                    final_issue_id = new_issue.id
+                    assigned_issue_id = await _assign_cluster_issue_if_empty(new_issue.id)
+                    if assigned_issue_id is not None and assigned_issue_id != new_issue.id:
+                        winner = await session.get(Issue, assigned_issue_id)
+                        if winner is not None and winner.project_id == crash_report.project_id:
+                            if await _transition_crash_issue(winner.id, new_issue.id):
+                                final_issue_id = winner.id
+                                if _as_utc(winner.last_seen_at) < crash_ts:
+                                    winner.last_seen_at = crash_ts
+                                await session.delete(new_issue)
+                    result_dict["matched_issue_id"] = final_issue_id
                 elif crash_report.issue_id is not None:
                     await session.delete(new_issue)
                     should_write_verdict = False
@@ -1470,9 +1491,10 @@ class AITriageAgent:
         )
         session.add(run)
         await session.flush()
-        await session.commit()
-        await session.refresh(run)
-        await session.refresh(crash_report)
+        if commit:
+            await session.commit()
+            await session.refresh(run)
+            await session.refresh(crash_report)
         return run
 
 

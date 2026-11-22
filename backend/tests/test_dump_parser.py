@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -320,3 +322,36 @@ async def test_parse_dump_corrupt_zst_and_malformed_json_fields(
     assert norm.os_version is not None and len(norm.os_version) == 255
     assert norm.parsed_stacks_json["threads"][0]["frames"][0]["frame_index"] == 0
     assert norm.parsed_stacks_json["threads"][0]["frames"][0]["registers"] == {}
+
+
+async def test_cancelling_stackwalk_stops_and_reaps_process(
+    tmp_path: Path, storage_manager: StorageManager, test_settings: Settings,
+) -> None:
+    running = asyncio.Event()
+    killed = asyncio.Event()
+    reaped = asyncio.Event()
+    raw_dump = tmp_path / "sample.dmp"
+    raw_dump.write_bytes(b"mock stackwalk input")
+
+    class Stackwalk:
+        async def communicate(self) -> tuple[bytes, bytes]:
+            running.set()
+            await killed.wait()
+            reaped.set()
+            return b"", b""
+
+        def kill(self) -> None:
+            killed.set()
+
+    async def start_stackwalk(*args: str, **kwargs: Any) -> Stackwalk:
+        return Stackwalk()
+
+    parse = asyncio.create_task(
+        parse_dump(raw_dump, storage_manager, test_settings, exec_fn=start_stackwalk),
+    )
+    await asyncio.wait_for(running.wait(), timeout=2)
+    parse.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(parse, timeout=2)
+    assert killed.is_set() and reaped.is_set()
+    assert not list(storage_manager.partition_path("staging").iterdir())

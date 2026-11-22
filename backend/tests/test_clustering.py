@@ -616,6 +616,33 @@ async def test_cluster_crash_idempotent_on_reprocess_and_resymbolicate(
     assert r2.cluster.crash_count == 1
 
 
+async def test_resymbolication_preserves_human_assignment(db_session: AsyncSession) -> None:
+    project = await _create_project(db_session, key="human-resymbolication")
+    crash = CrashReport(
+        project_id=project.id,
+        status="ANALYZED",
+        app_version="1.0.0",
+        crash_reason="AV",
+        parsed_stacks_json=_make_stacks(
+            [_frame("Core.dll", None, module_offset="0x1000", missing_symbols=True)]
+        ),
+    )
+    db_session.add(crash)
+    original = await cluster_crash(db_session, crash, project)
+    await apply_human_verdict(
+        db_session, crash, action="create_issue", new_issue_data={"title": "Reviewed"},
+    )
+    reviewed_issue_id = crash.issue_id
+
+    crash.parsed_stacks_json = _make_stacks([_frame("Core.dll", "Core::AllocateBuffer")])
+    result = await cluster_crash(db_session, crash, project, triage_mode="ALWAYS")
+
+    assert result.cluster.id != original.cluster.id
+    assert reviewed_issue_id is not None and crash.issue_id == reviewed_issue_id
+    assert crash.is_human_verified and not result.should_run_ai
+    assert result.issue is not None and result.issue.crash_count == 1
+
+
 async def test_apply_human_verdict_confirm_assign_and_create_issue(
     db_session: AsyncSession,
 ) -> None:

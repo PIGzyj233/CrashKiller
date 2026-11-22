@@ -6,9 +6,11 @@ import hashlib
 import hmac
 import secrets
 import uuid
+from base64 import b64decode
 from collections.abc import AsyncGenerator
 
 from fastapi import Depends, HTTPException, Request, status
+from fastapi.security.utils import get_authorization_scheme_param
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -32,6 +34,53 @@ def get_app_settings(request: Request) -> Settings:
     """Return app settings stored on app.state or fallback to get_settings()."""
     state_settings = getattr(request.app.state, "settings", None)
     return state_settings if state_settings is not None else get_settings()
+
+
+async def require_admin(request: Request) -> None:
+    """Authorize browser and management requests against deployment credentials."""
+    settings = get_app_settings(request)
+    username = settings.ADMIN_USERNAME
+    password = settings.ADMIN_PASSWORD.get_secret_value()
+    if not username.strip() or not password.strip():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Configure ADMIN_USERNAME and ADMIN_PASSWORD to enable admin access",
+        )
+
+    scheme, encoded = get_authorization_scheme_param(request.headers.get("Authorization"))
+    if scheme.lower() == "basic":
+        try:
+            provided = b64decode(encoded.strip(), validate=True)
+        except ValueError:
+            pass
+        else:
+            expected = f"{username}:{password}".encode()
+            if hmac.compare_digest(provided, expected):
+                _check_admin_origin(request, settings)
+                return
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Admin authentication required",
+        headers={"WWW-Authenticate": 'Basic realm="CrashKiller", charset="UTF-8"'},
+    )
+
+
+def _check_admin_origin(request: Request, settings: Settings) -> None:
+    """Keep browser state changes within the app or explicitly trusted origins."""
+    origin = request.headers.get("Origin")
+    if not origin or request.method in {"GET", "HEAD", "OPTIONS"}:
+        return
+    host = request.url.netloc
+    if origin in {f"http://{host}", f"https://{host}"}:
+        return
+    if origin != "*" and origin in settings.CORS_ORIGINS:
+        return
+    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Untrusted request origin")
+
+
+async def require_symsrv_access(request: Request) -> None:
+    if not get_app_settings(request).ALLOW_UNAUTHENTICATED_SYMSRV:
+        await require_admin(request)
 
 
 def get_storage(request: Request) -> StorageManager:
@@ -150,5 +199,7 @@ __all__ = [
     "get_event_bus_dep",
     "get_storage",
     "hash_api_key",
+    "require_admin",
+    "require_symsrv_access",
     "verify_project_upload_auth",
 ]

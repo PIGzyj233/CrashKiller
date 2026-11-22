@@ -1,4 +1,4 @@
-"""Database ORM models for all 8 CrashKiller tables."""
+"""Database ORM models for CrashKiller."""
 
 from __future__ import annotations
 
@@ -239,6 +239,26 @@ class CrashReport(Base):
         passive_deletes=True,
         order_by="AIAnalysisRun.created_at.desc()",
     )
+
+
+class CrashJob(Base):
+    """A recoverable unit of background work, with one active job per report."""
+
+    __tablename__ = "crash_jobs"
+    __table_args__ = (Index("ix_crash_jobs_ready", "lease_expires_at", "created_at"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUIDType, primary_key=True)
+    crash_id: Mapped[uuid.UUID] = mapped_column(
+        UUIDType,
+        ForeignKey("crash_reports.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    )
+    task: Mapped[str] = mapped_column(String(32), nullable=False)
+    run_ai_override: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    lease_id: Mapped[uuid.UUID | None] = mapped_column(UUIDType, nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(TZDateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(TZDateTime, nullable=False, default=utcnow)
 
 
 class CrashLog(Base):

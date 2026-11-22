@@ -67,7 +67,8 @@ async def test_run_dump_syms_pe_pdb_and_fallback(
     out, pe_used = await run_dump_syms(pdb, pe, test_settings, exec_fn=exec_ok)
     assert pe_used is True
     assert b"MODULE " in out
-    assert calls[0] == (test_settings.DUMP_SYMS_BIN, str(pe), str(pdb))
+    assert calls[-1] == (test_settings.DUMP_SYMS_BIN, str(pe), str(pdb))
+    assert Path(calls[0][1]).parent != Path(calls[1][1]).parent
 
     # Simulate PE+PDB failure followed by PDB-only fallback success
     fallback_calls: list[tuple[str, ...]] = []
@@ -84,13 +85,35 @@ async def test_run_dump_syms_pe_pdb_and_fallback(
     out_fb, pe_used_fb = await run_dump_syms(pdb, pe, test_settings, exec_fn=_fallback_exec)
     assert pe_used_fb is False
     assert b"Engine.pdb" in out_fb
-    assert len(fallback_calls) == 2
+    assert len(fallback_calls) == 3
 
     # Timeout test
     short_settings = test_settings.model_copy(update={"TOOL_TIMEOUT_SECONDS": 0.01})
     slow_exec = make_mock_exec(returncode=0, stdout=b"", delay=0.5)
     with pytest.raises(SymbolConversionError, match="timed out"):
         await run_dump_syms(pdb, None, short_settings, exec_fn=slow_exec)
+
+
+async def test_dump_syms_rejects_different_builds_and_multiple_modules(
+    tmp_path: Path, test_settings: Settings
+) -> None:
+    pdb = tmp_path / "Game.pdb"
+    pe = tmp_path / "Game.exe"
+    pdb.write_bytes(b"PDB")
+    pe.write_bytes(b"PE")
+    calls: list[tuple[str, ...]] = []
+
+    async def tool(*cmd: str, **kwargs):
+        calls.append(cmd)
+        output = SAMPLE_SYM_PDB_ONLY if Path(cmd[-1]).suffix == ".pdb" else SAMPLE_SYM_WITH_CFI
+        return await make_mock_exec(returncode=0, stdout=output.encode())(*cmd, **kwargs)
+
+    with pytest.raises(SymbolConversionError, match="different builds"):
+        await run_dump_syms(pdb, pe, test_settings, exec_fn=tool)
+    assert len(calls) == 2
+
+    with pytest.raises(SymbolConversionError, match="more than one MODULE"):
+        parse_sym_header(SAMPLE_SYM_WITH_CFI + SAMPLE_SYM_PDB_ONLY)
 
 
 async def test_ingest_symbol_dedup_upgrade_and_raw_archiving(

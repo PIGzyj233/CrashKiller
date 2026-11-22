@@ -6,11 +6,14 @@ import asyncio
 import io
 import os
 import shutil
+import struct
+import sys
+import tempfile
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 import zstandard as zstd
 from sqlalchemy import and_, func, or_, select
@@ -20,7 +23,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import Settings
 from app.db.base import utcnow
 from app.db.models import Symbol
-from app.services.storage import StorageError, StorageManager
+from app.services.storage import StorageCapacityError, StorageError, StorageManager
+
+MAX_SYMBOL_OUTPUT_BYTES = 128 * 1024**2
+MAX_SYMBOL_TOOL_MEMORY_BYTES = 1536 * 1024**2
 
 
 class SymbolConversionError(Exception):
@@ -107,6 +113,10 @@ def _resolve_in_partition(storage: StorageManager, partition: str, rel_path: str
 
 def parse_sym_header(sym_text: str) -> ParsedSymHeader:
     """Parse MODULE, INFO CODE_ID, and unwind records from Breakpad .sym text."""
+    return _parse_sym_records(io.StringIO(sym_text))
+
+
+def _parse_sym_records(lines: Iterable[str]) -> ParsedSymHeader:
     os_name = ""
     arch = ""
     debug_id = ""
@@ -116,10 +126,12 @@ def parse_sym_header(sym_text: str) -> ParsedSymHeader:
     has_unwind_records = False
     found_module = False
 
-    for raw_line in io.StringIO(sym_text):
+    for raw_line in lines:
         line = raw_line.rstrip("\r\n")
         upper_line = line.upper()
-        if not found_module and upper_line.startswith("MODULE "):
+        if upper_line.startswith("MODULE "):
+            if found_module:
+                raise SymbolConversionError("Symbol output contains more than one MODULE")
             parts = line.split(None, 4)
             if len(parts) < 5:
                 raise SymbolConversionError(f"Malformed MODULE line: {line!r}")
@@ -135,8 +147,6 @@ def parse_sym_header(sym_text: str) -> ParsedSymHeader:
                     code_file = parts[3].strip() or None
         elif upper_line.startswith("STACK CFI ") or upper_line.startswith("STACK WIN "):
             has_unwind_records = True
-            if found_module and code_id is not None:
-                break
 
     if not found_module or not debug_id or not debug_file:
         raise SymbolConversionError("Breakpad .sym output missing valid MODULE header")
@@ -177,9 +187,45 @@ async def _run_subprocess(
     timeout_seconds: int,
     exec_fn: Any = None,
 ) -> tuple[int, bytes, bytes]:
-    exec_callable = exec_fn or asyncio.create_subprocess_exec
+    if exec_fn is None:
+        native_cmd = cmd
+        if sys.platform == "linux":
+            native_cmd = [
+                "prlimit",
+                f"--as={MAX_SYMBOL_TOOL_MEMORY_BYTES}",
+                f"--fsize={MAX_SYMBOL_OUTPUT_BYTES}",
+                "--",
+                *cmd,
+            ]
+        with (
+            tempfile.TemporaryFile(dir=Path(cmd[1]).parent) as stdout_file,
+            tempfile.TemporaryFile(dir=Path(cmd[1]).parent) as stderr_file,
+        ):
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *native_cmd, stdout=stdout_file, stderr=stderr_file
+                )
+            except OSError as exc:
+                raise SymbolConversionError(f"Failed to start {cmd[0]}: {exc}") from exc
+            try:
+                rc = await asyncio.wait_for(proc.wait(), timeout=timeout_seconds)
+            except (TimeoutError, asyncio.CancelledError) as exc:
+                if proc.returncode is None:
+                    proc.kill()
+                await proc.wait()
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                raise SymbolConversionError(
+                    f"dump_syms timed out after {timeout_seconds}s"
+                ) from exc
+            if os.fstat(stdout_file.fileno()).st_size >= MAX_SYMBOL_OUTPUT_BYTES:
+                raise SymbolConversionError("dump_syms output exceeds the 128 MiB conversion limit")
+            stdout_file.seek(0)
+            stderr_file.seek(0)
+            return rc, stdout_file.read(), stderr_file.read(16384)
+
     try:
-        proc = await exec_callable(
+        proc = await exec_fn(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -194,18 +240,83 @@ async def _run_subprocess(
             proc.communicate(),
             timeout=timeout_seconds,
         )
-    except TimeoutError as exc:
+    except (TimeoutError, asyncio.CancelledError) as exc:
         try:
             proc.kill()
         except ProcessLookupError:
             pass
         await proc.communicate()
+        if isinstance(exc, asyncio.CancelledError):
+            raise
         raise SymbolConversionError(
             f"dump_syms timed out after {timeout_seconds}s: {' '.join(cmd)}"
         ) from exc
 
     rc = proc.returncode if proc.returncode is not None else -1
     return rc, stdout or b"", stderr or b""
+
+
+def _module_identity(header: ParsedSymHeader) -> tuple[str, str, str]:
+    return header.os_name.lower(), header.arch.lower(), header.debug_id
+
+
+def _pe_debug_identity(path: Path) -> tuple[str, str] | None:
+    """Read the PE CodeView GUID and age without loading the executable into memory."""
+    with path.open("rb") as stream:
+        dos_header = stream.read(64)
+        if len(dos_header) != 64 or dos_header[:2] != b"MZ":
+            return None
+        stream.seek(struct.unpack_from("<I", dos_header, 60)[0])
+        coff_header = stream.read(24)
+        if len(coff_header) != 24 or coff_header[:4] != b"PE\0\0":
+            return None
+        section_count, timestamp = struct.unpack_from("<HI", coff_header, 6)
+        optional_size = struct.unpack_from("<H", coff_header, 20)[0]
+        optional_header = stream.read(optional_size)
+        if optional_header[:2] == b"\x0b\x01":
+            directories_offset = 96
+        elif optional_header[:2] == b"\x0b\x02":
+            directories_offset = 112
+        else:
+            return None
+        debug_offset = directories_offset + 6 * 8
+        if len(optional_header) < debug_offset + 8:
+            return None
+        directory_count = struct.unpack_from("<I", optional_header, directories_offset - 4)[0]
+        if directory_count <= 6:
+            return None
+        debug_rva, debug_size = struct.unpack_from("<II", optional_header, debug_offset)
+        if not debug_rva or not 28 <= debug_size <= 65536:
+            return None
+        image_size, header_size = struct.unpack_from("<II", optional_header, 56)
+        debug_position = debug_rva if debug_rva + debug_size <= header_size else None
+        if debug_position is None:
+            for _ in range(section_count):
+                section = stream.read(40)
+                if len(section) < 40:
+                    return None
+                section_rva, file_size, file_offset = struct.unpack_from("<III", section, 12)
+                delta = debug_rva - section_rva
+                if 0 <= delta and delta + debug_size <= file_size:
+                    debug_position = file_offset + delta
+                    break
+        if debug_position is None:
+            return None
+        stream.seek(debug_position)
+        table = stream.read(debug_size)
+        for offset in range(0, len(table) - 27, 28):
+            record_type, record_size, _, record_position = struct.unpack_from(
+                "<IIII", table, offset + 12
+            )
+            if record_type != 2 or record_size < 24:
+                continue
+            stream.seek(record_position)
+            record = stream.read(24)
+            if len(record) == 24 and record[:4] == b"RSDS":
+                guid = uuid.UUID(bytes_le=record[4:20]).hex.upper()
+                age = struct.unpack_from("<I", record, 20)[0]
+                return f"{guid}{age:X}", f"{timestamp:08X}{image_size:X}"
+    return None
 
 
 async def run_dump_syms(
@@ -221,36 +332,57 @@ async def run_dump_syms(
     timeout = settings.TOOL_TIMEOUT_SECONDS
     bin_path = settings.DUMP_SYMS_BIN
 
+    async def convert(*inputs: Path) -> tuple[int, bytes, bytes]:
+        return await _run_subprocess(
+            [bin_path, *(str(path) for path in inputs)],
+            timeout_seconds=timeout,
+            exec_fn=exec_fn,
+        )
+
     if pe_path is not None and pdb_path is not None:
-        rc, stdout, stderr = await _run_subprocess(
-            [bin_path, str(pe_path), str(pdb_path)],
-            timeout_seconds=timeout,
-            exec_fn=exec_fn,
-        )
-        if rc == 0 and b"MODULE " in stdout:
-            return stdout, True
+        # A PE conversion may automatically consume a same-directory PDB.
+        # Compare an isolated PDB conversion with the PE's own build identifier.
+        pe_identity = _pe_debug_identity(pe_path)
+        with tempfile.TemporaryDirectory(prefix="probe_", dir=pe_path.parent) as directory:
+            probes = Path(directory)
+            pdb_probe = probes / pdb_path.name
+            os.link(pdb_path, pdb_probe)
+            pdb_rc, pdb_sym, pdb_err = await convert(pdb_probe)
+            if pdb_rc != 0:
+                detail = pdb_err.decode("utf-8", errors="replace").strip()
+                raise SymbolConversionError(f"dump_syms could not read the PDB: {detail or pdb_rc}")
+            pdb_header = parse_sym_header(pdb_sym.decode("utf-8", errors="replace"))
+            if pe_identity is None:
+                pe_dir = probes / "pe"
+                pe_dir.mkdir()
+                pe_probe = pe_dir / pe_path.name
+                os.link(pe_path, pe_probe)
+                pe_rc, pe_sym, _ = await convert(pe_probe)
+                if pe_rc != 0 or b"MODULE " not in pe_sym:
+                    return pdb_sym, False
+                pe_header = parse_sym_header(pe_sym.decode("utf-8", errors="replace"))
+                if _module_identity(pe_header) != _module_identity(pdb_header):
+                    raise SymbolConversionError("PDB and PE identify different builds")
+                expected_code_id = pe_header.code_id
+                del pe_sym
+            else:
+                expected_debug_id, expected_code_id = pe_identity
+                if expected_debug_id != pdb_header.debug_id:
+                    raise SymbolConversionError("PDB and PE identify different builds")
 
-        # Fallback to PDB-only invocation
-        rc_fb, stdout_fb, stderr_fb = await _run_subprocess(
-            [bin_path, str(pdb_path)],
-            timeout_seconds=timeout,
-            exec_fn=exec_fn,
-        )
-        if rc_fb == 0 and b"MODULE " in stdout_fb:
-            return stdout_fb, False
-
-        err_msg = (stderr_fb or stderr).decode("utf-8", errors="replace").strip()
-        raise SymbolConversionError(
-            f"dump_syms failed for PE+PDB and PDB fallback: {err_msg or f'exit {rc_fb}'}"
-        )
+        rc, stdout, _ = await convert(pe_path, pdb_path)
+        if rc != 0 or b"MODULE " not in stdout:
+            return pdb_sym, False
+        header = parse_sym_header(stdout.decode("utf-8", errors="replace"))
+        if _module_identity(header) != _module_identity(pdb_header):
+            raise SymbolConversionError("Combined symbols do not identify the uploaded build")
+        if expected_code_id and header.code_id != expected_code_id:
+            raise SymbolConversionError("Combined symbols do not identify the uploaded PE")
+        return stdout, True
 
     target = pe_path if pe_path is not None else pdb_path
     assert target is not None
-    rc, stdout, stderr = await _run_subprocess(
-        [bin_path, str(target)],
-        timeout_seconds=timeout,
-        exec_fn=exec_fn,
-    )
+    rc, stdout, stderr = await convert(target)
     if rc == 0 and b"MODULE " in stdout:
         return stdout, pe_path is not None
 
@@ -258,10 +390,22 @@ async def run_dump_syms(
     raise SymbolConversionError(f"dump_syms failed: {err_msg or f'exit {rc}'}")
 
 
+def _input_size(data: bytes | Path | BinaryIO | None) -> int:
+    if data is None:
+        return 0
+    if isinstance(data, bytes):
+        return len(data)
+    if isinstance(data, Path):
+        return data.stat().st_size
+    size = data.seek(0, os.SEEK_END)
+    data.seek(0)
+    return size
+
+
 def _stage_input(
     staging_dir: Path,
     filename: str | None,
-    data_or_path: bytes | Path | None,
+    data_or_path: bytes | Path | BinaryIO | None,
     label: str,
 ) -> Path | None:
     if data_or_path is None:
@@ -276,7 +420,12 @@ def _stage_input(
 
     safe_name = _sanitize_filename(filename, label)
     dest = staging_dir / safe_name
-    dest.write_bytes(data_or_path)
+    if isinstance(data_or_path, bytes):
+        dest.write_bytes(data_or_path)
+    else:
+        data_or_path.seek(0)
+        with dest.open("wb") as output:
+            shutil.copyfileobj(data_or_path, output, length=1024**2)
     return dest
 
 
@@ -306,7 +455,8 @@ def _build_raw_archive_paths(
     return rel_pdb, rel_pe
 
 
-def _archive_raw_files(
+async def _archive_raw_files(
+    session: AsyncSession,
     storage: StorageManager,
     header: ParsedSymHeader,
     pdb_path: Path | None,
@@ -316,13 +466,26 @@ def _archive_raw_files(
     rel_pdb, rel_pe = _build_raw_archive_paths(storage, header, pdb_path, pe_path)
     if storage.is_host_floor_breached():
         return None, 0
+    # Raw archives are optional. Allow enough headroom for incompressible input.
+    projected = 0
+    for source, rel in ((pdb_path, rel_pdb), (pe_path, rel_pe)):
+        if source is None or rel is None:
+            continue
+        size = source.stat().st_size
+        target = storage.resolve_path(rel)
+        old_size = target.stat().st_size if target.is_file() else 0
+        projected += max(0, size + max(65536, size // 100) - old_size)
+    try:
+        await storage.require_capacity(session, {"symbols/raw": projected})
+    except StorageCapacityError:
+        return None, 0
 
     primary_rel: str | None = None
     total_raw_size = 0
 
     if pdb_path is not None and rel_pdb is not None:
         try:
-            archived = storage.compress_raw_symbol(pdb_path, rel_pdb)
+            archived = await asyncio.to_thread(storage.compress_raw_symbol, pdb_path, rel_pdb)
         except StorageError as exc:
             raise SymbolConversionError(f"Failed to archive raw PDB: {exc}") from exc
         if archived is not None:
@@ -331,7 +494,7 @@ def _archive_raw_files(
 
     if pe_path is not None and rel_pe is not None:
         try:
-            archived = storage.compress_raw_symbol(pe_path, rel_pe)
+            archived = await asyncio.to_thread(storage.compress_raw_symbol, pe_path, rel_pe)
         except StorageError as exc:
             raise SymbolConversionError(f"Failed to archive raw PE: {exc}") from exc
         if archived is not None:
@@ -350,120 +513,167 @@ async def ingest_symbol(
     project_id: uuid.UUID,
     app_version: str,
     pdb_filename: str | None = None,
-    pdb_bytes_or_path: bytes | Path | None = None,
+    pdb_bytes_or_path: bytes | Path | BinaryIO | None = None,
     pe_filename: str | None = None,
-    pe_bytes_or_path: bytes | Path | None = None,
+    pe_bytes_or_path: bytes | Path | BinaryIO | None = None,
     exec_fn: Any = None,
 ) -> SymbolIngestResult:
     """Convert PDB/PE via dump_syms, deduplicate/upgrade in DB, and archive raw symbols."""
     if pdb_bytes_or_path is None and pe_bytes_or_path is None:
         raise SymbolConversionError("At least one of PDB or PE file must be provided")
 
-    staging_dir = storage.partition_path("staging") / f"sym_{uuid.uuid4().hex}"
-    staging_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        staged_pdb = _stage_input(staging_dir, pdb_filename, pdb_bytes_or_path, "pdb")
-        staged_pe = _stage_input(staging_dir, pe_filename, pe_bytes_or_path, "pe")
+    async with storage.shared_lock("symbol-conversion"):
+        with storage.staging_workspace("sym") as staging_dir:
+            async with storage.shared_lock("capacity"):
+                incoming = _input_size(pdb_bytes_or_path) + _input_size(pe_bytes_or_path)
+                await storage.require_capacity(session, {"staging": incoming})
+                staged_pdb = await asyncio.to_thread(
+                    _stage_input, staging_dir, pdb_filename, pdb_bytes_or_path, "pdb"
+                )
+                if staged_pdb is not None and pe_filename == staged_pdb.name:
+                    raise SymbolConversionError("PDB and PE must have distinct filenames")
+                staged_pe = await asyncio.to_thread(
+                    _stage_input, staging_dir, pe_filename, pe_bytes_or_path, "pe"
+                )
 
-        sym_bytes, pe_used = await run_dump_syms(
-            pdb_path=staged_pdb,
-            pe_path=staged_pe,
-            settings=settings,
-            exec_fn=exec_fn,
-        )
-        sym_text = sym_bytes.decode("utf-8", errors="replace")
-        header = parse_sym_header(sym_text)
-        has_pe_unwind = bool((staged_pe is not None and pe_used) or header.has_unwind_records)
-
-        project_seg = _validate_path_segment(str(project_id), "project_id")
-        rel_sym_path = (
-            f"symbols/sym/{project_seg}/{header.debug_file}/{header.debug_id}/{header.stem}.sym"
-        )
-        abs_sym_path = _resolve_in_partition(storage, "symbols/sym", rel_sym_path)
-        _build_raw_archive_paths(storage, header, staged_pdb, staged_pe)
-
-        existing_stmt = select(Symbol).where(
-            and_(
-                Symbol.project_id == project_id,
-                Symbol.debug_file == header.debug_file,
-                Symbol.debug_id == header.debug_id,
+            sym_bytes, pe_used = await run_dump_syms(
+                pdb_path=staged_pdb,
+                pe_path=staged_pe,
+                settings=settings,
+                exec_fn=exec_fn,
             )
+            header = parse_sym_header(sym_bytes.decode("utf-8", errors="replace"))
+            async with storage.shared_lock("capacity"):
+                return await _store_symbol(
+                    session,
+                    storage,
+                    settings,
+                    project_id,
+                    app_version,
+                    staged_pdb,
+                    staged_pe if pe_used and header.has_unwind_records else None,
+                    sym_bytes,
+                    header,
+                )
+
+
+async def _store_symbol(
+    session: AsyncSession,
+    storage: StorageManager,
+    settings: Settings,
+    project_id: uuid.UUID,
+    app_version: str,
+    staged_pdb: Path | None,
+    staged_pe: Path | None,
+    sym_bytes: bytes,
+    header: ParsedSymHeader,
+) -> SymbolIngestResult:
+    has_pe_unwind = header.has_unwind_records
+    project_seg = _validate_path_segment(str(project_id), "project_id")
+    rel_sym_path = (
+        f"symbols/sym/{project_seg}/{header.debug_file}/{header.debug_id}/{header.stem}.sym"
+    )
+    abs_sym_path = _resolve_in_partition(storage, "symbols/sym", rel_sym_path)
+    _build_raw_archive_paths(storage, header, staged_pdb, staged_pe)
+
+    existing_stmt = select(Symbol).where(
+        and_(
+            Symbol.project_id == project_id,
+            Symbol.debug_file == header.debug_file,
+            Symbol.debug_id == header.debug_id,
         )
-        existing = (await session.execute(existing_stmt)).scalar_one_or_none()
-        now = utcnow()
+    )
+    existing = (await session.execute(existing_stmt)).scalar_one_or_none()
+    now = utcnow()
 
-        if existing is None:
-            sym_row = Symbol(
-                project_id=project_id,
-                app_version=app_version,
-                module_name=header.module_name,
-                debug_file=header.debug_file,
-                debug_id=header.debug_id,
-                code_file=header.code_file,
-                code_id=header.code_id,
-                has_pe_unwind=has_pe_unwind,
-                sym_path=rel_sym_path,
-                sym_size=len(sym_bytes),
-                raw_archive_path=None,
-                raw_size=0,
-                last_used_at=now,
-                created_at=now,
-            )
-            try:
-                async with session.begin_nested():
-                    session.add(sym_row)
-                    await session.flush()
-            except IntegrityError:
-                existing = (await session.execute(existing_stmt)).scalar_one()
-            else:
-                storage.atomic_write_bytes(rel_sym_path, sym_bytes)
-                if settings.ARCHIVE_RAW_SYMBOLS:
-                    raw_rel, raw_sz = _archive_raw_files(
-                        storage,
-                        header,
-                        staged_pdb,
-                        staged_pe,
-                    )
-                    sym_row.raw_archive_path = raw_rel
-                    sym_row.raw_size = raw_sz
-                await session.commit()
-                await session.refresh(sym_row)
-                return SymbolIngestResult(symbol=sym_row, deduplicated=False, upgraded=False)
-
-        assert existing is not None
-        should_upgrade = (not existing.has_pe_unwind) and has_pe_unwind
-        if should_upgrade:
-            storage.atomic_write_bytes(rel_sym_path, sym_bytes)
-            existing.app_version = app_version
-            existing.module_name = header.module_name
-            existing.code_file = header.code_file or existing.code_file
-            existing.code_id = header.code_id or existing.code_id
-            existing.has_pe_unwind = True
-            existing.sym_path = rel_sym_path
-            existing.sym_size = len(sym_bytes)
+    if existing is None:
+        previous_size = abs_sym_path.stat().st_size if abs_sym_path.is_file() else 0
+        await storage.require_capacity(session, {"symbols/sym": len(sym_bytes) - previous_size})
+        sym_row = Symbol(
+            project_id=project_id,
+            app_version=app_version,
+            module_name=header.module_name,
+            debug_file=header.debug_file,
+            debug_id=header.debug_id,
+            code_file=header.code_file,
+            code_id=header.code_id,
+            has_pe_unwind=has_pe_unwind,
+            sym_path=rel_sym_path,
+            sym_size=len(sym_bytes),
+            raw_archive_path=None,
+            raw_size=0,
+            last_used_at=now,
+            created_at=now,
+        )
+        try:
+            async with session.begin_nested():
+                session.add(sym_row)
+                await session.flush()
+        except IntegrityError:
+            existing = (await session.execute(existing_stmt)).scalar_one()
+        else:
+            await asyncio.to_thread(storage.atomic_write_bytes, rel_sym_path, sym_bytes)
             if settings.ARCHIVE_RAW_SYMBOLS:
-                raw_rel, raw_sz = _archive_raw_files(storage, header, staged_pdb, staged_pe)
-                if raw_rel is not None:
-                    if staged_pdb is None and existing.raw_archive_path:
-                        if raw_rel != existing.raw_archive_path:
-                            existing.raw_size = (existing.raw_size or 0) + raw_sz
-                    else:
-                        existing.raw_archive_path = raw_rel
-                        existing.raw_size = raw_sz
-            existing.last_used_at = now
+                raw_rel, raw_sz = await _archive_raw_files(
+                    session,
+                    storage,
+                    header,
+                    staged_pdb,
+                    staged_pe,
+                )
+                sym_row.raw_archive_path = raw_rel
+                sym_row.raw_size = raw_sz
             await session.commit()
-            await session.refresh(existing)
-            return SymbolIngestResult(symbol=existing, deduplicated=True, upgraded=True)
+            await session.refresh(sym_row)
+            return SymbolIngestResult(symbol=sym_row, deduplicated=False, upgraded=False)
 
-        if not abs_sym_path.exists():
-            storage.atomic_write_bytes(rel_sym_path, sym_bytes)
-            existing.sym_size = len(sym_bytes)
+    assert existing is not None
+    should_upgrade = has_pe_unwind and not existing.has_pe_unwind
+    if staged_pe is not None and not should_upgrade:
+        try:
+            with abs_sym_path.open(encoding="utf-8", errors="replace") as current:
+                stored_header = _parse_sym_records(current)
+            should_upgrade = (
+                not stored_header.has_unwind_records
+                or stored_header.code_id != header.code_id
+            )
+        except (FileNotFoundError, SymbolConversionError):
+            should_upgrade = True
+    if should_upgrade:
+        previous_size = abs_sym_path.stat().st_size if abs_sym_path.is_file() else 0
+        await storage.require_capacity(session, {"symbols/sym": len(sym_bytes) - previous_size})
+        await asyncio.to_thread(storage.atomic_write_bytes, rel_sym_path, sym_bytes)
+        existing.app_version = app_version
+        existing.module_name = header.module_name
+        existing.code_file = header.code_file or existing.code_file
+        existing.code_id = header.code_id or existing.code_id
+        existing.has_pe_unwind = True
+        existing.sym_path = rel_sym_path
+        existing.sym_size = len(sym_bytes)
+        if settings.ARCHIVE_RAW_SYMBOLS:
+            raw_rel, raw_sz = await _archive_raw_files(
+                session, storage, header, staged_pdb, staged_pe
+            )
+            if raw_rel is not None:
+                if staged_pdb is None and existing.raw_archive_path:
+                    if raw_rel != existing.raw_archive_path:
+                        existing.raw_size = (existing.raw_size or 0) + raw_sz
+                else:
+                    existing.raw_archive_path = raw_rel
+                    existing.raw_size = raw_sz
         existing.last_used_at = now
         await session.commit()
         await session.refresh(existing)
-        return SymbolIngestResult(symbol=existing, deduplicated=True, upgraded=False)
-    finally:
-        shutil.rmtree(staging_dir, ignore_errors=True)
+        return SymbolIngestResult(symbol=existing, deduplicated=True, upgraded=True)
+
+    if not abs_sym_path.exists():
+        await storage.require_capacity(session, {"symbols/sym": len(sym_bytes)})
+        await asyncio.to_thread(storage.atomic_write_bytes, rel_sym_path, sym_bytes)
+        existing.sym_size = len(sym_bytes)
+    existing.last_used_at = now
+    await session.commit()
+    await session.refresh(existing)
+    return SymbolIngestResult(symbol=existing, deduplicated=True, upgraded=False)
 
 
 async def resolve_symsrv_file(

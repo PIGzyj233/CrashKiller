@@ -129,6 +129,7 @@ export interface ResymbolicateRequest {
   project_id?: string;
   debug_id?: string;
   crash_ids?: string[];
+  missing_only?: boolean;
 }
 
 export interface ResymbolicateResponse {

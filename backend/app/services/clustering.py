@@ -15,7 +15,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.base import utcnow
-from app.db.models import CrashCluster, CrashReport, Issue, Project
+from app.db.models import CrashCluster, CrashJob, CrashReport, Issue, Project
 from app.services.settings_service import (
     DEFAULT_NOISE_FUNCTIONS,
     DEFAULT_NOISE_MODULES,
@@ -945,8 +945,14 @@ async def cluster_crash(
     exc_cat = normalize_exception_category(crash_report.crash_reason)
 
     await session.flush()
+    await session.refresh(
+        crash_report,
+        attribute_names=["cluster_id", "issue_id", "is_human_verified"],
+        with_for_update=True,
+    )
     old_cluster_id = crash_report.cluster_id
     old_issue_id = crash_report.issue_id
+    human_verified = crash_report.is_human_verified
 
     existing_cluster = (
         await session.execute(
@@ -1019,15 +1025,16 @@ async def cluster_crash(
             )
             await session.refresh(cluster, attribute_names=["crash_count"])
         await session.refresh(crash_report, attribute_names=["cluster_id"])
-        if old_cluster_id is not None:
+        if old_cluster_id is not None and not human_verified:
             crash_report.ai_verdict = None
             crash_report.ai_confidence = None
 
     # Reconcile issue link & counts atomically, keeping CrashReport.issue_id synced for GC.
+    linked_issue_id = old_issue_id if human_verified else cluster.issue_id
     linked_issue = (
-        await session.get(Issue, cluster.issue_id) if cluster.issue_id is not None else None
+        await session.get(Issue, linked_issue_id) if linked_issue_id is not None else None
     )
-    if linked_issue is not None:
+    if linked_issue is not None and not human_verified:
         if old_issue_id != linked_issue.id:
             cond_old_issue = (
                 CrashReport.issue_id.is_(None)
@@ -1064,7 +1071,7 @@ async def cluster_crash(
         crash_ts = _as_utc(crash_report.crash_time)
         if _as_utc(linked_issue.last_seen_at) < crash_ts:
             linked_issue.last_seen_at = crash_ts
-    else:
+    elif not human_verified:
         if old_issue_id is not None and old_cluster_id != cluster.id:
             issue_upd = await session.execute(
                 update(CrashReport)
@@ -1097,7 +1104,11 @@ async def cluster_crash(
     if effective_mode not in {"SMART_TRIAGE", "ALWAYS", "MANUAL"}:
         raise ClusteringError(f"Unsupported ai_triage_mode: {raw_mode!r}")
 
-    if effective_mode == "MANUAL":
+    if human_verified:
+        should_run_ai = False
+        trigger_reason = "human_verified"
+        crash_report.status = "ANALYZED"
+    elif effective_mode == "MANUAL":
         should_run_ai = False
         trigger_reason = "manual_mode"
         crash_report.status = "ANALYZED"
@@ -1160,6 +1171,7 @@ async def apply_human_verdict(
     if action not in {"confirm", "assign_issue", "create_issue"}:
         raise ClusteringError(f"Invalid verdict action: {action!r}")
 
+    await session.refresh(crash_report, with_for_update=True)
     cluster = (
         await session.get(CrashCluster, crash_report.cluster_id)
         if crash_report.cluster_id is not None
@@ -1237,7 +1249,9 @@ async def apply_human_verdict(
     assert target_issue is not None
 
     crash_report.is_human_verified = True
-    if crash_report.status != "ANALYZED":
+    if crash_report.status != "ANALYZED" and not await session.scalar(
+        select(CrashJob.id).where(CrashJob.crash_id == crash_report.id)
+    ):
         crash_report.status = "ANALYZED"
 
     if root_cause is not None:

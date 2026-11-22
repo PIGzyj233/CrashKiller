@@ -44,6 +44,9 @@ services:
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://crashkiller:crashkiller@postgres:5432/crashkiller}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       DATA_DIR: ${DATA_DIR:-/data}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      ALLOW_UNAUTHENTICATED_SYMSRV: ${ALLOW_UNAUTHENTICATED_SYMSRV:-false}
     volumes:
       - ${CRASHKILLER_DATA_PATH:-./data}:/data
     mem_limit: 2560m
@@ -73,11 +76,15 @@ services:
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://crashkiller:crashkiller@postgres:5432/crashkiller}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       DATA_DIR: ${DATA_DIR:-/data}
+      ADMIN_USERNAME: ""
+      ADMIN_PASSWORD: ""
     volumes:
       - ${CRASHKILLER_DATA_PATH:-./data}:/data
     mem_limit: 4608m
     cpus: 4.0
     depends_on:
+      api:
+        condition: service_healthy
       postgres:
         condition: service_healthy
       redis:
@@ -89,9 +96,14 @@ services:
       dockerfile: docker/frontend.Dockerfile
     restart: unless-stopped
     ports:
-      - "${HTTP_PORT:-8080}:80"
+      - "${HTTP_BIND_HOST:-127.0.0.1}:${HTTP_PORT:-8080}:80"
     mem_limit: 256m
     cpus: 0.5
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     depends_on:
       api:
         condition: service_healthy

@@ -16,12 +16,13 @@ Full-stack C++ crash dump and multi-hundred-MB runtime log diagnostic platform e
 
 ```bash
 cp .env.example .env
+# Set ADMIN_USERNAME and ADMIN_PASSWORD in .env before starting the browser UI.
 # Edit .env to set LLM_API_KEY / LLM_BASE_URL / LLM_MODEL if using live AI triage
 docker compose up -d --build
 ```
 
 Services started by `docker-compose.yml`:
-- `nginx`: exposed on `http://localhost:${HTTP_PORT:-8080}`
+- `nginx` binds to `http://127.0.0.1:${HTTP_PORT:-8080}` by default.
 - `api`: runs `alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000`
 - `worker`: runs `arq app.workers.worker.WorkerSettings`
 - `postgres`: `postgres:16-alpine` with `pg_trgm`
@@ -29,17 +30,20 @@ Services started by `docker-compose.yml`:
 
 Total container memory limits remain within 12 GB (`2048m + 512m + 2560m + 4608m + 256m = 9984m`).
 
-## Disk Quota & 50 GB Host Safety Floor
+The browser prompts for the configured admin username and password using HTTP Basic authentication. The UI and management API stay locked until both values are set. Set `HTTP_BIND_HOST` to publish on a different interface and use TLS at the reverse proxy for remote access. For a browser client on a separate origin, list its exact origin in `CORS_ORIGINS`.
 
-CrashKiller enforces a compact 150 GB default disk budget partitioned under `DATA_DIR` (`/data`):
-- `symbols/sym` (`15 GB`), `symbols/public_cache` (`5 GB`), `symbols/raw` (`15 GB`)
-- `logs` (`55 GB`), `dumps` (`35 GB`), `staging` (`10 GB`), `db` (`15 GB`)
+## Disk Quota & 50 GiB Host Safety Floor
 
-When host free disk space drops below `HOST_SAFETY_FLOOR_GB` (`50.0 GB` default):
-- Raw PDB/PE archiving in `symbols/raw` is automatically paused (`raw_size = 0`).
-- Emergency LRU/TTL garbage collection runs while protecting `is_pinned=True` crashes and issues, and retaining PostgreSQL parsed stacks, log error digests, and AI analysis reports.
+CrashKiller checks the default 150 GiB budget when admitting dumps, logs, and symbols. The total includes the application data directories and the measured size of its PostgreSQL database.
 
-Runtime settings (LLM credentials, AI triage mode, disk quotas, safety floor, and noise filters) can be updated live via `GET/PUT /api/v1/settings` or the web UI Settings page.
+- Symbols use budgets of 15 GiB for converted files, 5 GiB for the public cache, and 15 GiB for optional raw archives.
+- Logs have a 55 GiB budget, dumps 35 GiB, staging 10 GiB, and PostgreSQL 15 GiB. PostgreSQL keeps report metadata for historical analysis. Use volume quotas to cap physical disk use, including WAL, Redis, and temporary processing space.
+
+Below `HOST_SAFETY_FLOOR_GB`, new raw symbol archives pause and automatic cleanup reclaims disk space until the floor is restored. It protects pinned crash and issue files, reports being processed, and active staging files. Standard age and quota cleanup still applies.
+
+Manage quotas and retention in Settings. The administrator's force-emergency action explicitly clears eligible evidence files. The normal cleanup action applies the configured retention and quotas.
+
+Symbol uploads stream into staging and conversions run one at a time per data volume. On Linux, each converter process has a 1.5 GiB address-space limit and a 128 MiB symbol output limit.
 
 ## Seed Demo Data
 
@@ -76,11 +80,13 @@ backend/.venv/bin/python cli/crashkiller_cli.py upload-crash \
   --wait
 ```
 
+Machine uploads and `--wait` use the project API key. The key grants status access for crashes in that project. Crash details, logs, dumps, and project administration require the admin credential.
+
 ## Windows C++ Uploader & WinDbg SymSrv
 
 See [`cli/cpp_uploader_example/README.md`](cli/cpp_uploader_example/README.md) for building the Windows C++17 `WinHTTP` multipart uploader (`crashkiller_uploader`).
 
-Point WinDbg or Visual Studio symbol search paths at CrashKiller's `/symsrv` endpoint:
+Enable `ARCHIVE_RAW_SYMBOLS` before uploading symbols for WinDbg or Visual Studio. Downloads require admin authentication by default. On a trusted loopback-only deployment, `ALLOW_UNAUTHENTICATED_SYMSRV=true` enables passwordless debugger access. Configure the debugger with this symbol search path.
 
 ```text
 SRV*C:\symcache*http://localhost:8080/symsrv

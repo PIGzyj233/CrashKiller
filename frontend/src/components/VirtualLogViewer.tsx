@@ -53,16 +53,18 @@ export interface VirtualLogViewerProps {
 }
 
 const PAGE_SIZE = 200;
+// Bound the scroll height and virtualizer bookkeeping, even for very large logs.
+const WINDOW_LINES = 20_000;
 const ROW_HEIGHT = 22;
 const OVERSCAN = 20;
 const MAX_CACHED_PAGES_PER_LOG = 100;
 const SEARCH_MAX_MATCHES = 200;
 const AROUND_TIME_MAX_LINES = 500;
 
-interface PendingScrollTarget {
+interface LogScrollTarget {
   logId: string;
-  startLine: number;
-  endLine: number;
+  lineNumber: number;
+  align: "start" | "center";
 }
 
 function formatBytes(bytes: number): string {
@@ -167,6 +169,7 @@ export function VirtualLogViewer({
   const [activeMatchIdx, setActiveMatchIdx] = useState<number>(-1);
   const [searchError, setSearchError] = useState<string | null>(null);
   const [retryTick, setRetryTick] = useState(0);
+  const [scrollTarget, setScrollTarget] = useState<LogScrollTarget | null>(null);
 
   // Caches & concurrency refs
   const linesCacheRef = useRef<Map<string, Map<number, LogLine>>>(new Map());
@@ -178,7 +181,6 @@ export function VirtualLogViewer({
     end: 0,
   });
   const scrollParentRef = useRef<HTMLDivElement | null>(null);
-  const pendingScrollRef = useRef<PendingScrollTarget | null>(null);
   const lastHighlightKeyRef = useRef<string | null>(null);
   const isMountedRef = useRef(true);
   const activeLogIdRef = useRef<string>("");
@@ -216,10 +218,13 @@ export function VirtualLogViewer({
 
   const selectLog = useCallback(
     (logId: string) => {
+      if (logId !== resolvedActiveLogId) {
+        setScrollTarget(null);
+      }
       setInternalLogId(logId);
       onSelectLog?.(logId);
     },
-    [onSelectLog],
+    [onSelectLog, resolvedActiveLogId],
   );
 
   const activeGcError = resolvedActiveLogId
@@ -230,16 +235,46 @@ export function VirtualLogViewer({
     : null;
 
   const totalLines = activeLog?.total_lines ?? 0;
+  const activeTarget =
+    scrollTarget?.logId === resolvedActiveLogId ? scrollTarget : null;
+  const targetIndex = Math.max(
+    0,
+    Math.min(totalLines, activeTarget?.lineNumber ?? 1) - 1,
+  );
+  const windowStart = Math.floor(targetIndex / WINDOW_LINES) * WINDOW_LINES;
+  const windowEnd = Math.min(totalLines, windowStart + WINDOW_LINES);
+  const windowCount = windowEnd - windowStart;
 
   const virtualizer = useVirtualizer({
-    count: totalLines,
+    count: windowCount,
     getScrollElement: () => scrollParentRef.current,
     estimateSize: () => ROW_HEIGHT,
     overscan: OVERSCAN,
-    getItemKey: (index) => `${resolvedActiveLogId}:${index}`,
+    getItemKey: (index) => `${resolvedActiveLogId}:${windowStart + index}`,
     useFlushSync: false,
     enabled: Boolean(activeLog && totalLines > 0 && !activeGcError),
   });
+
+  useEffect(() => {
+    if (windowCount === 0 || activeGcError) {
+      return;
+    }
+    const frameId = window.requestAnimationFrame(() => {
+      virtualizer.scrollToIndex(targetIndex - windowStart, {
+        align: activeTarget?.align ?? "start",
+        behavior: "auto",
+      });
+    });
+    return () => window.cancelAnimationFrame(frameId);
+  }, [
+    activeGcError,
+    activeTarget,
+    resolvedActiveLogId,
+    targetIndex,
+    virtualizer,
+    windowCount,
+    windowStart,
+  ]);
 
   // Reset search / around-time ephemeral UI when switching log tabs and invalidate in-flight requests
   useEffect(() => {
@@ -400,32 +435,6 @@ export function VirtualLogViewer({
     [gcErrorByLog, touchAndStorePage],
   );
 
-  const ensureLineRangeLoaded = useCallback(
-    async (
-      logId: string,
-      startLine: number,
-      endLine: number,
-      maxTotalLines: number,
-    ) => {
-      if (!logId || maxTotalLines <= 0) {
-        return;
-      }
-      const clampedStart = Math.max(1, Math.min(maxTotalLines, startLine));
-      const clampedEnd = Math.max(
-        clampedStart,
-        Math.min(maxTotalLines, endLine),
-      );
-      const startPage = Math.floor((clampedStart - 1) / PAGE_SIZE);
-      const endPage = Math.floor((clampedEnd - 1) / PAGE_SIZE);
-      const tasks: Promise<void>[] = [];
-      for (let p = startPage; p <= endPage; p += 1) {
-        tasks.push(fetchPage(logId, p, maxTotalLines));
-      }
-      await Promise.all(tasks);
-    },
-    [fetchPage],
-  );
-
   // Compute virtual items and primitive bounds for prefetching
   const virtualItems = virtualizer.getVirtualItems();
   const firstVisibleIdx = virtualItems[0]?.index ?? -1;
@@ -444,8 +453,8 @@ export function VirtualLogViewer({
       return;
     }
 
-    const startPage = Math.floor(firstVisibleIdx / PAGE_SIZE);
-    const endPage = Math.floor(lastVisibleIdx / PAGE_SIZE);
+    const startPage = Math.floor((windowStart + firstVisibleIdx) / PAGE_SIZE);
+    const endPage = Math.floor((windowStart + lastVisibleIdx) / PAGE_SIZE);
     const maxPage = Math.floor((totalLines - 1) / PAGE_SIZE);
     const prefetchStart = Math.max(0, startPage - 1);
     const prefetchEnd = Math.min(maxPage, endPage + 1);
@@ -461,6 +470,7 @@ export function VirtualLogViewer({
     activeGcError,
     firstVisibleIdx,
     lastVisibleIdx,
+    windowStart,
     fetchPage,
     retryTick,
   ]);
@@ -504,27 +514,15 @@ export function VirtualLogViewer({
   }, [activeLog, summaryByLog, activeGcError]);
 
   const jumpToLine = useCallback(
-    (lineNumber: number) => {
+    (lineNumber: number, align: LogScrollTarget["align"] = "center") => {
       if (!activeLog || activeLog.total_lines <= 0 || activeGcError) {
         return;
       }
-      const clamped = Math.max(1, Math.min(activeLog.total_lines, lineNumber));
-      void ensureLineRangeLoaded(
-        activeLog.id,
-        Math.max(1, clamped - 50),
-        Math.min(activeLog.total_lines, clamped + 50),
-        activeLog.total_lines,
-      );
-      virtualizer.scrollToIndex(clamped - 1, {
-        align: "center",
-        behavior: "auto",
-      });
+      setScrollTarget({ logId: activeLog.id, lineNumber, align });
     },
-    [activeLog, activeGcError, ensureLineRangeLoaded, virtualizer],
+    [activeLog, activeGcError],
   );
 
-  // Two-phase highlightRange effect:
-  // Phase 1: record target & switch tab if needed
   const highlightKey = highlightRange
     ? `${highlightRange.logId}:${highlightRange.startLine}:${highlightRange.endLine}:${highlightRange.nonce ?? 0}`
     : null;
@@ -542,73 +540,15 @@ export function VirtualLogViewer({
     }
     lastHighlightKeyRef.current = highlightKey;
 
-    const safeStart = Math.max(
-      1,
-      Math.min(highlightRange.startLine, highlightRange.endLine),
-    );
-    const safeEnd = Math.max(
-      safeStart,
-      Math.max(highlightRange.startLine, highlightRange.endLine),
-    );
-
-    pendingScrollRef.current = {
-      logId: highlightRange.logId,
-      startLine: safeStart,
-      endLine: safeEnd,
-    };
-
     if (resolvedActiveLogId !== highlightRange.logId) {
       selectLog(highlightRange.logId);
     }
-  }, [highlightRange, highlightKey, logs, resolvedActiveLogId, selectLog]);
-
-  // Phase 2: once target log is active & virtualizer count has committed, fetch range & scroll in rAF
-  useEffect(() => {
-    const target = pendingScrollRef.current;
-    if (
-      !target ||
-      !activeLog ||
-      target.logId !== resolvedActiveLogId ||
-      activeGcError
-    ) {
-      return;
-    }
-
-    if (activeLog.total_lines <= 0) {
-      pendingScrollRef.current = null;
-      return;
-    }
-
-    const targetLine = Math.max(
-      1,
-      Math.min(activeLog.total_lines, target.startLine),
-    );
-    void ensureLineRangeLoaded(
-      activeLog.id,
-      target.startLine,
-      target.endLine,
-      activeLog.total_lines,
-    );
-
-    const rafId = window.requestAnimationFrame(() => {
-      pendingScrollRef.current = null;
-      virtualizer.scrollToIndex(targetLine - 1, {
-        align: "center",
-        behavior: "auto",
-      });
+    setScrollTarget({
+      logId: highlightRange.logId,
+      lineNumber: Math.min(highlightRange.startLine, highlightRange.endLine),
+      align: "center",
     });
-
-    return () => {
-      window.cancelAnimationFrame(rafId);
-    };
-  }, [
-    resolvedActiveLogId,
-    activeLog,
-    activeGcError,
-    highlightKey,
-    ensureLineRangeLoaded,
-    virtualizer,
-  ]);
+  }, [highlightRange, highlightKey, logs, resolvedActiveLogId, selectLog]);
 
   const handleRetryFetch = () => {
     if (!activeLog) {
@@ -924,6 +864,64 @@ export function VirtualLogViewer({
         </button>
       </div>
 
+      {totalLines > WINDOW_LINES && !activeGcError && (
+        <nav
+          aria-label="Log navigation"
+          className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-700"
+        >
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              aria-label="Previous log window"
+              disabled={windowStart === 0}
+              onClick={() => jumpToLine(windowStart - WINDOW_LINES + 1, "start")}
+              className="rounded border border-slate-300 bg-white px-2 py-1 hover:bg-slate-100 disabled:opacity-40"
+            >
+              Previous
+            </button>
+            <span aria-live="polite" className="font-mono">
+              Lines {(windowStart + 1).toLocaleString()}–{windowEnd.toLocaleString()}
+              {" of "}{totalLines.toLocaleString()}
+            </span>
+            <button
+              type="button"
+              aria-label="Next log window"
+              disabled={windowEnd === totalLines}
+              onClick={() => jumpToLine(windowEnd + 1, "start")}
+              className="rounded border border-slate-300 bg-white px-2 py-1 hover:bg-slate-100 disabled:opacity-40"
+            >
+              Next
+            </button>
+          </div>
+          <form
+            key={resolvedActiveLogId}
+            onSubmit={(event) => {
+              event.preventDefault();
+              const line = new FormData(event.currentTarget).get("line");
+              jumpToLine(Number(line));
+            }}
+            className="flex items-center gap-1.5"
+          >
+            <input
+              aria-label="Log line number"
+              name="line"
+              type="number"
+              min={1}
+              max={totalLines}
+              required
+              placeholder="Line number"
+              className="w-32 rounded border border-slate-300 bg-white px-2 py-1 font-mono"
+            />
+            <button
+              type="submit"
+              className="rounded border border-slate-300 bg-white px-2 py-1 hover:bg-slate-100"
+            >
+              Go to line
+            </button>
+          </form>
+        </nav>
+      )}
+
       {/* Search & Timestamp Toolbar */}
       <div className="space-y-2 border-b border-slate-200 bg-white px-3 py-2.5">
         <div className="flex flex-wrap items-center justify-between gap-2">
@@ -1221,8 +1219,8 @@ export function VirtualLogViewer({
                   className="relative w-full"
                   style={{ height: `${virtualizer.getTotalSize()}px` }}
                 >
-                  {virtualizer.getVirtualItems().map((virtualRow) => {
-                    const lineNumber = virtualRow.index + 1;
+                  {virtualItems.map((virtualRow) => {
+                    const lineNumber = windowStart + virtualRow.index + 1;
                     const cachedLine = currentLogLinesMap?.get(lineNumber);
 
                     const isHighlighted =
@@ -1256,7 +1254,7 @@ export function VirtualLogViewer({
                     return (
                       <div
                         key={virtualRow.key}
-                        data-index={virtualRow.index}
+                        data-index={lineNumber - 1}
                         data-line-number={lineNumber}
                         data-highlighted={isHighlighted ? "true" : undefined}
                         className={`absolute left-0 top-0 flex min-w-full items-center ${rowBgClass}`}
