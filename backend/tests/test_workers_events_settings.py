@@ -36,7 +36,7 @@ from app.workers import (
     resymbolicate,
     symbol_ingest,
 )
-from app.workers.tasks import disk_gc, recover_crash_jobs, run_crash_job
+from app.workers.tasks import disk_gc, fetch_ms_symbols, recover_crash_jobs, run_crash_job
 from tests.conftest import make_disk_usage_fn, make_mock_exec
 
 
@@ -497,13 +497,15 @@ async def test_redis_subscription_cleans_up_on_subscribe_cancel_and_error() -> N
 
 
 def test_worker_settings_contract() -> None:
-    assert WorkerSettings.functions[:-1] == [
+    assert WorkerSettings.functions[:-2] == [
         symbol_ingest,
         parse_crash,
         ai_triage,
         resymbolicate,
         disk_gc,
     ]
+    assert WorkerSettings.functions[-2].coroutine is fetch_ms_symbols
+    assert WorkerSettings.functions[-2].keep_result_s == 0
     assert WorkerSettings.functions[-1].coroutine is run_crash_job
     assert WorkerSettings.functions[-1].keep_result_s == 0
     assert {job.coroutine for job in WorkerSettings.cron_jobs} == {disk_gc, recover_crash_jobs}
@@ -512,6 +514,7 @@ def test_worker_settings_contract() -> None:
         "parse_crash",
         "ai_triage",
         "resymbolicate",
+        "fetch_ms_symbols",
         "disk_gc",
         "run_crash_job",
     }

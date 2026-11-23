@@ -3,6 +3,7 @@
 from app.workers.tasks import (
     ai_triage,
     disk_gc,
+    fetch_ms_symbols,
     parse_crash,
     resymbolicate,
     symbol_ingest,
@@ -20,6 +21,7 @@ __all__ = [
     "WorkerSettings",
     "ai_triage",
     "disk_gc",
+    "fetch_ms_symbols",
     "parse_crash",
     "parse_redis_settings",
     "resymbolicate",

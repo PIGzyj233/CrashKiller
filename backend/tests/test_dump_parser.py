@@ -128,11 +128,16 @@ async def test_parse_dump_zst_normalization_and_cleanup(
     # Staging dir cleaned up
     assert list(storage_manager.partition_path("staging").iterdir()) == []
 
-    # Verify CLI flags included --json, --symbols-url, --symbols-cache
+    # Verify CLI flags included --json, --symbols-url (Breakpad only, excluding MSDL),
+    # --symbols-cache, and public_cache as secondary local symbol path after sym_dir.
     cmd = calls[0]
     assert "--json" in cmd
     assert "--symbols-url" in cmd
     assert "--symbols-cache" in cmd
+    assert "https://symbols.mozilla.org/" in cmd
+    assert "https://msdl.microsoft.com/download/symbols/" not in cmd
+    pub_cache_str = str(storage_manager.partition_path("symbols/public_cache"))
+    assert cmd[-1] == pub_cache_str
 
     # Verify normalization
     assert result.crash_reason == "EXCEPTION_ACCESS_VIOLATION_READ"
@@ -157,7 +162,26 @@ async def test_parse_dump_zst_normalization_and_cleanup(
     assert result.parsed_summary_json["missing_symbol_count"] == 1
     assert result.parsed_summary_json["thread_count"] == 2
 
-    # Verify ENABLE_PUBLIC_SYMBOLS=False omits --symbols-url / --symbols-cache
+    # Verify MSDL-only PUBLIC_SYMBOL_URLS omits --symbols-url/--symbols-cache but keeps local cache
+    msdl_only_settings = test_settings.model_copy(
+        update={"PUBLIC_SYMBOL_URLS": ["https://msdl.microsoft.com/download/symbols/"]}
+    )
+    calls_msdl_only: list[tuple[str, ...]] = []
+    await parse_dump(
+        rel_zst,
+        storage_manager,
+        msdl_only_settings,
+        exec_fn=make_mock_exec(
+            returncode=0,
+            stdout=json.dumps(SAMPLE_STACKWALK_JSON).encode("utf-8"),
+            calls_log=calls_msdl_only,
+        ),
+    )
+    assert "--symbols-url" not in calls_msdl_only[0]
+    assert "--symbols-cache" not in calls_msdl_only[0]
+    assert calls_msdl_only[0][-1] == pub_cache_str
+
+    # Verify ENABLE_PUBLIC_SYMBOLS=False omits --symbols-url, --symbols-cache, and public_cache
     no_pub_settings = test_settings.model_copy(update={"ENABLE_PUBLIC_SYMBOLS": False})
     calls_no_pub: list[tuple[str, ...]] = []
     await parse_dump(
@@ -172,6 +196,7 @@ async def test_parse_dump_zst_normalization_and_cleanup(
     )
     assert "--symbols-url" not in calls_no_pub[0]
     assert "--symbols-cache" not in calls_no_pub[0]
+    assert pub_cache_str not in calls_no_pub[0]
 
 
 async def test_normalize_stackwalk_null_fields_and_errors(

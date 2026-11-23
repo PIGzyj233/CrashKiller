@@ -25,6 +25,7 @@ from app.workers.jobs import (
 from app.workers.tasks import (
     ai_triage,
     disk_gc,
+    fetch_ms_symbols,
     parse_crash,
     recover_crash_jobs,
     resymbolicate,
@@ -39,6 +40,7 @@ TASK_REGISTRY: dict[str, Callable[..., Awaitable[Any]]] = {
     "parse_crash": parse_crash,
     "ai_triage": ai_triage,
     "resymbolicate": resymbolicate,
+    "fetch_ms_symbols": fetch_ms_symbols,
     "disk_gc": disk_gc,
     "run_crash_job": run_crash_job,
 }
@@ -77,6 +79,7 @@ class WorkerSettings:
     redis_settings = parse_redis_settings()
     functions = [
         symbol_ingest, parse_crash, ai_triage, resymbolicate, disk_gc,
+        func(fetch_ms_symbols, keep_result=0),
         func(run_crash_job, keep_result=0),
     ]
     cron_jobs = [
@@ -102,6 +105,8 @@ class TaskDispatcher:
         arq_pool: ArqRedis | None = None,
         exec_fn: Any = None,
         openai_client: Any = None,
+        http_transport: Any = None,
+        cab_exec_fn: Any = None,
     ) -> None:
         self.settings = settings
         self.storage = storage
@@ -112,6 +117,8 @@ class TaskDispatcher:
         self._pool_lock = asyncio.Lock()
         self.exec_fn = exec_fn
         self.openai_client = openai_client
+        self.http_transport = http_transport
+        self.cab_exec_fn = cab_exec_fn
         self._memory_tasks: set[asyncio.Task[Any]] = set()
         self._memory_job_ids: set[str] = set()
         self._memory_job_slots = asyncio.Semaphore(WorkerSettings.max_jobs)
@@ -150,7 +157,11 @@ class TaskDispatcher:
 
         if self.is_memory_mode:
             fn = TASK_REGISTRY[task_name]
-            job_id = str(args[0]) if task_name == "run_crash_job" else None
+            job_id: str | None = None
+            if task_name == "run_crash_job":
+                job_id = str(args[0])
+            elif task_name == "fetch_ms_symbols" and args:
+                job_id = f"msdl-crash:{args[0]}"
             if job_id is not None and job_id in self._memory_job_ids:
                 return None
             ctx: dict[str, Any] = {
@@ -164,6 +175,10 @@ class TaskDispatcher:
                 ctx["exec_fn"] = self.exec_fn
             if self.openai_client is not None:
                 ctx["openai_client"] = self.openai_client
+            if self.http_transport is not None:
+                ctx["http_transport"] = self.http_transport
+            if self.cab_exec_fn is not None:
+                ctx["cab_exec_fn"] = self.cab_exec_fn
 
             task = asyncio.create_task(
                 self._run_memory_task(fn, ctx, *args, **kwargs),

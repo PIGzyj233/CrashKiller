@@ -8,14 +8,20 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.config import Settings, get_settings
-from app.db.models import CrashJob, CrashReport
+from app.db.models import AIAnalysisRun, CrashJob, CrashReport
 from app.db.session import get_session_factory
-from app.services import clustering, dump_parser, settings_service, symbol_service
+from app.services import (
+    clustering,
+    dump_parser,
+    ms_symbol_service,
+    settings_service,
+    symbol_service,
+)
 from app.services.ai_agent import AITriageAgent
 from app.services.events import EventBus, get_event_bus
 from app.services.storage import StorageManager
@@ -26,6 +32,7 @@ from app.workers.jobs import (
     CrashJobClaim,
     CrashJobSuperseded,
     claim_crash_job,
+    crash_has_job,
     enqueue_crash_job,
     finish_crash_job,
     lock_current_crash_job,
@@ -86,6 +93,42 @@ async def _deliver_crash_job(ctx: dict[str, Any], job_id: uuid.UUID) -> None:
                 await enqueue_crash_job(redis_pool, job_id)
     except Exception:
         logger.warning("Crash job %s remains pending after delivery failure", job_id, exc_info=True)
+
+
+async def _dispatch_ms_symbol_fetch(
+    ctx: dict[str, Any],
+    crash_id: uuid.UUID,
+    project_id: uuid.UUID,
+    candidates: list[ms_symbol_service.WindowsSymbolCandidate],
+) -> None:
+    """Best-effort enqueue of non-blocking MSDL symbol import; never raises."""
+    if not candidates:
+        return
+    payload = [cand.to_dict() for cand in candidates]
+    try:
+        if (dispatcher := ctx.get("dispatcher")) is not None:
+            async with asyncio.timeout(JOB_DELIVERY_TIMEOUT_SECONDS):
+                await dispatcher.enqueue(
+                    "fetch_ms_symbols",
+                    str(crash_id),
+                    str(project_id),
+                    payload,
+                )
+        elif (redis_pool := ctx.get("redis")) is not None:
+            async with asyncio.timeout(JOB_DELIVERY_TIMEOUT_SECONDS):
+                await redis_pool.enqueue_job(
+                    "fetch_ms_symbols",
+                    str(crash_id),
+                    str(project_id),
+                    payload,
+                    _job_id=f"msdl-crash:{crash_id}",
+                )
+    except Exception:
+        logger.warning(
+            "Could not enqueue fetch_ms_symbols for crash %s",
+            crash_id,
+            exc_info=True,
+        )
 
 
 async def _set_crash_stage(
@@ -246,6 +289,7 @@ async def parse_crash(
                     return {"crash_id": str(cid), "status": "superseded"}
 
             project = crash.project
+            crash_project_id = crash.project_id
             dump_path = crash.dump_path
             existing_os_version = crash.os_version
             project_settings_json = project.settings_json if project else None
@@ -316,6 +360,31 @@ async def parse_crash(
             if should_run_ai and (claim is not None or ctx.get("redis") is not None):
                 next_job_id = stage_crash_job(session, cid, "ai_triage")
             await session.commit()
+
+        if (
+            not resymbolication
+            and eff_settings.ENABLE_PUBLIC_SYMBOLS
+            and eff_settings.MS_SYMBOL_AUTO_FETCH
+            and ms_symbol_service.split_public_symbol_urls(eff_settings.PUBLIC_SYMBOL_URLS)[1]
+            and not ms_symbol_service.is_circuit_open(eff_storage)
+        ):
+            try:
+                ms_candidates = ms_symbol_service.select_windows_system_candidates(
+                    os_version=parsed.os_version,
+                    parsed_stacks_json=parsed.parsed_stacks_json,
+                    missing_symbols_json=parsed.missing_symbols_json,
+                    storage=eff_storage,
+                    settings=eff_settings,
+                    project_id=crash_project_id,
+                )
+                if ms_candidates:
+                    await _dispatch_ms_symbol_fetch(ctx, cid, crash_project_id, ms_candidates)
+            except Exception:
+                logger.warning(
+                    "Could not schedule MSDL symbol fetch for crash %s",
+                    cid,
+                    exc_info=True,
+                )
 
         if should_run_ai:
             await _publish_status(
@@ -481,6 +550,104 @@ async def resymbolicate(
     return {
         "resymbolicated_count": len(processed_ids),
         "crash_ids": processed_ids,
+    }
+
+
+async def fetch_ms_symbols(
+    ctx: dict[str, Any],
+    crash_id: str | uuid.UUID,
+    project_id: str | uuid.UUID,
+    candidates_payload: list[dict[str, Any]],
+    auto_resymbolicate: bool = True,
+) -> dict[str, Any]:
+    """Fetch missing Windows system symbols from MSDL, cache .sym, and resymbolicate if idle."""
+    session_factory, base_settings, _ = _resolve_ctx_defaults(ctx)
+    cid = uuid.UUID(str(crash_id))
+    pid = uuid.UUID(str(project_id))
+
+    candidates = [
+        cand
+        for item in (candidates_payload or [])
+        if isinstance(item, dict)
+        and (cand := ms_symbol_service.WindowsSymbolCandidate.from_dict(item)) is not None
+    ]
+    if not candidates:
+        return {
+            "crash_id": str(cid),
+            "imported": 0,
+            "resymbolicate_queued": False,
+        }
+
+    async with session_factory() as session:
+        effective_app = await settings_service.get_effective_app_settings(
+            session, base_settings=base_settings
+        )
+    eff_storage = _effective_storage(ctx, effective_app)
+
+    if not effective_app.ENABLE_PUBLIC_SYMBOLS or not effective_app.MS_SYMBOL_AUTO_FETCH:
+        return {
+            "crash_id": str(cid),
+            "imported": 0,
+            "resymbolicate_queued": False,
+        }
+
+    summary = await ms_symbol_service.fetch_and_import_windows_symbols(
+        candidates,
+        eff_storage,
+        effective_app,
+        project_id=pid,
+        exec_fn=ctx.get("exec_fn"),
+        cab_exec_fn=ctx.get("cab_exec_fn"),
+        http_transport=ctx.get("http_transport"),
+    )
+
+    resym_job_id: uuid.UUID | None = None
+    if summary.imported > 0 and auto_resymbolicate and effective_app.MS_SYMBOL_AUTO_RESYMBOLICATE:
+        try:
+            async with eff_storage.shared_lock("capacity"):
+                async with session_factory() as session:
+                    has_ai_run = (
+                        await session.scalar(
+                            select(AIAnalysisRun.id)
+                            .where(AIAnalysisRun.crash_id == cid)
+                            .limit(1)
+                        )
+                        is not None
+                    )
+                    reserved = await session.scalar(
+                        update(CrashReport)
+                        .where(
+                            CrashReport.id == cid,
+                            CrashReport.dump_path.is_not(None),
+                            CrashReport.status.notin_(ACTIVE_CRASH_STATUSES),
+                            ~crash_has_job(),
+                        )
+                        .values(status="PENDING")
+                        .returning(CrashReport.id)
+                    )
+                    if reserved is not None:
+                        resym_job_id = stage_crash_job(
+                            session,
+                            cid,
+                            "resymbolicate",
+                            run_ai_override=False if has_ai_run else None,
+                        )
+                        await session.commit()
+        except Exception:
+            logger.warning(
+                "Could not schedule auto-resymbolicate for crash %s after MSDL import",
+                cid,
+                exc_info=True,
+            )
+            resym_job_id = None
+
+    if resym_job_id is not None:
+        await _deliver_crash_job(ctx, resym_job_id)
+
+    return {
+        **summary.to_dict(),
+        "crash_id": str(cid),
+        "resymbolicate_queued": resym_job_id is not None,
     }
 
 

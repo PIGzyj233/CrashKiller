@@ -90,12 +90,21 @@ class Settings(BaseSettings):
     # --- Native Symbol & MiniDump Toolchain ---
     DUMP_SYMS_BIN: str = "dump_syms"
     MINIDUMP_STACKWALK_BIN: str = "minidump-stackwalk"
+    CABEXTRACT_BIN: str = "cabextract"
     ENABLE_PUBLIC_SYMBOLS: bool = True
     PUBLIC_SYMBOL_URLS: StrList = [
         "https://symbols.mozilla.org/",
         "https://msdl.microsoft.com/download/symbols/",
     ]
     TOOL_TIMEOUT_SECONDS: int = 120
+    MS_SYMBOL_AUTO_FETCH: bool = True
+    MS_SYMBOL_FETCH_PE_UNWIND: bool = True
+    MS_SYMBOL_FETCH_TIMEOUT_SECONDS: int = 30
+    MS_SYMBOL_MAX_MODULES_PER_CRASH: int = 16
+    MS_SYMBOL_MAX_PDB_MB: int = 64
+    MS_SYMBOL_MAX_PE_MB: int = 32
+    MS_SYMBOL_NEGATIVE_CACHE_HOURS: int = 24
+    MS_SYMBOL_AUTO_RESYMBOLICATE: bool = True
 
     # --- Chunked Zstd Compression ---
     LOG_CHUNK_SIZE_BYTES: int = 262144
