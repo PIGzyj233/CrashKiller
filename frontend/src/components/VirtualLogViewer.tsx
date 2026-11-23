@@ -36,6 +36,7 @@ import type {
   LogLine,
   LogSearchResponse,
 } from "../api/types";
+import { useAppI18n } from "../i18n";
 
 export interface LogHighlightRange {
   logId: string;
@@ -122,6 +123,7 @@ export function VirtualLogViewer({
   crashTime,
   highlightRange,
 }: VirtualLogViewerProps) {
+  const { t, formatNumber } = useAppI18n();
   const [internalLogId, setInternalLogId] = useState<string>(
     () => logs[0]?.id ?? "",
   );
@@ -417,7 +419,7 @@ export function VirtualLogViewer({
             }));
           } else {
             const msg =
-              err instanceof Error ? err.message : "Failed to fetch log lines";
+              err instanceof Error ? err.message : t("log.fetchLinesFailed");
             failedPagesRef.current.set(key, msg);
             setPageErrorByLog((prev) => ({
               ...prev,
@@ -432,7 +434,7 @@ export function VirtualLogViewer({
       inFlightRef.current.set(key, promise);
       return promise;
     },
-    [gcErrorByLog, touchAndStorePage],
+    [gcErrorByLog, t, touchAndStorePage],
   );
 
   // Compute virtual items and primitive bounds for prefetching
@@ -610,7 +612,7 @@ export function VirtualLogViewer({
       if (res.lines.length === 0) {
         setAroundTimeInfo({
           logId: requestLogId,
-          text: "No log lines found within this time window.",
+          text: t("log.noLinesInWindow"),
         });
         return;
       }
@@ -637,7 +639,11 @@ export function VirtualLogViewer({
       jumpToLine(bestLine);
       setAroundTimeInfo({
         logId: requestLogId,
-        text: `Jumped to L${bestLine} (${res.lines.length} lines in ±${res.window_sec}s window)`,
+        text: t("log.jumpedAroundTime", {
+          line: bestLine,
+          count: res.lines.length,
+          sec: res.window_sec,
+        }),
       });
     } catch (err) {
       if (!isMountedRef.current) {
@@ -657,7 +663,7 @@ export function VirtualLogViewer({
       }
       if (!(err instanceof ApiError && (err.status === 404 || err.status === 410))) {
         setAroundTimeError(
-          err instanceof Error ? err.message : "Failed to jump around timestamp",
+          err instanceof Error ? err.message : t("log.jumpAroundTimeFailed"),
         );
       }
     } finally {
@@ -720,7 +726,7 @@ export function VirtualLogViewer({
       setSearchResult(null);
       setActiveMatchIdx(-1);
       if (!(err instanceof ApiError && (err.status === 404 || err.status === 410))) {
-        setSearchError(err instanceof Error ? err.message : "Log search failed");
+        setSearchError(err instanceof Error ? err.message : t("log.searchFailed"));
       }
     } finally {
       if (
@@ -795,12 +801,12 @@ export function VirtualLogViewer({
       <div className="rounded-xl border border-dashed border-slate-300 bg-white px-6 py-12 text-center shadow-sm">
         <FileText className="mx-auto h-7 w-7 text-slate-400" />
         <p className="mt-2 text-sm font-medium text-slate-700">
-          No log files attached to this crash report.
+          {t("log.noLogsTitle")}
         </p>
         <p className="mt-1 text-xs text-slate-500">
-          Attach <span className="font-mono">.log</span> or text files when
-          uploading crashes to inspect them with virtualized search and
-          timestamp navigation.
+          {t("log.noLogsHintBefore")}
+          <span className="font-mono">.log</span>
+          {t("log.noLogsHintAfter")}
         </p>
       </div>
     );
@@ -836,12 +842,12 @@ export function VirtualLogViewer({
                 <FileText className="h-3.5 w-3.5 shrink-0" />
                 <span className="max-w-[180px] truncate">{log.filename}</span>
                 <span className="font-mono text-[11px] text-slate-400">
-                  {log.total_lines.toLocaleString()}L ·{" "}
-                  {formatBytes(log.raw_size)}
+                  {t("log.linesShort", { lines: formatNumber(log.total_lines) })}{" "}
+                  · {formatBytes(log.raw_size)}
                 </span>
                 {errCount > 0 && (
                   <span className="rounded-full bg-rose-100 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-rose-700">
-                    {errCount} err
+                    {t("log.errorsShort", { count: errCount })}
                   </span>
                 )}
               </button>
@@ -853,44 +859,47 @@ export function VirtualLogViewer({
           type="button"
           onClick={() => setSidebarOpen((prev) => !prev)}
           className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-slate-300 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50"
-          title={sidebarOpen ? "Hide digest sidebar" : "Show digest sidebar"}
+          title={sidebarOpen ? t("log.hideDigestTitle") : t("log.showDigestTitle")}
         >
           {sidebarOpen ? (
             <PanelRightClose className="h-3.5 w-3.5" />
           ) : (
             <PanelRightOpen className="h-3.5 w-3.5" />
           )}
-          <span className="hidden sm:inline">Digest</span>
+          <span className="hidden sm:inline">{t("log.digestButton")}</span>
         </button>
       </div>
 
       {totalLines > WINDOW_LINES && !activeGcError && (
         <nav
-          aria-label="Log navigation"
+          aria-label={t("log.navAria")}
           className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-700"
         >
           <div className="flex items-center gap-2">
             <button
               type="button"
-              aria-label="Previous log window"
+              aria-label={t("log.prevWindowAria")}
               disabled={windowStart === 0}
               onClick={() => jumpToLine(windowStart - WINDOW_LINES + 1, "start")}
               className="rounded border border-slate-300 bg-white px-2 py-1 hover:bg-slate-100 disabled:opacity-40"
             >
-              Previous
+              {t("log.prevWindow")}
             </button>
             <span aria-live="polite" className="font-mono">
-              Lines {(windowStart + 1).toLocaleString()}–{windowEnd.toLocaleString()}
-              {" of "}{totalLines.toLocaleString()}
+              {t("log.windowRange", {
+                start: formatNumber(windowStart + 1),
+                end: formatNumber(windowEnd),
+                total: formatNumber(totalLines),
+              })}
             </span>
             <button
               type="button"
-              aria-label="Next log window"
+              aria-label={t("log.nextWindowAria")}
               disabled={windowEnd === totalLines}
               onClick={() => jumpToLine(windowEnd + 1, "start")}
               className="rounded border border-slate-300 bg-white px-2 py-1 hover:bg-slate-100 disabled:opacity-40"
             >
-              Next
+              {t("log.nextWindow")}
             </button>
           </div>
           <form
@@ -903,20 +912,20 @@ export function VirtualLogViewer({
             className="flex items-center gap-1.5"
           >
             <input
-              aria-label="Log line number"
+              aria-label={t("log.lineNumberAria")}
               name="line"
               type="number"
               min={1}
               max={totalLines}
               required
-              placeholder="Line number"
+              placeholder={t("log.lineNumberPlaceholder")}
               className="w-32 rounded border border-slate-300 bg-white px-2 py-1 font-mono"
             />
             <button
               type="submit"
               className="rounded border border-slate-300 bg-white px-2 py-1 hover:bg-slate-100"
             >
-              Go to line
+              {t("log.goToLine")}
             </button>
           </form>
         </nav>
@@ -938,8 +947,8 @@ export function VirtualLogViewer({
                 type="text"
                 value={searchPattern}
                 onChange={(e) => setSearchPattern(e.target.value)}
-                placeholder="Search log (keyword or regex)..."
-                aria-label="Search log"
+                placeholder={t("log.searchPlaceholder")}
+                aria-label={t("log.searchAria")}
                 disabled={Boolean(activeGcError)}
                 className="h-8 w-full rounded-md border border-slate-300 bg-white pl-8 pr-7 font-mono text-xs text-slate-800 placeholder:font-sans placeholder:text-slate-400 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 disabled:bg-slate-100"
               />
@@ -953,7 +962,7 @@ export function VirtualLogViewer({
                     setActiveMatchIdx(-1);
                     setSearchError(null);
                   }}
-                  aria-label="Clear search"
+                  aria-label={t("log.clearSearchAria")}
                   className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600"
                 >
                   <X className="h-3.5 w-3.5" />
@@ -965,7 +974,7 @@ export function VirtualLogViewer({
               type="button"
               onClick={() => setIsRegex((prev) => !prev)}
               aria-pressed={isRegex}
-              title="Toggle Regular Expression"
+              title={t("log.toggleRegexTitle")}
               className={`h-8 rounded-md border px-2 font-mono text-xs font-semibold transition-colors ${
                 isRegex
                   ? "border-indigo-300 bg-indigo-50 text-indigo-700"
@@ -979,7 +988,7 @@ export function VirtualLogViewer({
               type="button"
               onClick={() => setCaseSensitive((prev) => !prev)}
               aria-pressed={caseSensitive}
-              title="Toggle Case Sensitive"
+              title={t("log.toggleCaseTitle")}
               className={`h-8 rounded-md border px-2 font-mono text-xs font-semibold transition-colors ${
                 caseSensitive
                   ? "border-indigo-300 bg-indigo-50 text-indigo-700"
@@ -1001,7 +1010,7 @@ export function VirtualLogViewer({
               ) : (
                 <Search className="h-3.5 w-3.5" />
               )}
-              <span>Search</span>
+              <span>{t("log.searchButton")}</span>
             </button>
 
             {searchResult && searchResult.log_id === resolvedActiveLogId && (
@@ -1009,7 +1018,7 @@ export function VirtualLogViewer({
                 <span className="rounded bg-slate-100 px-2 py-1 font-mono text-[11px] text-slate-700">
                   {searchResult.matches.length > 0
                     ? `${activeMatchIdx + 1} / ${searchResult.matches.length}`
-                    : "0 matches"}{" "}
+                    : t("log.zeroMatches")}{" "}
                   <span className="text-slate-400">
                     ({searchResult.elapsed_ms.toFixed(1)} ms)
                   </span>
@@ -1018,7 +1027,7 @@ export function VirtualLogViewer({
                   type="button"
                   onClick={() => goToMatch(-1)}
                   disabled={searchResult.matches.length === 0}
-                  aria-label="Previous match"
+                  aria-label={t("log.prevMatchAria")}
                   className="inline-flex h-7 w-7 items-center justify-center rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 disabled:opacity-40"
                 >
                   <ChevronUp className="h-3.5 w-3.5" />
@@ -1027,7 +1036,7 @@ export function VirtualLogViewer({
                   type="button"
                   onClick={() => goToMatch(1)}
                   disabled={searchResult.matches.length === 0}
-                  aria-label="Next match"
+                  aria-label={t("log.nextMatchAria")}
                   className="inline-flex h-7 w-7 items-center justify-center rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 disabled:opacity-40"
                 >
                   <ChevronDown className="h-3.5 w-3.5" />
@@ -1048,10 +1057,10 @@ export function VirtualLogViewer({
                   void handleJumpAroundTime(crashTime);
                 }}
                 className="inline-flex h-8 items-center gap-1 rounded-md border border-rose-200 bg-rose-50 px-2.5 text-xs font-medium text-rose-700 hover:bg-rose-100 disabled:opacity-50"
-                title={`Jump to crash time (${crashTime})`}
+                title={t("log.jumpCrashTimeTitle", { time: crashTime })}
               >
                 <Clock className="h-3.5 w-3.5" />
-                <span>Crash Time</span>
+                <span>{t("log.crashTimeBtn")}</span>
               </button>
             )}
 
@@ -1062,14 +1071,14 @@ export function VirtualLogViewer({
                 setTimestampInput(e.target.value);
                 setTimestampDirty(true);
               }}
-              placeholder="ISO timestamp..."
-              aria-label="Timestamp jump target"
+              placeholder={t("log.timestampPlaceholder")}
+              aria-label={t("log.timestampAria")}
               disabled={Boolean(activeGcError)}
               className="h-8 w-44 rounded-md border border-slate-300 bg-white px-2 font-mono text-xs text-slate-800 placeholder:font-sans placeholder:text-slate-400 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 disabled:bg-slate-100"
             />
 
             <select
-              aria-label="Timestamp window seconds"
+              aria-label={t("log.windowSecAria")}
               value={windowSec}
               onChange={(e) => setWindowSec(Number(e.target.value))}
               disabled={Boolean(activeGcError)}
@@ -1098,7 +1107,7 @@ export function VirtualLogViewer({
               ) : (
                 <Clock className="h-3.5 w-3.5" />
               )}
-              <span>Jump</span>
+              <span>{t("log.jumpBtn")}</span>
             </button>
           </div>
         </div>
@@ -1129,8 +1138,9 @@ export function VirtualLogViewer({
             <div className="flex items-center gap-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-1.5 text-xs text-amber-900">
               <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-amber-600" />
               <span>
-                Showing first {searchResult.matches.length} matches (result set
-                truncated at limit). Refine your pattern to narrow down results.
+                {t("log.truncatedWarning", {
+                  count: searchResult.matches.length,
+                })}
               </span>
             </div>
           )}
@@ -1182,31 +1192,31 @@ export function VirtualLogViewer({
               </div>
               <div className="max-w-md space-y-1">
                 <h3 className="text-sm font-semibold text-white">
-                  Raw compressed log unavailable (HTTP {activeGcError.status})
+                  {t("log.gcUnavailableTitle", { status: activeGcError.status })}
                 </h3>
                 <p className="text-xs text-slate-400">
-                  This log file&apos;s compressed archive was reclaimed by disk
-                  garbage collection or retention cleanup. Its PostgreSQL error
-                  digest and tail lines remain accessible in the Digest sidebar.
+                  {t("log.gcUnavailableDesc")}
                 </p>
               </div>
             </div>
           ) : totalLines === 0 ? (
             <div className="flex h-[320px] items-center justify-center text-xs text-slate-400">
-              This log file is empty (0 lines).
+              {t("log.emptyLogFile")}
             </div>
           ) : (
             <>
               {activePageError && (
                 <div className="flex items-center justify-between gap-2 border-b border-rose-500/30 bg-rose-950/80 px-3 py-1.5 text-xs text-rose-200">
-                  <span>Error loading log chunks: {activePageError}</span>
+                  <span>
+                    {t("log.chunkErrorPrefix", { error: activePageError })}
+                  </span>
                   <button
                     type="button"
                     onClick={handleRetryFetch}
                     className="inline-flex items-center gap-1 rounded border border-rose-400/40 bg-rose-900/60 px-2 py-0.5 text-[11px] font-medium text-white hover:bg-rose-800"
                   >
                     <RefreshCw className="h-3 w-3" />
-                    Retry
+                    {t("log.retry")}
                   </button>
                 </div>
               )}
@@ -1302,7 +1312,7 @@ export function VirtualLogViewer({
                       : "text-slate-400 hover:text-slate-200"
                   }`}
                 >
-                  Errors ({recentErrors.length})
+                  {t("log.tabErrors", { count: recentErrors.length })}
                 </button>
                 <button
                   type="button"
@@ -1313,7 +1323,7 @@ export function VirtualLogViewer({
                       : "text-slate-400 hover:text-slate-200"
                   }`}
                 >
-                  Tail ({tailLines.length})
+                  {t("log.tabTail", { count: tailLines.length })}
                 </button>
               </div>
               {activeDigest && (
@@ -1328,7 +1338,7 @@ export function VirtualLogViewer({
               {sidebarTab === "errors" ? (
                 recentErrors.length === 0 ? (
                   <div className="px-4 py-8 text-center text-xs text-slate-400">
-                    No ERROR / FATAL / ASSERT digest entries recorded.
+                    {t("log.noDigestErrors")}
                   </div>
                 ) : (
                   recentErrors.map((entry, idx) => {
@@ -1372,7 +1382,7 @@ export function VirtualLogViewer({
                 )
               ) : tailLines.length === 0 ? (
                 <div className="px-4 py-8 text-center text-xs text-slate-400">
-                  No tail lines recorded in digest.
+                  {t("log.noDigestTail")}
                 </div>
               ) : (
                 tailLines.map((entry, idx) => {

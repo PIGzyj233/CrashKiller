@@ -23,6 +23,7 @@ import type {
   IssueSplitResponse,
   IssueStatus,
   IssueUpdateRequest,
+  LLMProviderPreset,
   LogAroundTimeResponse,
   LogLinesResponse,
   LogSearchResponse,
@@ -721,6 +722,10 @@ export function splitIssueCluster(
 
 export function getSystemSettings(): Promise<SystemSettingsRead> {
   return requestJson<SystemSettingsRead>(`${API_BASE}/settings`);
+}
+
+export function listLLMProviders(): Promise<LLMProviderPreset[]> {
+  return requestJson<LLMProviderPreset[]>(`${API_BASE}/settings/llm-providers`);
 }
 
 export function updateSystemSettings(

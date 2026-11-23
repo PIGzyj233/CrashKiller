@@ -30,6 +30,7 @@ import {
   uploadSymbol,
 } from "../api/client";
 import type { ProjectRead } from "../api/types";
+import { i18n, useAppI18n } from "../i18n";
 
 export interface UploadModalProps {
   isOpen: boolean;
@@ -75,20 +76,20 @@ function resolveInitialProjectKey(
 function formatUploadError(err: unknown): string {
   if (err instanceof ApiError) {
     if (err.status === 401 || err.status === 403) {
-      return `${err.message} — Verify the Project API Key (or rotate it in Settings).`;
+      return i18n.t("upload.errorAuth", { message: err.message });
     }
     if (err.status === 413) {
-      return `Upload exceeds the 2GB server limit (${err.message}).`;
+      return i18n.t("upload.errorTooLarge", { message: err.message });
     }
     if (err.status === 507) {
-      return `Server disk quota or 50GB host safety floor reached (${err.message}).`;
+      return i18n.t("upload.errorDiskFull", { message: err.message });
     }
     return err.message;
   }
   if (err instanceof Error) {
     return err.message;
   }
-  return "Upload failed due to an unexpected error.";
+  return i18n.t("upload.errorUnexpected");
 }
 
 export function UploadModal({
@@ -99,6 +100,7 @@ export function UploadModal({
   defaultProjectKey,
   onSuccess,
 }: UploadModalProps) {
+  const { t } = useAppI18n();
   const [activeMode, setActiveMode] = useState<"crash" | "symbol">(mode);
   const [selectedProjectKey, setSelectedProjectKey] = useState<string>(() =>
     resolveInitialProjectKey(projects, defaultProjectKey),
@@ -238,9 +240,7 @@ export function UploadModal({
     const valid: File[] = [];
     for (const f of incoming) {
       if (blockedExt.test(f.name)) {
-        setErrorMessage(
-          `File "${f.name}" looks like a dump or symbol binary, not a log file.`,
-        );
+        setErrorMessage(t("upload.errBinaryInLogs", { name: f.name }));
         return;
       }
       valid.push(f);
@@ -273,11 +273,11 @@ export function UploadModal({
     const nonDmp = list.filter((f) => !f.name.toLowerCase().endsWith(".dmp"));
 
     if (dmpCandidates.length > 1) {
-      setErrorMessage("Only one .dmp file can be uploaded per crash.");
+      setErrorMessage(t("upload.errMultiDmp"));
       return;
     }
     if (dmpCandidates.length === 0) {
-      setErrorMessage("Dump file must have a .dmp extension.");
+      setErrorMessage(t("upload.errNeedDmpExt"));
       return;
     }
     setDumpFile(dmpCandidates[0]);
@@ -293,7 +293,7 @@ export function UploadModal({
     }
     const file = files[0];
     if (!file.name.toLowerCase().endsWith(".pdb")) {
-      setErrorMessage("Symbol file must have a .pdb extension.");
+      setErrorMessage(t("upload.errNeedPdbExt"));
       return;
     }
     setPdbFile(file);
@@ -306,7 +306,7 @@ export function UploadModal({
     }
     const file = files[0];
     if (!/\.(exe|dll)$/i.test(file.name)) {
-      setErrorMessage("PE companion file must be a .exe or .dll binary.");
+      setErrorMessage(t("upload.errNeedPeExt"));
       return;
     }
     setPeFile(file);
@@ -320,24 +320,24 @@ export function UploadModal({
     }
 
     if (!selectedProjectKey) {
-      setErrorMessage("Please select a target project.");
+      setErrorMessage(t("upload.errSelectProject"));
       return;
     }
     if (!apiKey.trim()) {
-      setErrorMessage("Project API key is required for uploads.");
+      setErrorMessage(t("upload.errNeedApiKey"));
       return;
     }
     if (!appVersion.trim()) {
-      setErrorMessage("App version is required (e.g. 1.2.0).");
+      setErrorMessage(t("upload.errNeedAppVersion"));
       return;
     }
 
     if (activeMode === "crash" && !dumpFile) {
-      setErrorMessage("Please attach a .dmp crash dump file.");
+      setErrorMessage(t("upload.errAttachDump"));
       return;
     }
     if (activeMode === "symbol" && !pdbFile) {
-      setErrorMessage("Please attach a .pdb symbol file.");
+      setErrorMessage(t("upload.errAttachPdb"));
       return;
     }
 
@@ -446,13 +446,13 @@ export function UploadModal({
                 className="text-sm font-semibold text-slate-900"
               >
                 {activeMode === "crash"
-                  ? "Upload Crash Dump & Logs"
-                  : "Upload Debug Symbols"}
+                  ? t("upload.crashHeaderTitle")
+                  : t("upload.symbolHeaderTitle")}
               </h2>
               <p className="text-xs text-slate-500">
                 {activeMode === "crash"
-                  ? "Submit a Windows MiniDump (.dmp) with optional log files for triage"
-                  : "Convert PDB + PE companion into Breakpad .sym symbols"}
+                  ? t("upload.crashHeaderSubtitle")
+                  : t("upload.symbolHeaderSubtitle")}
               </p>
             </div>
           </div>
@@ -460,7 +460,7 @@ export function UploadModal({
           <button
             type="button"
             onClick={handleClose}
-            aria-label="Close upload modal"
+            aria-label={t("upload.closeModalAria")}
             className="rounded-md p-1.5 text-slate-400 hover:bg-slate-200/70 hover:text-slate-700"
           >
             <X className="h-4 w-4" />
@@ -482,7 +482,7 @@ export function UploadModal({
                 : "border-transparent text-slate-500 hover:text-slate-800"
             }`}
           >
-            Crash Dump (.dmp + .log)
+            {t("upload.tabCrash")}
           </button>
           <button
             type="button"
@@ -497,7 +497,7 @@ export function UploadModal({
                 : "border-transparent text-slate-500 hover:text-slate-800"
             }`}
           >
-            Symbol Package (.pdb + .exe/.dll)
+            {t("upload.tabSymbol")}
           </button>
         </div>
 
@@ -526,7 +526,8 @@ export function UploadModal({
                   htmlFor="upload-project-select"
                   className="mb-1 block text-xs font-medium text-slate-700"
                 >
-                  Project <span className="text-rose-500">*</span>
+                  {t("upload.projectLabel")}{" "}
+                  <span className="text-rose-500">*</span>
                 </label>
                 <select
                   id="upload-project-select"
@@ -536,7 +537,7 @@ export function UploadModal({
                   className="h-9 w-full rounded-md border border-slate-300 bg-white px-2.5 text-xs text-slate-800 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 disabled:bg-slate-100"
                 >
                   {projects.length === 0 ? (
-                    <option value="">No projects available</option>
+                    <option value="">{t("upload.noProjects")}</option>
                   ) : (
                     projects.map((p) => (
                       <option key={p.id} value={p.key}>
@@ -552,7 +553,8 @@ export function UploadModal({
                   htmlFor="upload-app-version"
                   className="mb-1 block text-xs font-medium text-slate-700"
                 >
-                  App Version <span className="text-rose-500">*</span>
+                  {t("upload.appVersionLabel")}{" "}
+                  <span className="text-rose-500">*</span>
                 </label>
                 <input
                   id="upload-app-version"
@@ -560,7 +562,7 @@ export function UploadModal({
                   value={appVersion}
                   disabled={isUploading}
                   onChange={(e) => setAppVersion(e.target.value)}
-                  placeholder="e.g. 2.4.1"
+                  placeholder={t("upload.appVersionPlaceholder")}
                   className="h-9 w-full rounded-md border border-slate-300 bg-white px-2.5 font-mono text-xs text-slate-800 placeholder:font-sans placeholder:text-slate-400 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 disabled:bg-slate-100"
                 />
               </div>
@@ -575,12 +577,13 @@ export function UploadModal({
                 >
                   <KeyRound className="h-3.5 w-3.5 text-slate-400" />
                   <span>
-                    Project API Key <span className="text-rose-500">*</span>
+                    {t("upload.apiKeyLabel")}{" "}
+                    <span className="text-rose-500">*</span>
                   </span>
                 </label>
                 {isApiKeyPrefilled && (
                   <span className="rounded bg-emerald-50 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700">
-                    Prefilled from browser storage
+                    {t("upload.apiKeyPrefilled")}
                   </span>
                 )}
               </div>
@@ -595,13 +598,17 @@ export function UploadModal({
                     setApiKey(e.target.value);
                     setIsApiKeyPrefilled(false);
                   }}
-                  placeholder="Enter project API key (X-API-Key)"
+                  placeholder={t("upload.apiKeyPlaceholder")}
                   className="h-9 w-full rounded-md border border-slate-300 bg-white pl-2.5 pr-9 font-mono text-xs text-slate-800 placeholder:font-sans placeholder:text-slate-400 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 disabled:bg-slate-100"
                 />
                 <button
                   type="button"
                   onClick={() => setShowApiKey((prev) => !prev)}
-                  aria-label={showApiKey ? "Hide API key" : "Show API key"}
+                  aria-label={
+                    showApiKey
+                      ? t("upload.hideApiKey")
+                      : t("upload.showApiKey")
+                  }
                   className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600"
                 >
                   {showApiKey ? (
@@ -620,7 +627,7 @@ export function UploadModal({
                   onChange={(e) => setRememberApiKey(e.target.checked)}
                   className="h-3.5 w-3.5 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
                 />
-                <span>Remember API key in browser</span>
+                <span>{t("upload.rememberApiKey")}</span>
               </label>
             </div>
 
@@ -629,7 +636,7 @@ export function UploadModal({
                 {/* .dmp Dropzone */}
                 <div>
                   <label className="mb-1 block text-xs font-medium text-slate-700">
-                    Crash Dump File (.dmp){" "}
+                    {t("upload.dumpFileLabel")}{" "}
                     <span className="text-rose-500">*</span>
                   </label>
                   <input
@@ -697,7 +704,7 @@ export function UploadModal({
                             setDumpFile(null);
                           }}
                           className="rounded p-1 text-slate-400 hover:bg-slate-200 hover:text-slate-700"
-                          aria-label="Remove dump file"
+                          aria-label={t("upload.removeDumpAria")}
                         >
                           <Trash2 className="h-4 w-4" />
                         </button>
@@ -706,11 +713,12 @@ export function UploadModal({
                       <>
                         <HardDriveUpload className="h-6 w-6 text-slate-400" />
                         <p className="mt-1.5 text-xs font-medium text-slate-700">
-                          Drop <span className="font-mono">.dmp</span> file here
-                          or click to browse
+                          {t("upload.dropDumpTextBefore")}
+                          <span className="font-mono">.dmp</span>
+                          {t("upload.dropDumpTextAfter")}
                         </p>
                         <p className="mt-0.5 text-[11px] text-slate-500">
-                          Tip: You can also drop a .dmp + .log files together
+                          {t("upload.dropDumpTip")}
                         </p>
                       </>
                     )}
@@ -720,7 +728,7 @@ export function UploadModal({
                 {/* Optional Log Files Dropzone */}
                 <div>
                   <label className="mb-1 block text-xs font-medium text-slate-700">
-                    Attached Log Files (optional, 0..N)
+                    {t("upload.logFilesLabel")}
                   </label>
                   <input
                     ref={logInputRef}
@@ -769,8 +777,11 @@ export function UploadModal({
                   >
                     <FileText className="h-4 w-4 text-slate-400" />
                     <span>
-                      Drop <span className="font-mono">.log / .txt</span> files
-                      or click to add ({logFiles.length} selected)
+                      {t("upload.dropLogsTextBefore")}
+                      <span className="font-mono">.log / .txt</span>
+                      {t("upload.dropLogsTextAfter", {
+                        count: logFiles.length,
+                      })}
                     </span>
                   </div>
 
@@ -802,7 +813,9 @@ export function UploadModal({
                                     ),
                                   )
                                 }
-                                aria-label={`Remove ${file.name}`}
+                                aria-label={t("upload.removeFileAria", {
+                                  name: file.name,
+                                })}
                                 className="rounded p-0.5 text-slate-400 hover:bg-slate-100 hover:text-slate-700"
                               >
                                 <X className="h-3.5 w-3.5" />
@@ -822,7 +835,7 @@ export function UploadModal({
                       htmlFor="upload-build-id"
                       className="mb-1 block text-xs font-medium text-slate-700"
                     >
-                      Build ID (optional)
+                      {t("upload.buildIdLabel")}
                     </label>
                     <input
                       id="upload-build-id"
@@ -830,7 +843,7 @@ export function UploadModal({
                       value={buildId}
                       disabled={isUploading}
                       onChange={(e) => setBuildId(e.target.value)}
-                      placeholder="e.g. ci-9482"
+                      placeholder={t("upload.buildIdPlaceholder")}
                       className="h-8 w-full rounded-md border border-slate-300 bg-white px-2.5 font-mono text-xs text-slate-800 placeholder:font-sans placeholder:text-slate-400 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
                     />
                   </div>
@@ -839,7 +852,7 @@ export function UploadModal({
                       htmlFor="upload-os-version"
                       className="mb-1 block text-xs font-medium text-slate-700"
                     >
-                      OS Version (optional)
+                      {t("upload.osVersionLabel")}
                     </label>
                     <input
                       id="upload-os-version"
@@ -847,7 +860,7 @@ export function UploadModal({
                       value={osVersion}
                       disabled={isUploading}
                       onChange={(e) => setOsVersion(e.target.value)}
-                      placeholder="e.g. Windows 11 23H2"
+                      placeholder={t("upload.osVersionPlaceholder")}
                       className="h-8 w-full rounded-md border border-slate-300 bg-white px-2.5 text-xs text-slate-800 placeholder:text-slate-400 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
                     />
                   </div>
@@ -856,7 +869,7 @@ export function UploadModal({
                       htmlFor="upload-crash-time"
                       className="mb-1 block text-xs font-medium text-slate-700"
                     >
-                      Crash Time (optional)
+                      {t("upload.crashTimeLabel")}
                     </label>
                     <input
                       id="upload-crash-time"
@@ -874,7 +887,7 @@ export function UploadModal({
                 {/* .pdb Dropzone */}
                 <div>
                   <label className="mb-1 block text-xs font-medium text-slate-700">
-                    PDB Symbol File (.pdb){" "}
+                    {t("upload.pdbFileLabel")}{" "}
                     <span className="text-rose-500">*</span>
                   </label>
                   <input
@@ -940,7 +953,7 @@ export function UploadModal({
                             setPdbFile(null);
                           }}
                           className="rounded p-1 text-slate-400 hover:bg-slate-200 hover:text-slate-700"
-                          aria-label="Remove PDB file"
+                          aria-label={t("upload.removePdbAria")}
                         >
                           <Trash2 className="h-4 w-4" />
                         </button>
@@ -949,8 +962,9 @@ export function UploadModal({
                       <>
                         <FileCode2 className="h-6 w-6 text-slate-400" />
                         <p className="mt-1.5 text-xs font-medium text-slate-700">
-                          Drop <span className="font-mono">.pdb</span> file here
-                          or click to browse
+                          {t("upload.dropPdbTextBefore")}
+                          <span className="font-mono">.pdb</span>
+                          {t("upload.dropPdbTextAfter")}
                         </p>
                       </>
                     )}
@@ -960,8 +974,7 @@ export function UploadModal({
                 {/* Optional PE Companion (.exe / .dll) */}
                 <div>
                   <label className="mb-1 block text-xs font-medium text-slate-700">
-                    PE Companion Binary (.exe / .dll, recommended for x64 CFI
-                    unwind)
+                    {t("upload.peFileLabel")}
                   </label>
                   <input
                     ref={peInputRef}
@@ -1026,16 +1039,18 @@ export function UploadModal({
                             setPeFile(null);
                           }}
                           className="rounded p-1 text-slate-400 hover:bg-slate-200 hover:text-slate-700"
-                          aria-label="Remove PE file"
+                          aria-label={t("upload.removePeAria")}
                         >
                           <Trash2 className="h-4 w-4" />
                         </button>
                       </div>
                     ) : (
                       <p className="text-xs text-slate-600">
-                        Drop matching <span className="font-mono">.exe</span>{" "}
-                        or <span className="font-mono">.dll</span> here
-                        (optional)
+                        {t("upload.dropPeTextBefore")}
+                        <span className="font-mono">.exe</span>
+                        {t("upload.dropPeTextMid")}
+                        <span className="font-mono">.dll</span>
+                        {t("upload.dropPeTextAfter")}
                       </p>
                     )}
                   </div>
@@ -1051,22 +1066,17 @@ export function UploadModal({
                     <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
                     <div>
                       <p className="font-semibold">
-                        缺少 PE 伴随文件，x64 栈展开可能受限
+                        {t("upload.peWarningTitle")}
                       </p>
                       <p className="mt-0.5 text-amber-800">
-                        Uploading PDB alone is supported as a fallback, but
-                        attaching the matching .exe / .dll provides
-                        .pdata/.xdata STACK CFI unwind tables for accurate x64
-                        stack walking.
+                        {t("upload.peWarningDesc")}
                       </p>
                     </div>
                   </div>
                 ) : (
                   <div className="flex items-center gap-2 rounded-lg border border-emerald-200 bg-emerald-50 px-3.5 py-2 text-xs text-emerald-800">
                     <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" />
-                    <span>
-                      PE companion attached — full x64 STACK CFI unwind enabled.
-                    </span>
+                    <span>{t("upload.peAttachedOk")}</span>
                   </div>
                 )}
               </>
@@ -1078,10 +1088,10 @@ export function UploadModal({
                 <div className="flex items-center justify-between text-xs">
                   <span className="font-medium text-slate-700">
                     {progress < 100
-                      ? `Uploading... ${progress}%`
+                      ? t("upload.uploadingProgress", { progress })
                       : activeMode === "symbol"
-                        ? "100% — Converting PDB with dump_syms on server..."
-                        : "100% — Compressing & queuing crash on server..."}
+                        ? t("upload.convertingSymbol")
+                        : t("upload.queuingCrash")}
                   </span>
                   <span className="font-mono font-semibold text-indigo-600">
                     {progress}%
@@ -1110,7 +1120,7 @@ export function UploadModal({
               onClick={handleClose}
               className="rounded-md border border-slate-300 bg-white px-3.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100"
             >
-              {isUploading ? "Abort Upload" : "Cancel"}
+              {isUploading ? t("upload.abortUpload") : t("common.cancel")}
             </button>
             <button
               type="submit"
@@ -1120,15 +1130,15 @@ export function UploadModal({
               {isUploading ? (
                 <>
                   <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                  <span>Uploading...</span>
+                  <span>{t("upload.uploadingBtn")}</span>
                 </>
               ) : (
                 <>
                   <Upload className="h-3.5 w-3.5" />
                   <span>
                     {activeMode === "crash"
-                      ? "Upload Crash"
-                      : "Upload Symbols"}
+                      ? t("upload.uploadCrashBtn")
+                      : t("upload.uploadSymbolsBtn")}
                   </span>
                 </>
               )}

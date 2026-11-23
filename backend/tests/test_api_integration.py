@@ -892,3 +892,46 @@ async def test_crash_upload_sanitizes_log_filenames_and_cleans_partial_artifacts
     logs_after = sorted(p.relative_to(api_harness.data_dir) for p in logs_dir.rglob("*"))
     assert dumps_after == dumps_before
     assert logs_after == logs_before
+
+
+async def test_settings_llm_providers_catalog_and_thinking_level_api(
+    api_harness: Any,
+) -> None:
+    client: httpx.AsyncClient = api_harness.client
+
+    providers_resp = await client.get("/api/v1/settings/llm-providers")
+    assert providers_resp.status_code == 200
+    providers = providers_resp.json()
+    provider_ids = {p["id"] for p in providers}
+    assert {"openai", "anthropic", "gemini", "deepseek", "ollama", "custom"}.issubset(
+        provider_ids
+    )
+    anthropic_preset = next(p for p in providers if p["id"] == "anthropic")
+    assert anthropic_preset["protocol"] == "anthropic_messages"
+    assert anthropic_preset["supports_thinking"] is True
+    assert len(anthropic_preset["models"]) >= 3
+
+    put_resp = await client.put(
+        "/api/v1/settings",
+        json={
+            "llm_provider": "anthropic",
+            "llm_base_url": "https://api.anthropic.com",
+            "llm_model": "claude-sonnet-4-5",
+            "llm_thinking_level": "medium",
+        },
+    )
+    assert put_resp.status_code == 200
+    body = put_resp.json()
+    assert body["llm_provider"] == "anthropic"
+    assert body["llm_model"] == "claude-sonnet-4-5"
+    assert body["llm_thinking_level"] == "medium"
+
+    get_body = (await client.get("/api/v1/settings")).json()
+    assert get_body["llm_provider"] == "anthropic"
+    assert get_body["llm_thinking_level"] == "medium"
+
+    bad_resp = await client.put(
+        "/api/v1/settings",
+        json={"llm_thinking_level": "ultra"},
+    )
+    assert bad_resp.status_code == 422

@@ -35,6 +35,7 @@ import type {
   StorageReport,
 } from "../api/types";
 import { useProjectContext } from "../components/Layout";
+import { useAppI18n } from "../i18n";
 
 const GIB = 1024 ** 3;
 const DAY_OPTIONS = [7, 14, 30] as const;
@@ -49,16 +50,6 @@ const PARTITION_ORDER: readonly string[] = [
   "db",
   "staging",
 ];
-
-const PARTITION_LABELS: Record<string, string> = {
-  logs: "Logs (.log.zst)",
-  dumps: "Minidumps (.dmp.zst)",
-  "symbols/sym": "Breakpad Symbols (.sym)",
-  "symbols/raw": "Raw Symbols Archive",
-  "symbols/public_cache": "Public Symbol Cache",
-  db: "Database (PostgreSQL)",
-  staging: "Staging Buffer",
-};
 
 const VERDICT_COLORS: Record<string, string> = {
   KNOWN_ISSUE: "#10b981",
@@ -85,6 +76,7 @@ interface NormalizedPartition extends StoragePartitionUsage {
 
 function normalizePartitions(
   partitions: StorageReport["partitions"],
+  getPartitionLabel: (key: string) => string,
 ): NormalizedPartition[] {
   const rawList: Array<{ key: string; usage: StoragePartitionUsage }> =
     Array.isArray(partitions)
@@ -108,7 +100,7 @@ function normalizePartitions(
       return {
         ...usage,
         key,
-        label: PARTITION_LABELS[key] ?? key,
+        label: getPartitionLabel(key),
         usedGb,
         quotaGb,
         pct: Math.min(100, Math.max(0, rawPct)),
@@ -136,22 +128,12 @@ function formatGb(gb: number): string {
   return `${gb.toFixed(2)} GB`;
 }
 
-function formatDateTime(value: string | null | undefined): string {
-  if (!value) {
-    return "—";
-  }
-  const d = new Date(value);
-  if (Number.isNaN(d.getTime())) {
-    return value;
-  }
-  return d.toLocaleString();
-}
-
 function formatTooltipNumber(
   value: number | string | Array<number | string> | undefined,
+  formatNum: (n: number) => string,
 ): string {
   if (typeof value === "number") {
-    return value.toLocaleString();
+    return formatNum(value);
   }
   if (Array.isArray(value)) {
     return value.join(", ");
@@ -170,6 +152,13 @@ function getBarColorClass(pct: number): string {
 }
 
 export function DashboardPage() {
+  const {
+    t,
+    formatDateTime,
+    formatNumber,
+    formatVerdict,
+    formatIssueStatus,
+  } = useAppI18n();
   const { projects, selectedProject, selectedProjectId, isLoadingProjects } =
     useProjectContext();
   const [days, setDays] = useState<DaysOption>(14);
@@ -185,18 +174,28 @@ export function DashboardPage() {
 
   const scopeLabel = selectedProject
     ? `${selectedProject.name} (${selectedProject.key})`
-    : selectedProjectId || "All Projects";
+    : selectedProjectId || t("nav.allProjects");
 
   const data = dashboardQuery.data;
 
   const verdictData = useMemo(
-    () => (data?.verdict_distribution ?? []).filter((item) => item.count > 0),
-    [data?.verdict_distribution],
+    () =>
+      (data?.verdict_distribution ?? [])
+        .filter((item) => item.count > 0)
+        .map((item) => ({
+          ...item,
+          displayLabel: formatVerdict(item.verdict),
+        })),
+    [data?.verdict_distribution, formatVerdict],
   );
 
   const issueStatusData = useMemo(
-    () => data?.issue_status_distribution ?? [],
-    [data?.issue_status_distribution],
+    () =>
+      (data?.issue_status_distribution ?? []).map((item) => ({
+        ...item,
+        displayLabel: formatIssueStatus(item.status),
+      })),
+    [data?.issue_status_distribution, formatIssueStatus],
   );
 
   const hasAnalyzedSeries = useMemo(
@@ -226,6 +225,27 @@ export function DashboardPage() {
         ? (storage.total_used_bytes / storage.total_quota_bytes) * 100
         : 0);
 
+    const getPartitionLabel = (key: string): string => {
+      switch (key) {
+        case "logs":
+          return t("dashboard.partitions.logs");
+        case "dumps":
+          return t("dashboard.partitions.dumps");
+        case "symbols/sym":
+          return t("dashboard.partitions.symbols/sym");
+        case "symbols/raw":
+          return t("dashboard.partitions.symbols/raw");
+        case "symbols/public_cache":
+          return t("dashboard.partitions.symbols/public_cache");
+        case "db":
+          return t("dashboard.partitions.db");
+        case "staging":
+          return t("dashboard.partitions.staging");
+        default:
+          return key;
+      }
+    };
+
     return {
       storage,
       floorGb,
@@ -234,16 +254,16 @@ export function DashboardPage() {
       totalUsedGb,
       totalQuotaGb,
       totalPct: Math.min(100, Math.max(0, rawTotalPct)),
-      partitions: normalizePartitions(storage.partitions),
+      partitions: normalizePartitions(storage.partitions, getPartitionLabel),
     };
-  }, [data?.storage]);
+  }, [data?.storage, t]);
 
   const errorMessage =
     dashboardQuery.error instanceof ApiError
       ? dashboardQuery.error.message
       : dashboardQuery.error instanceof Error
         ? dashboardQuery.error.message
-        : "Failed to load dashboard telemetry.";
+        : t("dashboard.loadFailed");
 
   return (
     <div className="space-y-6">
@@ -254,28 +274,27 @@ export function DashboardPage() {
             <LayoutDashboard className="h-5 w-5" />
           </div>
           <div>
-            <h1 className="text-xl font-semibold text-slate-900">Dashboard</h1>
-            <p className="text-sm text-slate-500">
-              Crash telemetry, AI triage overview, symbol health, and disk
-              quotas
-            </p>
+            <h1 className="text-xl font-semibold text-slate-900">
+              {t("dashboard.title")}
+            </h1>
+            <p className="text-sm text-slate-500">{t("dashboard.subtitle")}</p>
           </div>
         </div>
 
         <div className="flex flex-wrap items-center gap-2.5">
           <span className="rounded-full border border-slate-200 bg-white px-3 py-1 text-xs font-medium text-slate-700">
-            Scope: {scopeLabel}
+            {t("dashboard.scope", { scope: scopeLabel })}
           </span>
           <span className="rounded-full border border-slate-200 bg-white px-3 py-1 text-xs text-slate-600">
             {isLoadingProjects
-              ? "Loading projects..."
-              : `${projects.length} project(s)`}
+              ? t("dashboard.loadingProjects")
+              : t("dashboard.projectsCount", { count: projects.length })}
           </span>
 
           <div
             className="inline-flex rounded-lg border border-slate-200 bg-white p-0.5 shadow-sm"
             role="group"
-            aria-label="Trend window days"
+            aria-label={t("dashboard.trendWindowAria")}
           >
             {DAY_OPTIONS.map((opt) => (
               <button
@@ -288,7 +307,7 @@ export function DashboardPage() {
                     : "text-slate-600 hover:bg-slate-100 hover:text-slate-900"
                 }`}
               >
-                {opt}d
+                {t("dashboard.daysLabel", { days: opt })}
               </button>
             ))}
           </div>
@@ -304,7 +323,7 @@ export function DashboardPage() {
                 dashboardQuery.isFetching ? "animate-spin" : ""
               }`}
             />
-            Refresh
+            {t("common.refresh")}
           </button>
         </div>
       </div>
@@ -321,7 +340,7 @@ export function DashboardPage() {
             onClick={() => void dashboardQuery.refetch()}
             className="rounded-md border border-rose-300 bg-white px-3 py-1 text-xs font-medium text-rose-700 hover:bg-rose-100"
           >
-            Retry
+            {t("common.retry")}
           </button>
         </div>
       )}
@@ -369,25 +388,31 @@ export function DashboardPage() {
                   <div>
                     <div className="font-semibold">
                       {normalizedStorage.isBreached
-                        ? `Host Safety Floor Breached (${normalizedStorage.storage.host_free_gb.toFixed(1)} GB free < ${normalizedStorage.floorGb} GB floor)`
-                        : `Approaching Host Safety Floor (${normalizedStorage.storage.host_free_gb.toFixed(1)} GB free, floor: ${normalizedStorage.floorGb} GB)`}
+                        ? t("dashboard.floorBreachedTitle", {
+                            free: normalizedStorage.storage.host_free_gb.toFixed(1),
+                            floor: normalizedStorage.floorGb,
+                          })
+                        : t("dashboard.floorNearTitle", {
+                            free: normalizedStorage.storage.host_free_gb.toFixed(1),
+                            floor: normalizedStorage.floorGb,
+                          })}
                     </div>
                     <p className="mt-0.5 text-xs opacity-90">
                       {normalizedStorage.isBreached
-                        ? "Emergency GC protection is active and raw symbol archiving is paused until host free disk space recovers above the safety floor."
-                        : "Free space on the host volume is approaching the safety floor threshold. Consider running garbage collection or lowering retention days."}
+                        ? t("dashboard.floorBreachedDesc")
+                        : t("dashboard.floorNearDesc")}
                     </p>
                   </div>
                 </div>
                 <Link
-                  to="/settings"
+                  to="/admin"
                   className={`inline-flex items-center gap-1 rounded-md px-3 py-1.5 text-xs font-medium shadow-sm ${
                     normalizedStorage.isBreached
                       ? "bg-rose-600 text-white hover:bg-rose-700"
                       : "bg-amber-600 text-white hover:bg-amber-700"
                   }`}
                 >
-                  Manage Storage &amp; GC
+                  {t("dashboard.manageStorageGc")}
                   <ArrowRight className="h-3.5 w-3.5" />
                 </Link>
               </div>
@@ -400,14 +425,14 @@ export function DashboardPage() {
               className="group rounded-xl border border-slate-200 bg-white p-4 shadow-sm transition hover:border-indigo-300 hover:shadow"
             >
               <div className="flex items-center justify-between text-xs font-medium text-slate-500">
-                <span>Total Crashes</span>
+                <span>{t("dashboard.kpiTotalCrashes")}</span>
                 <Bug className="h-4 w-4 text-indigo-600" />
               </div>
               <div className="mt-2 font-mono text-2xl font-bold text-slate-900">
-                {data.kpis.total_crashes.toLocaleString()}
+                {formatNumber(data.kpis.total_crashes)}
               </div>
               <div className="mt-1 text-xs text-slate-500 group-hover:text-indigo-600">
-                View all crash reports &rarr;
+                {t("dashboard.kpiViewAllCrashes")}
               </div>
             </Link>
 
@@ -416,17 +441,19 @@ export function DashboardPage() {
               className="group rounded-xl border border-slate-200 bg-white p-4 shadow-sm transition hover:border-emerald-300 hover:shadow"
             >
               <div className="flex items-center justify-between text-xs font-medium text-slate-500">
-                <span>Analyzed</span>
+                <span>{t("dashboard.kpiAnalyzed")}</span>
                 <CheckCircle2 className="h-4 w-4 text-emerald-600" />
               </div>
               <div className="mt-2 font-mono text-2xl font-bold text-slate-900">
-                {data.kpis.analyzed_crashes.toLocaleString()}
+                {formatNumber(data.kpis.analyzed_crashes)}
               </div>
               <div className="mt-1 text-xs text-slate-500">
                 {typeof data.kpis.failed_crashes === "number" &&
                 data.kpis.failed_crashes > 0
-                  ? `${data.kpis.failed_crashes.toLocaleString()} failed`
-                  : "Completed pipeline & triage"}
+                  ? t("dashboard.kpiFailedCount", {
+                      value: formatNumber(data.kpis.failed_crashes),
+                    })
+                  : t("dashboard.kpiCompletedPipeline")}
               </div>
             </Link>
 
@@ -435,14 +462,14 @@ export function DashboardPage() {
               className="group rounded-xl border border-slate-200 bg-white p-4 shadow-sm transition hover:border-sky-300 hover:shadow"
             >
               <div className="flex items-center justify-between text-xs font-medium text-slate-500">
-                <span>Pending / Active</span>
+                <span>{t("dashboard.kpiPendingActive")}</span>
                 <Clock className="h-4 w-4 text-sky-600" />
               </div>
               <div className="mt-2 font-mono text-2xl font-bold text-slate-900">
-                {data.kpis.pending_crashes.toLocaleString()}
+                {formatNumber(data.kpis.pending_crashes)}
               </div>
               <div className="mt-1 text-xs text-slate-500 group-hover:text-sky-600">
-                Queued or parsing/triaging &rarr;
+                {t("dashboard.kpiPendingDesc")}
               </div>
             </Link>
 
@@ -451,16 +478,18 @@ export function DashboardPage() {
               className="group rounded-xl border border-slate-200 bg-white p-4 shadow-sm transition hover:border-indigo-300 hover:shadow"
             >
               <div className="flex items-center justify-between text-xs font-medium text-slate-500">
-                <span>Open Issues</span>
+                <span>{t("dashboard.kpiOpenIssues")}</span>
                 <Layers className="h-4 w-4 text-indigo-600" />
               </div>
               <div className="mt-2 font-mono text-2xl font-bold text-slate-900">
-                {data.kpis.open_issues.toLocaleString()}
+                {formatNumber(data.kpis.open_issues)}
               </div>
               <div className="mt-1 text-xs text-slate-500">
                 {typeof data.kpis.total_issues === "number"
-                  ? `${data.kpis.total_issues.toLocaleString()} total tracked issues`
-                  : "NEW / KNOWN / REGRESSION"}
+                  ? t("dashboard.kpiTotalTrackedIssues", {
+                      value: formatNumber(data.kpis.total_issues),
+                    })
+                  : t("dashboard.kpiOpenStatuses")}
               </div>
             </Link>
 
@@ -473,7 +502,7 @@ export function DashboardPage() {
               }`}
             >
               <div className="flex items-center justify-between text-xs font-medium text-slate-500">
-                <span>Missing Symbols</span>
+                <span>{t("dashboard.kpiMissingSymbols")}</span>
                 <FileWarning
                   className={`h-4 w-4 ${
                     data.kpis.missing_symbols_count > 0
@@ -489,12 +518,14 @@ export function DashboardPage() {
                     : "text-slate-900"
                 }`}
               >
-                {data.kpis.missing_symbols_count.toLocaleString()}
+                {formatNumber(data.kpis.missing_symbols_count)}
               </div>
               <div className="mt-1 text-xs text-slate-500 group-hover:text-amber-700">
                 {typeof data.kpis.total_symbols === "number"
-                  ? `${data.kpis.total_symbols.toLocaleString()} indexed symbols`
-                  : "View missing PDB queue →"}
+                  ? t("dashboard.kpiIndexedSymbols", {
+                      value: formatNumber(data.kpis.total_symbols),
+                    })
+                  : t("dashboard.kpiViewMissingQueue")}
               </div>
             </Link>
           </div>
@@ -505,17 +536,17 @@ export function DashboardPage() {
               <div className="mb-4 flex items-center justify-between">
                 <div>
                   <h2 className="text-sm font-semibold text-slate-900">
-                    Crash Volume Trend ({days}d)
+                    {t("dashboard.trendTitle", { days })}
                   </h2>
                   <p className="text-xs text-slate-500">
-                    Daily ingested crash reports and analyzed completions
+                    {t("dashboard.trendSubtitle")}
                   </p>
                 </div>
               </div>
 
               {data.crash_trend.length === 0 ? (
                 <div className="flex h-[260px] items-center justify-center rounded-lg border border-dashed border-slate-200 text-sm text-slate-500">
-                  No crash trend data in the last {days} days.
+                  {t("dashboard.trendEmpty", { days })}
                 </div>
               ) : (
                 <div className="h-[260px] w-full">
@@ -537,7 +568,7 @@ export function DashboardPage() {
                       />
                       <Tooltip
                         formatter={(value, name) => [
-                          formatTooltipNumber(value),
+                          formatTooltipNumber(value, formatNumber),
                           String(name ?? ""),
                         ]}
                       />
@@ -545,7 +576,7 @@ export function DashboardPage() {
                       <Area
                         type="monotone"
                         dataKey="count"
-                        name="Total Crashes"
+                        name={t("dashboard.seriesTotalCrashes")}
                         stroke="#4f46e5"
                         fill="#4f46e5"
                         fillOpacity={0.14}
@@ -555,7 +586,7 @@ export function DashboardPage() {
                         <Area
                           type="monotone"
                           dataKey="analyzed"
-                          name="Analyzed"
+                          name={t("dashboard.seriesAnalyzed")}
                           stroke="#10b981"
                           fill="#10b981"
                           fillOpacity={0.1}
@@ -571,16 +602,16 @@ export function DashboardPage() {
             <div className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
               <div className="mb-4">
                 <h2 className="text-sm font-semibold text-slate-900">
-                  AI Verdict Distribution
+                  {t("dashboard.verdictTitle")}
                 </h2>
                 <p className="text-xs text-slate-500">
-                  Breakdown of automated ReAct triage verdicts
+                  {t("dashboard.verdictSubtitle")}
                 </p>
               </div>
 
               {verdictData.length === 0 ? (
                 <div className="flex h-[260px] items-center justify-center rounded-lg border border-dashed border-slate-200 text-sm text-slate-500">
-                  No AI triage verdicts recorded yet.
+                  {t("dashboard.verdictEmpty")}
                 </div>
               ) : (
                 <div className="h-[260px] w-full">
@@ -589,7 +620,7 @@ export function DashboardPage() {
                       <Pie
                         data={verdictData}
                         dataKey="count"
-                        nameKey="verdict"
+                        nameKey="displayLabel"
                         cx="50%"
                         cy="46%"
                         innerRadius={52}
@@ -605,7 +636,7 @@ export function DashboardPage() {
                       </Pie>
                       <Tooltip
                         formatter={(value, name) => [
-                          formatTooltipNumber(value),
+                          formatTooltipNumber(value, formatNumber),
                           String(name ?? ""),
                         ]}
                       />
@@ -623,24 +654,24 @@ export function DashboardPage() {
               <div className="mb-4 flex items-center justify-between">
                 <div>
                   <h2 className="text-sm font-semibold text-slate-900">
-                    Issue Status Distribution
+                    {t("dashboard.issueStatusTitle")}
                   </h2>
                   <p className="text-xs text-slate-500">
-                    Tracked issues by lifecycle state
+                    {t("dashboard.issueStatusSubtitle")}
                   </p>
                 </div>
                 <Link
                   to="/issues"
                   className="text-xs font-medium text-indigo-600 hover:underline"
                 >
-                  All Issues
+                  {t("dashboard.allIssuesLink")}
                 </Link>
               </div>
 
               {issueStatusData.length === 0 ||
               issueStatusData.every((item) => item.count === 0) ? (
                 <div className="flex h-[240px] items-center justify-center rounded-lg border border-dashed border-slate-200 text-sm text-slate-500">
-                  No issues found for current scope.
+                  {t("dashboard.issueStatusEmpty")}
                 </div>
               ) : (
                 <div className="h-[240px] w-full">
@@ -655,7 +686,7 @@ export function DashboardPage() {
                         vertical={false}
                       />
                       <XAxis
-                        dataKey="status"
+                        dataKey="displayLabel"
                         tick={{ fontSize: 11, fill: "#64748b" }}
                       />
                       <YAxis
@@ -665,8 +696,8 @@ export function DashboardPage() {
                       />
                       <Tooltip
                         formatter={(value) => [
-                          formatTooltipNumber(value),
-                          "Issues",
+                          formatTooltipNumber(value, formatNumber),
+                          t("dashboard.issuesTooltipLabel"),
                         ]}
                       />
                       <Bar dataKey="count" radius={[4, 4, 0, 0]}>
@@ -689,17 +720,17 @@ export function DashboardPage() {
               <div className="mb-4 flex items-center justify-between gap-2">
                 <div>
                   <h2 className="text-sm font-semibold text-slate-900">
-                    Top Missing Symbols
+                    {t("dashboard.missingSymbolsTitle")}
                   </h2>
                   <p className="text-xs text-slate-500">
-                    Unindexed modules impacting minidump stack resolution
+                    {t("dashboard.missingSymbolsSubtitle")}
                   </p>
                 </div>
                 <Link
                   to="/symbols?tab=missing"
                   className="inline-flex items-center gap-1 text-xs font-medium text-indigo-600 hover:underline"
                 >
-                  Open Missing Queue
+                  {t("dashboard.openMissingQueue")}
                   <ArrowRight className="h-3.5 w-3.5" />
                 </Link>
               </div>
@@ -707,7 +738,7 @@ export function DashboardPage() {
               {data.top_missing_symbols.length === 0 ? (
                 <div className="flex h-[240px] flex-col items-center justify-center rounded-lg border border-dashed border-slate-200 text-center text-sm text-slate-500">
                   <CheckCircle2 className="mb-2 h-6 w-6 text-emerald-500" />
-                  All observed crash modules have indexed symbols.
+                  {t("dashboard.missingSymbolsEmpty")}
                 </div>
               ) : (
                 <div className="overflow-x-auto">
@@ -715,12 +746,20 @@ export function DashboardPage() {
                     <thead>
                       <tr className="text-slate-500">
                         <th className="pb-2 pr-3 font-medium">
-                          Module / Debug File
+                          {t("dashboard.colModuleDebugFile")}
                         </th>
-                        <th className="pb-2 pr-3 font-medium">Debug ID</th>
-                        <th className="pb-2 pr-3 font-medium">Crashes</th>
-                        <th className="pb-2 pr-3 font-medium">Latest Crash</th>
-                        <th className="pb-2 text-right font-medium">Action</th>
+                        <th className="pb-2 pr-3 font-medium">
+                          {t("dashboard.colDebugId")}
+                        </th>
+                        <th className="pb-2 pr-3 font-medium">
+                          {t("dashboard.colCrashes")}
+                        </th>
+                        <th className="pb-2 pr-3 font-medium">
+                          {t("dashboard.colLatestCrash")}
+                        </th>
+                        <th className="pb-2 text-right font-medium">
+                          {t("dashboard.colAction")}
+                        </th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100">
@@ -753,7 +792,7 @@ export function DashboardPage() {
                               to="/symbols?tab=missing"
                               className="font-medium text-indigo-600 hover:underline"
                             >
-                              Resolve
+                              {t("dashboard.resolveAction")}
                             </Link>
                           </td>
                         </tr>
@@ -773,11 +812,10 @@ export function DashboardPage() {
                   <HardDrive className="h-5 w-5 text-indigo-600" />
                   <div>
                     <h2 className="text-sm font-semibold text-slate-900">
-                      Storage Quotas &amp; 150GB Hard Cap
+                      {t("dashboard.storageTitle")}
                     </h2>
                     <p className="text-xs text-slate-500">
-                      Per-partition usage vs configured quotas and 50GB host
-                      safety floor
+                      {t("dashboard.storageSubtitle")}
                     </p>
                   </div>
                 </div>
@@ -792,14 +830,16 @@ export function DashboardPage() {
                           : "border-emerald-200 bg-emerald-50 text-emerald-700"
                     }`}
                   >
-                    Host Free: {normalizedStorage.storage.host_free_gb.toFixed(1)}{" "}
-                    GB (Floor: {normalizedStorage.floorGb} GB)
+                    {t("dashboard.hostFreeBadge", {
+                      free: normalizedStorage.storage.host_free_gb.toFixed(1),
+                      floor: normalizedStorage.floorGb,
+                    })}
                   </span>
                   <Link
-                    to="/settings"
+                    to="/admin"
                     className="rounded-md border border-slate-200 bg-white px-2.5 py-1 font-medium text-slate-700 hover:bg-slate-50"
                   >
-                    Quota &amp; GC Settings
+                    {t("dashboard.quotaGcSettings")}
                   </Link>
                 </div>
               </div>
@@ -808,7 +848,7 @@ export function DashboardPage() {
               <div className="mt-4 rounded-lg border border-slate-200 bg-slate-50 p-3.5">
                 <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
                   <span className="font-semibold text-slate-800">
-                    Total Platform Disk Usage
+                    {t("dashboard.totalDiskUsage")}
                   </span>
                   <span className="font-mono text-slate-700">
                     {formatGb(normalizedStorage.totalUsedGb)} /{" "}
@@ -854,7 +894,11 @@ export function DashboardPage() {
                     </div>
                     <div className="mt-1.5 flex items-center justify-between font-mono text-[11px] text-slate-500">
                       <span>{formatGb(part.usedGb)}</span>
-                      <span>Cap: {formatGb(part.quotaGb)}</span>
+                      <span>
+                        {t("dashboard.capLabel", {
+                          quota: formatGb(part.quotaGb),
+                        })}
+                      </span>
                     </div>
                   </div>
                 ))}

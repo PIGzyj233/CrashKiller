@@ -102,10 +102,22 @@ class Settings(BaseSettings):
     LOG_ZSTD_LEVEL: int = 6
     DUMP_ZSTD_LEVEL: int = 3
 
-    # --- AI Agent & OpenAI-Compatible LLM Configuration ---
+    # --- AI Agent & Multi-Provider LLM Configuration ---
+    LLM_PROVIDER: Literal[
+        "openai",
+        "anthropic",
+        "gemini",
+        "deepseek",
+        "openrouter",
+        "qwen",
+        "zhipu",
+        "ollama",
+        "custom",
+    ] = "openai"
     LLM_BASE_URL: str = "https://api.openai.com/v1"
     LLM_API_KEY: str = ""
     LLM_MODEL: str = "gpt-4o-mini"
+    LLM_THINKING_LEVEL: Literal["auto", "off", "low", "medium", "high"] = "auto"
     AI_TRIAGE_MODE: Literal["SMART_TRIAGE", "ALWAYS", "MANUAL"] = "SMART_TRIAGE"
     AI_MAX_STEPS: int = 10
     AI_TIMEOUT_SECONDS: int = 120

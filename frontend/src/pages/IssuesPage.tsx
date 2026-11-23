@@ -34,6 +34,7 @@ import type {
   SignatureFrameItem,
 } from "../api/types";
 import { useProjectContext } from "../components/Layout";
+import { useAppI18n } from "../i18n";
 
 const PAGE_SIZE = 25;
 
@@ -52,17 +53,6 @@ const STATUS_BADGE_CLASSES: Record<IssueStatus, string> = {
   WONTFIX: "border-slate-200 bg-slate-100 text-slate-700",
   REGRESSION: "border-rose-200 bg-rose-50 text-rose-700",
 };
-
-function formatDateTime(value: string | null | undefined): string {
-  if (!value) {
-    return "—";
-  }
-  const d = new Date(value);
-  if (Number.isNaN(d.getTime())) {
-    return value;
-  }
-  return d.toLocaleString();
-}
 
 function formatSignatureFrames(
   frames: SignatureFrameItem[],
@@ -90,6 +80,7 @@ function parsePatternLines(raw: string): string[] {
 }
 
 export function IssuesPage() {
+  const { t, formatDateTime, formatNumber, formatIssueStatus } = useAppI18n();
   const { projects, selectedProject, selectedProjectId } = useProjectContext();
   const [searchParams, setSearchParams] = useSearchParams();
   const queryClient = useQueryClient();
@@ -259,7 +250,7 @@ export function IssuesPage() {
       setIsMergeModalOpen(false);
       setMergeTargetId(null);
       setActionFeedback(
-        `Merged selected issues into #${merged.id}: ${merged.title}`,
+        t("issues.mergedFeedback", { id: merged.id, title: merged.title }),
       );
       void queryClient.invalidateQueries({ queryKey: ["issues"] });
       void queryClient.invalidateQueries({ queryKey: ["clusters"] });
@@ -279,7 +270,9 @@ export function IssuesPage() {
       setNewLogPatternsText("");
       setNewIsAmbiguous(false);
       setNewIsPinned(false);
-      setActionFeedback(`Created issue #${created.id}: ${created.title}`);
+      setActionFeedback(
+        t("issues.createdFeedback", { id: created.id, title: created.title }),
+      );
       void queryClient.invalidateQueries({ queryKey: ["issues"] });
       void queryClient.invalidateQueries({ queryKey: ["dashboard"] });
     },
@@ -401,7 +394,7 @@ export function IssuesPage() {
 
   const scopeLabel = selectedProject
     ? `${selectedProject.name} (${selectedProject.key})`
-    : selectedProjectId || "All Projects";
+    : selectedProjectId || t("nav.allProjects");
 
   const issuesFrom = issuesTotal === 0 ? 0 : issuesPage * PAGE_SIZE + 1;
   const issuesTo = Math.min(issuesTotal, (issuesPage + 1) * PAGE_SIZE);
@@ -421,18 +414,15 @@ export function IssuesPage() {
           </div>
           <div>
             <h1 className="text-xl font-semibold text-slate-900">
-              Issues &amp; Clusters
+              {t("issues.title")}
             </h1>
-            <p className="text-sm text-slate-500">
-              Deduplicated crash signatures, known issues knowledge base, and
-              cluster triage
-            </p>
+            <p className="text-sm text-slate-500">{t("issues.subtitle")}</p>
           </div>
         </div>
 
         <div className="flex items-center gap-2.5">
           <span className="rounded-full border border-slate-200 bg-white px-3 py-1 text-xs font-medium text-slate-700">
-            Scope: {scopeLabel}
+            {t("issues.scope", { scope: scopeLabel })}
           </span>
           <button
             type="button"
@@ -440,7 +430,7 @@ export function IssuesPage() {
             className="inline-flex items-center gap-1.5 rounded-md bg-indigo-600 px-3 py-1.5 text-sm font-medium text-white shadow-sm hover:bg-indigo-700"
           >
             <Plus className="h-4 w-4" />
-            New Issue
+            {t("issues.newIssue")}
           </button>
         </div>
       </div>
@@ -453,7 +443,7 @@ export function IssuesPage() {
             type="button"
             onClick={() => setActionFeedback(null)}
             className="rounded p-1 text-emerald-700 hover:bg-emerald-100"
-            aria-label="Dismiss notification"
+            aria-label={t("issues.dismissNotification")}
           >
             <X className="h-4 w-4" />
           </button>
@@ -462,7 +452,7 @@ export function IssuesPage() {
 
       {/* Tabs */}
       <div className="border-b border-slate-200">
-        <nav className="-mb-px flex gap-6" aria-label="Issues and Clusters tabs">
+        <nav className="-mb-px flex gap-6" aria-label={t("issues.tabsAria")}>
           <button
             type="button"
             onClick={() => setActiveTab("issues")}
@@ -472,7 +462,7 @@ export function IssuesPage() {
                 : "border-transparent text-slate-500 hover:border-slate-300 hover:text-slate-700"
             }`}
           >
-            Known Issues
+            {t("issues.tabKnownIssues")}
             {typeof issuesQuery.data?.total === "number" && (
               <span className="ml-2 rounded-full bg-slate-100 px-2 py-0.5 font-mono text-xs text-slate-700">
                 {issuesQuery.data.total}
@@ -489,7 +479,7 @@ export function IssuesPage() {
                 : "border-transparent text-slate-500 hover:border-slate-300 hover:text-slate-700"
             }`}
           >
-            Crash Clusters
+            {t("issues.tabCrashClusters")}
             {typeof clustersQuery.data?.total === "number" && (
               <span className="ml-2 rounded-full bg-slate-100 px-2 py-0.5 font-mono text-xs text-slate-700">
                 {clustersQuery.data.total}
@@ -510,23 +500,23 @@ export function IssuesPage() {
                 type="text"
                 value={searchInput}
                 onChange={(e) => setSearchInput(e.target.value)}
-                placeholder="Search issue title or root cause..."
+                placeholder={t("issues.searchPlaceholder")}
                 className="h-9 w-full rounded-md border border-slate-300 pl-9 pr-3 text-sm text-slate-900 placeholder:text-slate-400 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
               />
             </div>
 
             <select
-              aria-label="Filter by issue status"
+              aria-label={t("issues.filterStatusAria")}
               value={statusFilter}
               onChange={(e) =>
                 setStatusFilter(e.target.value as "" | IssueStatus)
               }
               className="h-9 rounded-md border border-slate-300 bg-white px-3 text-sm text-slate-800 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
             >
-              <option value="">All Statuses</option>
+              <option value="">{t("issues.allStatuses")}</option>
               {ISSUE_STATUSES.map((st) => (
                 <option key={st} value={st}>
-                  {st}
+                  {formatIssueStatus(st)}
                 </option>
               ))}
             </select>
@@ -535,8 +525,8 @@ export function IssuesPage() {
               type="text"
               value={componentInput}
               onChange={(e) => setComponentInput(e.target.value)}
-              placeholder="Component..."
-              aria-label="Filter by component"
+              placeholder={t("issues.componentPlaceholder")}
+              aria-label={t("issues.filterComponentAria")}
               className="h-9 w-40 rounded-md border border-slate-300 px-3 text-sm text-slate-900 placeholder:text-slate-400 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
             />
 
@@ -550,7 +540,7 @@ export function IssuesPage() {
               }`}
             >
               <Pin className="h-3.5 w-3.5" />
-              Pinned Only
+              {t("issues.pinnedOnly")}
             </button>
 
             {(searchInput || statusFilter || componentInput || pinnedOnly) && (
@@ -564,7 +554,7 @@ export function IssuesPage() {
                 }}
                 className="h-9 rounded-md px-2.5 text-xs font-medium text-slate-600 hover:bg-slate-100 hover:text-slate-900"
               >
-                Reset
+                {t("common.reset")}
               </button>
             )}
           </div>
@@ -575,11 +565,13 @@ export function IssuesPage() {
               <div className="flex items-center gap-2 text-indigo-900">
                 <GitMerge className="h-4 w-4 text-indigo-600" />
                 <span className="font-medium">
-                  {selectedIssueIds.length} issues selected
+                  {t("issues.selectedCount", {
+                    count: selectedIssueIds.length,
+                  })}
                 </span>
                 {hasCrossProjectSelection && (
                   <span className="rounded bg-rose-100 px-2 py-0.5 text-xs font-medium text-rose-700">
-                    Selected issues belong to different projects
+                    {t("issues.crossProjectWarning")}
                   </span>
                 )}
               </div>
@@ -589,7 +581,7 @@ export function IssuesPage() {
                   onClick={() => setSelectedIssuesMap(new Map())}
                   className="rounded-md border border-indigo-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50"
                 >
-                  Clear
+                  {t("common.clear")}
                 </button>
                 <button
                   type="button"
@@ -598,7 +590,7 @@ export function IssuesPage() {
                   className="inline-flex items-center gap-1.5 rounded-md bg-indigo-600 px-3 py-1 text-xs font-medium text-white hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   <GitMerge className="h-3.5 w-3.5" />
-                  Merge {selectedIssueIds.length} Issues
+                  {t("issues.mergeButton", { count: selectedIssueIds.length })}
                 </button>
               </div>
             </div>
@@ -610,14 +602,14 @@ export function IssuesPage() {
               <span>
                 {issuesQuery.error instanceof Error
                   ? issuesQuery.error.message
-                  : "Failed to load issues."}
+                  : t("issues.loadIssuesFailed")}
               </span>
               <button
                 type="button"
                 onClick={() => void issuesQuery.refetch()}
                 className="rounded border border-rose-300 bg-white px-2.5 py-1 text-xs font-medium text-rose-700"
               >
-                Retry
+                {t("common.retry")}
               </button>
             </div>
           )}
@@ -631,18 +623,20 @@ export function IssuesPage() {
                     <th className="w-10 px-4 py-3">
                       <input
                         type="checkbox"
-                        aria-label="Select all issues on page"
+                        aria-label={t("issues.selectAllAria")}
                         checked={allOnPageSelected}
                         onChange={toggleSelectAllOnPage}
                         className="h-4 w-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
                       />
                     </th>
-                    <th className="px-4 py-3">Issue</th>
-                    <th className="px-4 py-3">Status</th>
-                    <th className="px-4 py-3">Component</th>
-                    <th className="px-4 py-3">Crashes</th>
-                    <th className="px-4 py-3">Last Seen</th>
-                    <th className="px-4 py-3 text-right">Pin</th>
+                    <th className="px-4 py-3">{t("issues.colIssue")}</th>
+                    <th className="px-4 py-3">{t("issues.colStatus")}</th>
+                    <th className="px-4 py-3">{t("issues.colComponent")}</th>
+                    <th className="px-4 py-3">{t("issues.colCrashes")}</th>
+                    <th className="px-4 py-3">{t("issues.colLastSeen")}</th>
+                    <th className="px-4 py-3 text-right">
+                      {t("issues.colPin")}
+                    </th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
@@ -652,7 +646,7 @@ export function IssuesPage() {
                         colSpan={7}
                         className="px-4 py-10 text-center text-sm text-slate-500"
                       >
-                        Loading issues...
+                        {t("issues.loadingIssues")}
                       </td>
                     </tr>
                   ) : issuesList.length === 0 ? (
@@ -661,7 +655,7 @@ export function IssuesPage() {
                         colSpan={7}
                         className="px-4 py-12 text-center text-sm text-slate-500"
                       >
-                        No issues match the current filters.
+                        {t("issues.emptyIssues")}
                       </td>
                     </tr>
                   ) : (
@@ -678,7 +672,9 @@ export function IssuesPage() {
                           <td className="px-4 py-3">
                             <input
                               type="checkbox"
-                              aria-label={`Select issue #${issue.id}`}
+                              aria-label={t("issues.selectIssueAria", {
+                                id: issue.id,
+                              })}
                               checked={isSelected}
                               onChange={() => toggleSelectIssue(issue)}
                               className="h-4 w-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
@@ -702,12 +698,14 @@ export function IssuesPage() {
                               )}
                               {issue.is_ambiguous_stack && (
                                 <span className="rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[11px] font-medium text-amber-700">
-                                  Ambiguous Stack
+                                  {t("issues.ambiguousStackBadge")}
                                 </span>
                               )}
                               {issue.fixed_in_version && (
                                 <span className="rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 font-mono text-[11px] text-emerald-700">
-                                  Fixed v{issue.fixed_in_version}
+                                  {t("issues.fixedVersionBadge", {
+                                    version: issue.fixed_in_version,
+                                  })}
                                 </span>
                               )}
                             </div>
@@ -723,20 +721,20 @@ export function IssuesPage() {
                                 STATUS_BADGE_CLASSES[issue.status]
                               }`}
                             >
-                              {issue.status}
+                              {formatIssueStatus(issue.status)}
                             </span>
                           </td>
                           <td className="px-4 py-3 text-xs text-slate-600">
                             {issue.component || "—"}
                           </td>
                           <td className="px-4 py-3 font-mono text-xs font-semibold text-slate-800">
-                            {issue.crash_count.toLocaleString()}
+                            {formatNumber(issue.crash_count)}
                           </td>
                           <td
                             className="px-4 py-3 text-xs text-slate-600"
-                            title={`First seen: ${formatDateTime(
-                              issue.first_seen_at,
-                            )}`}
+                            title={t("issues.firstSeenTitle", {
+                              time: formatDateTime(issue.first_seen_at),
+                            })}
                           >
                             {formatDateTime(issue.last_seen_at)}
                           </td>
@@ -755,13 +753,13 @@ export function IssuesPage() {
                               }
                               title={
                                 issue.is_pinned
-                                  ? "Unpin issue (allow GC)"
-                                  : "Pin issue (protect from GC)"
+                                  ? t("issues.unpinTitle")
+                                  : t("issues.pinTitle")
                               }
                               aria-label={
                                 issue.is_pinned
-                                  ? `Unpin issue #${issue.id}`
-                                  : `Pin issue #${issue.id}`
+                                  ? t("issues.unpinAria", { id: issue.id })
+                                  : t("issues.pinAria", { id: issue.id })
                               }
                               className={`inline-flex items-center gap-1 rounded-md border px-2 py-1 text-xs font-medium transition-colors ${
                                 issue.is_pinned
@@ -770,7 +768,9 @@ export function IssuesPage() {
                               }`}
                             >
                               <Pin className="h-3.5 w-3.5" />
-                              {issue.is_pinned ? "Pinned" : "Pin"}
+                              {issue.is_pinned
+                                ? t("issues.pinned")
+                                : t("issues.pin")}
                             </button>
                           </td>
                         </tr>
@@ -784,8 +784,11 @@ export function IssuesPage() {
             {/* Pagination Footer */}
             <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-200 bg-slate-50 px-4 py-3 text-xs text-slate-600">
               <span>
-                Showing {issuesFrom}–{issuesTo} of{" "}
-                {issuesTotal.toLocaleString()}
+                {t("common.showingRange", {
+                  from: issuesFrom,
+                  to: issuesTo,
+                  total: formatNumber(issuesTotal),
+                })}
               </span>
               <div className="flex items-center gap-2">
                 <button
@@ -795,7 +798,7 @@ export function IssuesPage() {
                   className="inline-flex items-center gap-1 rounded-md border border-slate-300 bg-white px-2.5 py-1 font-medium text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   <ChevronLeft className="h-3.5 w-3.5" />
-                  Previous
+                  {t("common.previous")}
                 </button>
                 <button
                   type="button"
@@ -803,7 +806,7 @@ export function IssuesPage() {
                   onClick={() => setIssuesPage((p) => p + 1)}
                   className="inline-flex items-center gap-1 rounded-md border border-slate-300 bg-white px-2.5 py-1 font-medium text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
                 >
-                  Next
+                  {t("common.next")}
                   <ChevronRight className="h-3.5 w-3.5" />
                 </button>
               </div>
@@ -823,11 +826,10 @@ export function IssuesPage() {
                 onChange={(e) => setUnassignedOnly(e.target.checked)}
                 className="h-4 w-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
               />
-              Show unassigned clusters only
+              {t("issues.unassignedOnly")}
             </label>
             <span className="text-xs text-slate-500">
-              Clusters group crashes with identical normalized stack signature
-              hashes.
+              {t("issues.clustersHint")}
             </span>
           </div>
 
@@ -836,14 +838,14 @@ export function IssuesPage() {
               <span>
                 {clustersQuery.error instanceof Error
                   ? clustersQuery.error.message
-                  : "Failed to load clusters."}
+                  : t("issues.loadClustersFailed")}
               </span>
               <button
                 type="button"
                 onClick={() => void clustersQuery.refetch()}
                 className="rounded border border-rose-300 bg-white px-2.5 py-1 text-xs font-medium text-rose-700"
               >
-                Retry
+                {t("common.retry")}
               </button>
             </div>
           )}
@@ -853,12 +855,20 @@ export function IssuesPage() {
               <table className="min-w-full divide-y divide-slate-200 text-left text-sm">
                 <thead className="bg-slate-50 text-xs font-medium uppercase tracking-wider text-slate-500">
                   <tr>
-                    <th className="px-4 py-3">Signature Hash</th>
-                    <th className="px-4 py-3">Exception</th>
-                    <th className="px-4 py-3">Signature Frames</th>
-                    <th className="px-4 py-3">Crashes</th>
-                    <th className="px-4 py-3">Assigned Issue</th>
-                    <th className="px-4 py-3 text-right">Explore</th>
+                    <th className="px-4 py-3">
+                      {t("issues.colSignatureHash")}
+                    </th>
+                    <th className="px-4 py-3">{t("issues.colException")}</th>
+                    <th className="px-4 py-3">
+                      {t("issues.colSignatureFrames")}
+                    </th>
+                    <th className="px-4 py-3">{t("issues.colCrashes")}</th>
+                    <th className="px-4 py-3">
+                      {t("issues.colAssignedIssue")}
+                    </th>
+                    <th className="px-4 py-3 text-right">
+                      {t("issues.colExplore")}
+                    </th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
@@ -868,7 +878,7 @@ export function IssuesPage() {
                         colSpan={6}
                         className="px-4 py-10 text-center text-sm text-slate-500"
                       >
-                        Loading clusters...
+                        {t("issues.loadingClusters")}
                       </td>
                     </tr>
                   ) : clustersList.length === 0 ? (
@@ -877,7 +887,7 @@ export function IssuesPage() {
                         colSpan={6}
                         className="px-4 py-12 text-center text-sm text-slate-500"
                       >
-                        No crash clusters found.
+                        {t("issues.emptyClusters")}
                       </td>
                     </tr>
                   ) : (
@@ -896,7 +906,7 @@ export function IssuesPage() {
                                   handleCopyHash(cluster.signature_hash)
                                 }
                                 className="rounded p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-700"
-                                title="Copy full signature hash"
+                                title={t("issues.copyHashTitle")}
                               >
                                 {copiedHash === cluster.signature_hash ? (
                                   <Check className="h-3.5 w-3.5 text-emerald-600" />
@@ -923,7 +933,7 @@ export function IssuesPage() {
                             </div>
                           </td>
                           <td className="px-4 py-3 font-mono text-xs font-semibold text-slate-800">
-                            {cluster.crash_count.toLocaleString()}
+                            {formatNumber(cluster.crash_count)}
                           </td>
                           <td className="px-4 py-3 text-xs">
                             {cluster.issue_id !== null ? (
@@ -931,11 +941,11 @@ export function IssuesPage() {
                                 to={`/issues/${cluster.issue_id}`}
                                 className="font-medium text-indigo-600 hover:underline"
                               >
-                                Issue #{cluster.issue_id}
+                                {t("issues.issueRef", { id: cluster.issue_id })}
                               </Link>
                             ) : (
                               <span className="inline-flex rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[11px] font-medium text-amber-700">
-                                Unassigned
+                                {t("issues.unassignedBadge")}
                               </span>
                             )}
                           </td>
@@ -946,7 +956,7 @@ export function IssuesPage() {
                               )}`}
                               className="font-medium text-indigo-600 hover:underline"
                             >
-                              View Crashes &rarr;
+                              {t("issues.viewCrashes")}
                             </Link>
                           </td>
                         </tr>
@@ -959,8 +969,11 @@ export function IssuesPage() {
 
             <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-200 bg-slate-50 px-4 py-3 text-xs text-slate-600">
               <span>
-                Showing {clustersFrom}–{clustersTo} of{" "}
-                {clustersTotal.toLocaleString()}
+                {t("common.showingRange", {
+                  from: clustersFrom,
+                  to: clustersTo,
+                  total: formatNumber(clustersTotal),
+                })}
               </span>
               <div className="flex items-center gap-2">
                 <button
@@ -970,7 +983,7 @@ export function IssuesPage() {
                   className="inline-flex items-center gap-1 rounded-md border border-slate-300 bg-white px-2.5 py-1 font-medium text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   <ChevronLeft className="h-3.5 w-3.5" />
-                  Previous
+                  {t("common.previous")}
                 </button>
                 <button
                   type="button"
@@ -978,7 +991,7 @@ export function IssuesPage() {
                   onClick={() => setClustersPage((p) => p + 1)}
                   className="inline-flex items-center gap-1 rounded-md border border-slate-300 bg-white px-2.5 py-1 font-medium text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
                 >
-                  Next
+                  {t("common.next")}
                   <ChevronRight className="h-3.5 w-3.5" />
                 </button>
               </div>
@@ -1001,7 +1014,7 @@ export function IssuesPage() {
                 id="merge-modal-title"
                 className="text-base font-semibold text-slate-900"
               >
-                Merge Selected Issues
+                {t("issues.mergeModalTitle")}
               </h2>
               <button
                 type="button"
@@ -1012,15 +1025,14 @@ export function IssuesPage() {
               </button>
             </div>
             <p className="mt-1 text-xs text-slate-500">
-              Choose the target issue to keep. All clusters and crashes from the
-              other selected issues will be moved into the target issue.
+              {t("issues.mergeModalDesc")}
             </p>
 
             {mergeMutation.isError && (
               <div className="mt-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700">
                 {mergeMutation.error instanceof ApiError
                   ? mergeMutation.error.message
-                  : "Failed to merge issues."}
+                  : t("issues.mergeFailed")}
               </div>
             )}
 
@@ -1046,7 +1058,10 @@ export function IssuesPage() {
                       #{issue.id} — {issue.title}
                     </div>
                     <div className="mt-0.5 text-xs text-slate-500">
-                      Status: {issue.status} | Crashes: {issue.crash_count}
+                      {t("issues.mergeItemMeta", {
+                        status: formatIssueStatus(issue.status),
+                        count: issue.crash_count,
+                      })}
                     </div>
                   </div>
                 </label>
@@ -1059,7 +1074,7 @@ export function IssuesPage() {
                 onClick={() => setIsMergeModalOpen(false)}
                 className="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50"
               >
-                Cancel
+                {t("common.cancel")}
               </button>
               <button
                 type="button"
@@ -1072,7 +1087,9 @@ export function IssuesPage() {
                 className="inline-flex items-center gap-1.5 rounded-md bg-indigo-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-indigo-700 disabled:opacity-50"
               >
                 <GitMerge className="h-4 w-4" />
-                {mergeMutation.isPending ? "Merging..." : "Confirm Merge"}
+                {mergeMutation.isPending
+                  ? t("issues.merging")
+                  : t("issues.confirmMerge")}
               </button>
             </div>
           </div>
@@ -1093,7 +1110,7 @@ export function IssuesPage() {
                 id="create-issue-modal-title"
                 className="text-base font-semibold text-slate-900"
               >
-                Create Known Issue
+                {t("issues.createModalTitle")}
               </h2>
               <button
                 type="button"
@@ -1111,14 +1128,14 @@ export function IssuesPage() {
                   <span>
                     {createMutation.error instanceof ApiError
                       ? createMutation.error.message
-                      : "Failed to create issue."}
+                      : t("issues.createFailed")}
                   </span>
                 </div>
               )}
 
               <div>
                 <label className="block text-xs font-medium text-slate-700">
-                  Project
+                  {t("issues.projectLabel")}
                 </label>
                 <select
                   required
@@ -1128,7 +1145,7 @@ export function IssuesPage() {
                   className="mt-1 h-9 w-full rounded-md border border-slate-300 bg-white px-3 text-sm text-slate-900 disabled:bg-slate-100"
                 >
                   {projects.length === 0 && (
-                    <option value="">No projects available</option>
+                    <option value="">{t("issues.noProjectsAvailable")}</option>
                   )}
                   {projects.map((p) => (
                     <option key={p.id} value={p.id}>
@@ -1140,14 +1157,15 @@ export function IssuesPage() {
 
               <div>
                 <label className="block text-xs font-medium text-slate-700">
-                  Title <span className="text-rose-500">*</span>
+                  {t("issues.titleLabel")}{" "}
+                  <span className="text-rose-500">*</span>
                 </label>
                 <input
                   type="text"
                   required
                   value={newTitle}
                   onChange={(e) => setNewTitle(e.target.value)}
-                  placeholder="e.g. Null pointer dereference in RenderPipeline::Submit"
+                  placeholder={t("issues.titlePlaceholder")}
                   className="mt-1 h-9 w-full rounded-md border border-slate-300 px-3 text-sm text-slate-900"
                 />
               </div>
@@ -1155,7 +1173,7 @@ export function IssuesPage() {
               <div className="grid gap-3 sm:grid-cols-3">
                 <div>
                   <label className="block text-xs font-medium text-slate-700">
-                    Status
+                    {t("issues.statusLabel")}
                   </label>
                   <select
                     value={newStatus}
@@ -1166,32 +1184,32 @@ export function IssuesPage() {
                   >
                     {ISSUE_STATUSES.map((st) => (
                       <option key={st} value={st}>
-                        {st}
+                        {formatIssueStatus(st)}
                       </option>
                     ))}
                   </select>
                 </div>
                 <div>
                   <label className="block text-xs font-medium text-slate-700">
-                    Component
+                    {t("issues.componentLabel")}
                   </label>
                   <input
                     type="text"
                     value={newComponent}
                     onChange={(e) => setNewComponent(e.target.value)}
-                    placeholder="e.g. Renderer"
+                    placeholder={t("issues.componentExamplePlaceholder")}
                     className="mt-1 h-9 w-full rounded-md border border-slate-300 px-3 text-sm text-slate-900"
                   />
                 </div>
                 <div>
                   <label className="block text-xs font-medium text-slate-700">
-                    Fixed in Version
+                    {t("issues.fixedInVersionLabel")}
                   </label>
                   <input
                     type="text"
                     value={newFixedInVersion}
                     onChange={(e) => setNewFixedInVersion(e.target.value)}
-                    placeholder="e.g. 2.4.1"
+                    placeholder={t("issues.fixedInVersionPlaceholder")}
                     className="mt-1 h-9 w-full rounded-md border border-slate-300 px-3 font-mono text-sm text-slate-900"
                   />
                 </div>
@@ -1199,20 +1217,20 @@ export function IssuesPage() {
 
               <div>
                 <label className="block text-xs font-medium text-slate-700">
-                  Root Cause
+                  {t("issues.rootCauseLabel")}
                 </label>
                 <textarea
                   rows={3}
                   value={newRootCause}
                   onChange={(e) => setNewRootCause(e.target.value)}
-                  placeholder="Describe the root cause and fix notes..."
+                  placeholder={t("issues.rootCausePlaceholder")}
                   className="mt-1 w-full rounded-md border border-slate-300 p-2.5 text-sm text-slate-900"
                 />
               </div>
 
               <div>
                 <label className="block text-xs font-medium text-slate-700">
-                  Log Patterns (one regex/keyword per line)
+                  {t("issues.logPatternsLabel")}
                 </label>
                 <textarea
                   rows={2}
@@ -1231,7 +1249,7 @@ export function IssuesPage() {
                     onChange={(e) => setNewIsAmbiguous(e.target.checked)}
                     className="h-4 w-4 rounded border-slate-300 text-indigo-600"
                   />
-                  Ambiguous stack (force AI log triage in SMART_TRIAGE)
+                  {t("issues.ambiguousStackCheckbox")}
                 </label>
                 <label className="inline-flex items-center gap-2 text-xs text-slate-700">
                   <input
@@ -1240,7 +1258,7 @@ export function IssuesPage() {
                     onChange={(e) => setNewIsPinned(e.target.checked)}
                     className="h-4 w-4 rounded border-slate-300 text-indigo-600"
                   />
-                  Pin issue (protect from GC)
+                  {t("issues.pinIssueCheckbox")}
                 </label>
               </div>
 
@@ -1250,7 +1268,7 @@ export function IssuesPage() {
                   onClick={() => setIsCreateModalOpen(false)}
                   className="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50"
                 >
-                  Cancel
+                  {t("common.cancel")}
                 </button>
                 <button
                   type="submit"
@@ -1261,7 +1279,9 @@ export function IssuesPage() {
                   }
                   className="rounded-md bg-indigo-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-indigo-700 disabled:opacity-50"
                 >
-                  {createMutation.isPending ? "Creating..." : "Create Issue"}
+                  {createMutation.isPending
+                    ? t("common.creating")
+                    : t("issues.createIssueButton")}
                 </button>
               </div>
             </form>

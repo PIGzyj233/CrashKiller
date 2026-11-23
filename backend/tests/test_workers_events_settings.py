@@ -264,6 +264,57 @@ async def test_settings_rejects_booleans_on_all_numeric_fields(
     assert recovered.gc_threshold_percent == test_settings.GC_THRESHOLD_PERCENT
 
 
+async def test_settings_llm_provider_and_thinking_level_lifecycle(
+    db_session: AsyncSession,
+    test_settings: Settings,
+) -> None:
+    baseline = await settings_service.get_effective_settings(
+        db_session, base_settings=test_settings
+    )
+    assert baseline.llm_provider == "openai"
+    assert baseline.llm_thinking_level == "auto"
+    public = baseline.to_public_dict()
+    assert public["llm_provider"] == "openai"
+    assert public["llm_thinking_level"] == "auto"
+
+    # Valid update with mixed case normalizes to lowercase literals.
+    updated = await settings_service.update_settings(
+        db_session,
+        {
+            "llm_provider": "Anthropic",
+            "llm_base_url": "https://api.anthropic.com",
+            "llm_model": "claude-sonnet-4-5",
+            "llm_thinking_level": "HIGH",
+        },
+        base_settings=test_settings,
+    )
+    assert updated.llm_provider == "anthropic"
+    assert updated.llm_model == "claude-sonnet-4-5"
+    assert updated.llm_thinking_level == "high"
+    app_cfg = updated.to_app_settings(base_settings=test_settings)
+    assert app_cfg.LLM_PROVIDER == "anthropic"
+    assert app_cfg.LLM_THINKING_LEVEL == "high"
+
+    # Reject unknown provider or thinking level.
+    with pytest.raises(ValidationError):
+        settings_service.SystemSettingsUpdate(llm_provider="unknown_vendor")  # type: ignore[arg-type]
+    with pytest.raises(ValidationError):
+        settings_service.SystemSettingsUpdate(llm_thinking_level="extreme")  # type: ignore[arg-type]
+
+    # Corrupt DB values fall back cleanly to defaults.
+    await db_session.merge(SystemSetting(key="llm_provider", value_json={"value": "bad_vendor"}))
+    await db_session.merge(
+        SystemSetting(key="llm_thinking_level", value_json={"value": "bad_level"})
+    )
+    await db_session.commit()
+
+    recovered = await settings_service.get_effective_settings(
+        db_session, base_settings=test_settings
+    )
+    assert recovered.llm_provider == test_settings.LLM_PROVIDER
+    assert recovered.llm_thinking_level == test_settings.LLM_THINKING_LEVEL
+
+
 # ---------------------------------------------------------------------------
 # events.py tests
 # ---------------------------------------------------------------------------

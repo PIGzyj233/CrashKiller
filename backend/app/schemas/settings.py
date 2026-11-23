@@ -6,16 +6,30 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from app.services.llm_providers import LLMProtocol, LLMProviderId, LLMThinkingLevel
 from app.services.settings_service import SystemSettingsUpdate
 
 AITriageModeLiteral = Literal["SMART_TRIAGE", "ALWAYS", "MANUAL"]
 
 
+class LLMProviderPresetRead(BaseModel):
+    id: LLMProviderId
+    name: str
+    protocol: LLMProtocol
+    default_base_url: str
+    default_model: str
+    models: list[str] = Field(default_factory=list)
+    requires_api_key: bool
+    supports_thinking: bool
+
+
 class SystemSettingsRead(BaseModel):
+    llm_provider: LLMProviderId
     llm_base_url: str
     llm_api_key_set: bool
     llm_api_key_masked: str | None = None
     llm_model: str
+    llm_thinking_level: LLMThinkingLevel
     ai_triage_mode: AITriageModeLiteral
     ai_max_steps: int
     ai_timeout_seconds: int
@@ -56,6 +70,7 @@ __all__ = [
     "AITriageModeLiteral",
     "GCReport",
     "GCRequest",
+    "LLMProviderPresetRead",
     "SystemSettingsRead",
     "SystemSettingsUpdate",
 ]

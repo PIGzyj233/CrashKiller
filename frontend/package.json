@@ -12,9 +12,11 @@
   "dependencies": {
     "@tanstack/react-query": "^5.62.0",
     "@tanstack/react-virtual": "^3.11.0",
+    "i18next": "^27.2.4",
     "lucide-react": "^1.0.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
+    "react-i18next": "^18.0.3",
     "react-is": "^19.0.0",
     "react-router-dom": "^7.1.0",
     "recharts": "^2.15.4"

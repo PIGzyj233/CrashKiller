@@ -13,6 +13,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import Settings, get_settings
 from app.db.base import utcnow
 from app.db.models import SystemSetting
+from app.services.llm_providers import (
+    LLMProviderId,
+    LLMThinkingLevel,
+    normalize_provider_id,
+    normalize_thinking_level,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -70,9 +76,11 @@ DEFAULT_NOISE_FUNCTIONS: tuple[str, ...] = (
 )
 
 SETTINGS_TO_ENV_MAP: dict[str, str] = {
+    "llm_provider": "LLM_PROVIDER",
     "llm_base_url": "LLM_BASE_URL",
     "llm_api_key": "LLM_API_KEY",
     "llm_model": "LLM_MODEL",
+    "llm_thinking_level": "LLM_THINKING_LEVEL",
     "ai_triage_mode": "AI_TRIAGE_MODE",
     "ai_max_steps": "AI_MAX_STEPS",
     "ai_timeout_seconds": "AI_TIMEOUT_SECONDS",
@@ -172,9 +180,11 @@ class EffectiveSettings(BaseModel):
 
     model_config = ConfigDict(extra="ignore", allow_inf_nan=False)
 
+    llm_provider: LLMProviderId = "openai"
     llm_base_url: str = "https://api.openai.com/v1"
     llm_api_key: str = ""
     llm_model: str = "gpt-4o-mini"
+    llm_thinking_level: LLMThinkingLevel = "auto"
     ai_triage_mode: AITriageMode = "SMART_TRIAGE"
     ai_max_steps: int = Field(default=10, ge=1, le=50)
     ai_timeout_seconds: int = Field(default=120, ge=1, le=3600)
@@ -210,6 +220,16 @@ class EffectiveSettings(BaseModel):
     def _reject_bool_on_numeric_fields(cls, value: Any) -> Any:
         return _reject_bool_numeric(value)
 
+    @field_validator("llm_provider", mode="before")
+    @classmethod
+    def _validate_llm_provider(cls, value: Any) -> LLMProviderId:
+        return normalize_provider_id(value)
+
+    @field_validator("llm_thinking_level", mode="before")
+    @classmethod
+    def _validate_llm_thinking_level(cls, value: Any) -> LLMThinkingLevel:
+        return normalize_thinking_level(value)
+
     @field_validator(
         "public_symbol_urls",
         "default_noise_modules",
@@ -240,12 +260,14 @@ class EffectiveSettings(BaseModel):
         return base.model_copy(update=updates)
 
     def to_public_dict(self) -> dict[str, Any]:
-        """Return the 26-key SystemSettingsRead payload without exposing raw llm_api_key."""
+        """Return the SystemSettingsRead payload without exposing raw llm_api_key."""
         return {
+            "llm_provider": self.llm_provider,
             "llm_base_url": self.llm_base_url,
             "llm_api_key_set": self.llm_api_key_set,
             "llm_api_key_masked": self.llm_api_key_masked,
             "llm_model": self.llm_model,
+            "llm_thinking_level": self.llm_thinking_level,
             "ai_triage_mode": self.ai_triage_mode,
             "ai_max_steps": self.ai_max_steps,
             "ai_timeout_seconds": self.ai_timeout_seconds,
@@ -276,9 +298,11 @@ class SystemSettingsUpdate(BaseModel):
 
     model_config = ConfigDict(extra="ignore", allow_inf_nan=False)
 
+    llm_provider: LLMProviderId | None = None
     llm_base_url: str | None = None
     llm_api_key: str | None = None
     llm_model: str | None = None
+    llm_thinking_level: LLMThinkingLevel | None = None
     ai_triage_mode: AITriageMode | None = None
     ai_max_steps: int | None = Field(default=None, ge=1, le=50)
     ai_timeout_seconds: int | None = Field(default=None, ge=1, le=3600)
@@ -309,6 +333,20 @@ class SystemSettingsUpdate(BaseModel):
     @classmethod
     def _reject_bool_on_numeric_fields(cls, value: Any) -> Any:
         return _reject_bool_numeric(value)
+
+    @field_validator("llm_provider", mode="before")
+    @classmethod
+    def _validate_optional_llm_provider(cls, value: Any) -> LLMProviderId | None:
+        if value is None:
+            return None
+        return normalize_provider_id(value)
+
+    @field_validator("llm_thinking_level", mode="before")
+    @classmethod
+    def _validate_optional_llm_thinking_level(cls, value: Any) -> LLMThinkingLevel | None:
+        if value is None:
+            return None
+        return normalize_thinking_level(value)
 
     @field_validator(
         "public_symbol_urls",

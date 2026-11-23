@@ -24,6 +24,32 @@ export type IssueStatus =
 
 export type AITriageMode = "SMART_TRIAGE" | "ALWAYS" | "MANUAL";
 
+export type LLMProviderId =
+  | "openai"
+  | "anthropic"
+  | "gemini"
+  | "deepseek"
+  | "openrouter"
+  | "qwen"
+  | "zhipu"
+  | "ollama"
+  | "custom";
+
+export type LLMThinkingLevel = "auto" | "off" | "low" | "medium" | "high";
+
+export type LLMProtocol = "openai_compatible" | "anthropic_messages";
+
+export interface LLMProviderPreset {
+  id: LLMProviderId;
+  name: string;
+  protocol: LLMProtocol;
+  default_base_url: string;
+  default_model: string;
+  models: string[];
+  requires_api_key: boolean;
+  supports_thinking: boolean;
+}
+
 export type AIRunStatus = "RUNNING" | "COMPLETED" | "FAILED";
 
 export type ReprocessMode = "full" | "triage";
@@ -535,10 +561,12 @@ export interface CrashPinResponse {
 // ============================================================================
 
 export interface SystemSettingsRead {
+  llm_provider: LLMProviderId;
   llm_base_url: string;
   llm_api_key_set: boolean;
   llm_api_key_masked: string | null;
   llm_model: string;
+  llm_thinking_level: LLMThinkingLevel;
   ai_triage_mode: AITriageMode;
   ai_max_steps: number;
   ai_timeout_seconds: number;
@@ -564,9 +592,11 @@ export interface SystemSettingsRead {
 }
 
 export interface SystemSettingsUpdate {
+  llm_provider?: LLMProviderId;
   llm_base_url?: string;
   llm_api_key?: string;
   llm_model?: string;
+  llm_thinking_level?: LLMThinkingLevel;
   ai_triage_mode?: AITriageMode;
   ai_max_steps?: number;
   ai_timeout_seconds?: number;

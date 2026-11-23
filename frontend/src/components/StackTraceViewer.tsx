@@ -22,6 +22,7 @@ import type {
   StackFrame,
   StackThread,
 } from "../api/types";
+import { useAppI18n } from "../i18n";
 
 export interface StackTraceViewerProps {
   parsedStacks: ParsedStacks | null | undefined;
@@ -93,13 +94,13 @@ function extractThreadRegisters(
   return null;
 }
 
-function getModuleDisplayName(mod: CompatModule): string {
+function getModuleDisplayName(mod: CompatModule, fallbackLabel: string): string {
   if (mod.module_name && mod.module_name.trim()) {
     return mod.module_name;
   }
   const filename = mod.filename ?? "";
   if (!filename) {
-    return mod.debug_file || mod.code_file || "(unknown module)";
+    return mod.debug_file || mod.code_file || fallbackLabel;
   }
   const parts = filename.split(/[\\/]/);
   return parts[parts.length - 1] || filename;
@@ -119,7 +120,8 @@ function formatOffset(offset: string | number | null | undefined): string {
 function getTrustBadgeMeta(trust: string | null | undefined): {
   label: string;
   className: string;
-  description: string;
+  descKind: "context" | "cfi" | "fp" | "scan" | "other";
+  rawTrust: string;
 } | null {
   if (!trust) {
     return null;
@@ -129,30 +131,31 @@ function getTrustBadgeMeta(trust: string | null | undefined): {
     return {
       label: normalized,
       className: "border-emerald-200 bg-emerald-50 text-emerald-700",
-      description:
-        normalized === "context"
-          ? "Exact CPU context register state"
-          : "Call Frame Information (CFI) unwind — high reliability",
+      descKind: normalized === "context" ? "context" : "cfi",
+      rawTrust: trust,
     };
   }
   if (normalized === "fp" || normalized === "frame_pointer") {
     return {
       label: normalized === "frame_pointer" ? "fp" : normalized,
       className: "border-amber-200 bg-amber-50 text-amber-800",
-      description: "Frame pointer chain unwind — moderate reliability",
+      descKind: "fp",
+      rawTrust: trust,
     };
   }
   if (normalized === "scan") {
     return {
       label: "scan",
       className: "border-rose-200 bg-rose-50 text-rose-700",
-      description: "Stack scanning heuristic — low reliability, may contain false frames",
+      descKind: "scan",
+      rawTrust: trust,
     };
   }
   return {
     label: trust,
     className: "border-slate-200 bg-slate-100 text-slate-600",
-    description: `Unwind method: ${trust}`,
+    descKind: "other",
+    rawTrust: trust,
   };
 }
 
@@ -173,6 +176,7 @@ export function StackTraceViewer({
   crashAddress,
   status,
 }: StackTraceViewerProps) {
+  const { t, formatCrashStatus } = useAppI18n();
   const [activeTab, setActiveTab] = useState<"stack" | "modules">("stack");
   const [selectedThreadIndex, setSelectedThreadIndex] = useState<number>(() =>
     parsedStacks ? resolveCrashingThreadIndex(parsedStacks) : 0,
@@ -307,7 +311,7 @@ export function StackTraceViewer({
   }, [modules, moduleFilter, moduleQuery]);
 
   const effectiveReason =
-    crashReason ?? parsedStacks?.crash_reason ?? "Unknown Exception";
+    crashReason ?? parsedStacks?.crash_reason ?? t("stack.unknownException");
   const effectiveAddress = crashAddress ?? parsedStacks?.crash_address ?? null;
 
   const handleCopyStack = async () => {
@@ -379,9 +383,11 @@ export function StackTraceViewer({
             )}
             <AlertTriangle className="h-4 w-4 shrink-0 text-amber-600" />
             <span>
-              {consolidatedMissing.length} missing symbol
-              {consolidatedMissing.length === 1 ? "" : "s"} — stack frames may
-              be incomplete or unsymbolicated
+              {consolidatedMissing.length === 1
+                ? t("stack.missingBannerTitleOne")
+                : t("stack.missingBannerTitleOther", {
+                    count: consolidatedMissing.length,
+                  })}
             </span>
           </button>
           <Link
@@ -389,7 +395,7 @@ export function StackTraceViewer({
             className="inline-flex items-center gap-1 rounded-md border border-amber-300 bg-white px-2.5 py-1 text-xs font-medium text-amber-900 shadow-sm hover:bg-amber-100"
           >
             <FileCode className="h-3.5 w-3.5" />
-            Upload symbols
+            {t("stack.uploadSymbols")}
           </Link>
         </div>
 
@@ -409,11 +415,11 @@ export function StackTraceViewer({
                   </span>
                 </div>
                 <div className="mt-0.5 truncate font-mono text-[11px] text-slate-600">
-                  Debug ID: {item.debug_id}
+                  {t("stack.debugIdLabel", { id: item.debug_id })}
                 </div>
                 {(item.code_file || item.code_id) && (
                   <div className="mt-0.5 truncate font-mono text-[11px] text-slate-500">
-                    Code: {item.code_file ?? "-"}
+                    {t("stack.codeLabel", { file: item.code_file ?? "-" })}
                     {item.code_id ? ` (${item.code_id})` : ""}
                   </div>
                 )}
@@ -433,10 +439,11 @@ export function StackTraceViewer({
           <div className="flex flex-col items-center justify-center gap-2.5 px-6 py-12 text-center">
             <Loader2 className="h-6 w-6 animate-spin text-indigo-600" />
             <p className="text-sm font-medium text-slate-800">
-              Parsing minidump and resolving symbols...
+              {t("stack.parsingTitle")}
             </p>
             <p className="text-xs text-slate-500">
-              Status: <span className="font-mono">{status}</span>
+              {t("stack.statusLabel")}
+              <span className="font-mono">{formatCrashStatus(status)}</span>
             </p>
           </div>
         ) : status === "FAILED" ? (
@@ -444,12 +451,12 @@ export function StackTraceViewer({
             <ShieldAlert className="mt-0.5 h-5 w-5 shrink-0 text-rose-600" />
             <div>
               <h3 className="text-sm font-semibold">
-                Minidump parsing failed — stack trace unavailable
+                {t("stack.parseFailedTitle")}
               </h3>
               <p className="mt-1 text-xs text-rose-700">
-                The uploaded dump could not be walked by{" "}
-                <span className="font-mono">minidump-stackwalk</span>. Verify
-                the dump file integrity or try reprocessing.
+                {t("stack.parseFailedDescBefore")}
+                <span className="font-mono">minidump-stackwalk</span>
+                {t("stack.parseFailedDescAfter")}
               </p>
             </div>
           </div>
@@ -457,12 +464,12 @@ export function StackTraceViewer({
           <div className="m-4 rounded-lg border border-dashed border-slate-300 bg-slate-50/70 px-6 py-10 text-center">
             <Layers className="mx-auto h-6 w-6 text-slate-400" />
             <p className="mt-2 text-sm font-medium text-slate-700">
-              No parsed stack trace available.
+              {t("stack.noStackTitle")}
             </p>
             <p className="mt-1 text-xs text-slate-500">
               {crashReason
-                ? `Exception: ${crashReason}`
-                : "Stack frames will appear here once dump analysis completes."}
+                ? t("stack.noStackException", { reason: crashReason })
+                : t("stack.noStackHint")}
             </p>
           </div>
         )}
@@ -497,8 +504,10 @@ export function StackTraceViewer({
           )}
         </div>
         <div className="text-xs text-slate-500">
-          {threads.length} thread{threads.length === 1 ? "" : "s"} ·{" "}
-          {modules.length} module{modules.length === 1 ? "" : "s"}
+          {t("stack.summaryCounts", {
+            threads: threads.length,
+            modules: modules.length,
+          })}
         </div>
       </div>
 
@@ -520,7 +529,7 @@ export function StackTraceViewer({
             }`}
           >
             <Layers className="h-4 w-4" />
-            <span>Call Stack &amp; Registers</span>
+            <span>{t("stack.tabStackRegisters")}</span>
             <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs font-semibold text-slate-700">
               {threads.length}
             </span>
@@ -538,13 +547,13 @@ export function StackTraceViewer({
             }`}
           >
             <FileCode className="h-4 w-4" />
-            <span>Loaded Modules</span>
+            <span>{t("stack.tabLoadedModules")}</span>
             <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs font-semibold text-slate-700">
               {modules.length}
             </span>
             {moduleCounts.missing > 0 && (
               <span className="rounded-full border border-amber-200 bg-amber-50 px-1.5 py-0.5 text-[11px] font-medium text-amber-800">
-                {moduleCounts.missing} missing
+                {t("stack.missingShort", { count: moduleCounts.missing })}
               </span>
             )}
           </button>
@@ -560,11 +569,11 @@ export function StackTraceViewer({
                 htmlFor="stack-thread-select"
                 className="text-xs font-medium text-slate-600"
               >
-                Thread:
+                {t("stack.threadLabel")}
               </label>
               <select
                 id="stack-thread-select"
-                aria-label="Select thread"
+                aria-label={t("stack.selectThreadAria")}
                 value={activeThread?.thread_index ?? 0}
                 onChange={(e) => setSelectedThreadIndex(Number(e.target.value))}
                 className="h-8 max-w-md rounded-md border border-slate-300 bg-white px-2.5 text-xs font-medium text-slate-800 shadow-sm focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
@@ -576,10 +585,11 @@ export function StackTraceViewer({
                   const tid = getThreadId(thread);
                   return (
                     <option key={thread.thread_index} value={thread.thread_index}>
-                      {isCrashed ? "[CRASHED] " : ""}#{thread.thread_index}{" "}
-                      {thread.thread_name || "Thread"}
+                      {isCrashed ? t("stack.crashedPrefix") : ""}#
+                      {thread.thread_index}{" "}
+                      {thread.thread_name || t("stack.defaultThreadName")}
                       {tid !== undefined ? ` (tid:${tid})` : ""} ·{" "}
-                      {thread.frames.length} frames
+                      {t("stack.framesCount", { count: thread.frames.length })}
                     </option>
                   );
                 })}
@@ -592,7 +602,7 @@ export function StackTraceViewer({
                     onClick={() => setSelectedThreadIndex(crashingThreadIdx)}
                     className="inline-flex items-center gap-1 rounded-md border border-rose-200 bg-rose-50 px-2 py-1 text-xs font-medium text-rose-700 hover:bg-rose-100"
                   >
-                    Jump to Crashed Thread (#{crashingThreadIdx})
+                    {t("stack.jumpToCrashed", { index: crashingThreadIdx })}
                   </button>
                 )}
             </div>
@@ -610,7 +620,9 @@ export function StackTraceViewer({
               >
                 <Filter className="h-3.5 w-3.5" />
                 <span>
-                  {hideNoiseFrames ? "Show" : "Hide"} noise frames ({noiseCount})
+                  {hideNoiseFrames
+                    ? t("stack.showNoiseFrames", { count: noiseCount })
+                    : t("stack.hideNoiseFrames", { count: noiseCount })}
                 </span>
               </button>
 
@@ -624,12 +636,12 @@ export function StackTraceViewer({
                 {copiedStack ? (
                   <>
                     <Check className="h-3.5 w-3.5 text-emerald-600" />
-                    <span className="text-emerald-700">Copied</span>
+                    <span className="text-emerald-700">{t("stack.copied")}</span>
                   </>
                 ) : (
                   <>
                     <Copy className="h-3.5 w-3.5" />
-                    <span>Copy Stack</span>
+                    <span>{t("stack.copyStack")}</span>
                   </>
                 )}
               </button>
@@ -663,7 +675,7 @@ export function StackTraceViewer({
                     <span className="font-mono">#{thread.thread_index}</span>
                     {isCrashed && (
                       <span className="rounded bg-rose-600 px-1 py-0.5 text-[10px] font-bold uppercase text-white">
-                        CRASHED
+                        {t("stack.crashedBadge")}
                       </span>
                     )}
                     {thread.thread_name && (
@@ -683,8 +695,8 @@ export function StackTraceViewer({
               <div className="px-6 py-10 text-center">
                 <p className="text-sm text-slate-600">
                   {activeFrames.length > 0 && hideNoiseFrames
-                    ? `All ${activeFrames.length} frames on this thread are marked as noise.`
-                    : "No stack frames recorded for this thread."}
+                    ? t("stack.allFramesNoise", { count: activeFrames.length })
+                    : t("stack.noFramesRecorded")}
                 </p>
                 {activeFrames.length > 0 && hideNoiseFrames && (
                   <button
@@ -692,7 +704,7 @@ export function StackTraceViewer({
                     onClick={() => setHideNoiseFrames(false)}
                     className="mt-2 rounded-md border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50"
                   >
-                    Show all frames
+                    {t("stack.showAllFrames")}
                   </button>
                 )}
               </div>
@@ -734,7 +746,7 @@ export function StackTraceViewer({
                                 : "font-semibold text-slate-900"
                             }`}
                           >
-                            {frame.function || "(unresolved symbol)"}
+                            {frame.function || t("stack.unresolvedSymbol")}
                             {offsetText && (
                               <span className="font-normal text-slate-500">
                                 {" "}
@@ -745,25 +757,37 @@ export function StackTraceViewer({
 
                           {frame.is_inlined === true && (
                             <span className="rounded border border-indigo-200 bg-indigo-50 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-indigo-700">
-                              INLINED
+                              {t("stack.inlinedBadge")}
                             </span>
                           )}
 
                           {isNoise && (
                             <span className="rounded border border-slate-200 bg-slate-100 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-slate-500">
-                              NOISE
+                              {t("stack.noiseBadge")}
                             </span>
                           )}
 
                           {frame.missing_symbols === true && (
                             <span className="rounded border border-amber-200 bg-amber-50 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-amber-700">
-                              MISSING SYM
+                              {t("stack.missingSymBadge")}
                             </span>
                           )}
 
                           {trustMeta && (
                             <span
-                              title={trustMeta.description}
+                              title={
+                                trustMeta.descKind === "context"
+                                  ? t("stack.trustContext")
+                                  : trustMeta.descKind === "cfi"
+                                    ? t("stack.trustCfi")
+                                    : trustMeta.descKind === "fp"
+                                      ? t("stack.trustFp")
+                                      : trustMeta.descKind === "scan"
+                                        ? t("stack.trustScan")
+                                        : t("stack.trustOther", {
+                                            trust: trustMeta.rawTrust,
+                                          })
+                              }
                               className={`rounded border px-1.5 py-0.5 font-mono text-[10px] font-semibold uppercase ${trustMeta.className}`}
                             >
                               {trustMeta.label}
@@ -805,11 +829,11 @@ export function StackTraceViewer({
                             className="flex items-start gap-2.5 py-1.5 pl-14 pr-4"
                           >
                             <span className="mt-0.5 shrink-0 rounded border border-indigo-200 bg-indigo-50 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-indigo-700">
-                              INLINED
+                              {t("stack.inlinedBadge")}
                             </span>
                             <div className="min-w-0 flex-1">
                               <div className="break-all font-mono text-xs text-slate-800">
-                                {inl.function || "(inlined frame)"}
+                                {inl.function || t("stack.inlinedFrame")}
                                 {formatOffset(inl.function_offset) && (
                                   <span className="text-slate-500">
                                     {" "}
@@ -852,7 +876,9 @@ export function StackTraceViewer({
                   )}
                   <Cpu className="h-3.5 w-3.5 text-slate-500" />
                   <span>
-                    CPU Registers ({Object.keys(threadRegisters).length})
+                    {t("stack.cpuRegisters", {
+                      count: Object.keys(threadRegisters).length,
+                    })}
                   </span>
                 </button>
 
@@ -863,8 +889,8 @@ export function StackTraceViewer({
                       type="text"
                       value={registerFilter}
                       onChange={(e) => setRegisterFilter(e.target.value)}
-                      placeholder="Filter registers..."
-                      aria-label="Filter CPU registers"
+                      placeholder={t("stack.filterRegistersPlaceholder")}
+                      aria-label={t("stack.filterRegistersAria")}
                       className="h-7 w-44 rounded-md border border-slate-300 bg-white pl-7 pr-2 text-xs text-slate-800 placeholder:text-slate-400 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
                     />
                   </div>
@@ -875,7 +901,7 @@ export function StackTraceViewer({
                 <div className="ck-scrollbar grid max-h-64 grid-cols-2 gap-2 overflow-y-auto px-4 pb-3 sm:grid-cols-3 lg:grid-cols-4">
                   {registerEntries.length === 0 ? (
                     <p className="col-span-full py-2 text-xs text-slate-500">
-                      No registers match &ldquo;{registerFilter}&rdquo;.
+                      {t("stack.noRegistersMatch", { query: registerFilter })}
                     </p>
                   ) : (
                     registerEntries.map(([regName, regValue]) => (
@@ -907,8 +933,8 @@ export function StackTraceViewer({
                 type="text"
                 value={moduleQuery}
                 onChange={(e) => setModuleQuery(e.target.value)}
-                placeholder="Search module, debug file, or ID..."
-                aria-label="Search loaded modules"
+                placeholder={t("stack.searchModulesPlaceholder")}
+                aria-label={t("stack.searchModulesAria")}
                 className="h-8 w-full rounded-md border border-slate-300 bg-white pl-8 pr-3 text-xs text-slate-800 placeholder:text-slate-400 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
               />
             </div>
@@ -916,10 +942,10 @@ export function StackTraceViewer({
             <div className="flex flex-wrap items-center gap-1.5">
               {(
                 [
-                  { id: "all", label: `All (${modules.length})` },
-                  { id: "loaded", label: `Loaded (${moduleCounts.loaded})` },
-                  { id: "missing", label: `Missing (${moduleCounts.missing})` },
-                  { id: "corrupt", label: `Corrupt (${moduleCounts.corrupt})` },
+                  { id: "all", label: t("stack.filterAll", { count: modules.length }) },
+                  { id: "loaded", label: t("stack.filterLoaded", { count: moduleCounts.loaded }) },
+                  { id: "missing", label: t("stack.filterMissing", { count: moduleCounts.missing }) },
+                  { id: "corrupt", label: t("stack.filterCorrupt", { count: moduleCounts.corrupt }) },
                 ] as const
               ).map((pill) => (
                 <button
@@ -942,18 +968,18 @@ export function StackTraceViewer({
             {filteredModules.length === 0 ? (
               <div className="px-6 py-10 text-center text-sm text-slate-500">
                 {modules.length === 0
-                  ? "No loaded module metadata available."
-                  : "No modules match the active filters."}
+                  ? t("stack.noModulesMetadata")
+                  : t("stack.noModulesMatch")}
               </div>
             ) : (
               <table className="min-w-full divide-y divide-slate-200 text-left text-xs">
                 <thead className="sticky top-0 z-10 bg-slate-50 text-[11px] font-semibold uppercase tracking-wider text-slate-500">
                   <tr>
-                    <th className="px-4 py-2.5">Module</th>
-                    <th className="px-4 py-2.5">Version</th>
-                    <th className="px-4 py-2.5">Address Range</th>
-                    <th className="px-4 py-2.5">Debug File / ID</th>
-                    <th className="px-4 py-2.5">Symbols</th>
+                    <th className="px-4 py-2.5">{t("stack.colModule")}</th>
+                    <th className="px-4 py-2.5">{t("stack.colVersion")}</th>
+                    <th className="px-4 py-2.5">{t("stack.colAddressRange")}</th>
+                    <th className="px-4 py-2.5">{t("stack.colDebugFileId")}</th>
+                    <th className="px-4 py-2.5">{t("stack.colSymbols")}</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 bg-white">
@@ -969,7 +995,7 @@ export function StackTraceViewer({
                             className="truncate font-mono font-medium text-slate-900"
                             title={mod.filename ?? undefined}
                           >
-                            {getModuleDisplayName(mod)}
+                            {getModuleDisplayName(mod, t("stack.unknownModule"))}
                           </div>
                           <div
                             className="truncate font-mono text-[11px] text-slate-400"
@@ -998,15 +1024,15 @@ export function StackTraceViewer({
                         <td className="whitespace-nowrap px-4 py-2.5">
                           {modStatus === "loaded" ? (
                             <span className="inline-flex rounded border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[11px] font-medium text-emerald-700">
-                              Loaded
+                              {t("stack.statusLoaded")}
                             </span>
                           ) : modStatus === "corrupt" ? (
                             <span className="inline-flex rounded border border-rose-200 bg-rose-50 px-2 py-0.5 text-[11px] font-medium text-rose-700">
-                              Corrupt
+                              {t("stack.statusCorrupt")}
                             </span>
                           ) : (
                             <span className="inline-flex rounded border border-amber-200 bg-amber-50 px-2 py-0.5 text-[11px] font-medium text-amber-800">
-                              Missing
+                              {t("stack.statusMissing")}
                             </span>
                           )}
                         </td>

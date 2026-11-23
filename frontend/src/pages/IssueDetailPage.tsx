@@ -29,6 +29,7 @@ import type {
   SignatureFrameItem,
 } from "../api/types";
 import { useProjectContext } from "../components/Layout";
+import { useAppI18n } from "../i18n";
 
 const ISSUE_STATUSES: readonly IssueStatus[] = [
   "NEW",
@@ -45,17 +46,6 @@ const STATUS_BADGE_CLASSES: Record<IssueStatus, string> = {
   WONTFIX: "border-slate-200 bg-slate-100 text-slate-700",
   REGRESSION: "border-rose-200 bg-rose-50 text-rose-700",
 };
-
-function formatDateTime(value: string | null | undefined): string {
-  if (!value) {
-    return "—";
-  }
-  const d = new Date(value);
-  if (Number.isNaN(d.getTime())) {
-    return value;
-  }
-  return d.toLocaleString();
-}
 
 function formatSignatureFrames(
   frames: SignatureFrameItem[],
@@ -92,6 +82,14 @@ function isValidRegex(pattern: string): boolean {
 }
 
 export function IssueDetailPage() {
+  const {
+    t,
+    formatDateTime,
+    formatNumber,
+    formatIssueStatus,
+    formatCrashStatus,
+    formatVerdict,
+  } = useAppI18n();
   const { issueId } = useParams<{ issueId: string }>();
   const { projects } = useProjectContext();
   const queryClient = useQueryClient();
@@ -179,7 +177,7 @@ export function IssueDetailPage() {
     onSuccess: (updated) => {
       syncedIssueIdRef.current = updated.id;
       syncFormFromIssue(updated);
-      setSaveBanner(`Saved issue #${updated.id}.`);
+      setSaveBanner(t("issueDetail.savedBanner", { id: updated.id }));
       void queryClient.invalidateQueries({ queryKey: ["issue", numericIssueId] });
       void queryClient.invalidateQueries({ queryKey: ["issues"] });
       void queryClient.invalidateQueries({ queryKey: ["dashboard"] });
@@ -312,18 +310,19 @@ export function IssueDetailPage() {
     return (
       <div className="rounded-xl border border-rose-200 bg-white p-6 shadow-sm">
         <h1 className="text-base font-semibold text-slate-900">
-          Invalid Issue ID
+          {t("issueDetail.invalidIdTitle")}
         </h1>
         <p className="mt-1 text-sm text-slate-600">
-          The issue identifier <code className="font-mono">{issueId}</code> is
-          not a valid positive integer.
+          {t("issueDetail.invalidIdDescBefore")}
+          <code className="font-mono">{issueId}</code>
+          {t("issueDetail.invalidIdDescAfter")}
         </p>
         <Link
           to="/issues"
           className="mt-4 inline-flex items-center gap-1.5 text-sm font-medium text-indigo-600 hover:underline"
         >
           <ArrowLeft className="h-4 w-4" />
-          Back to Issues
+          {t("issueDetail.backToIssues")}
         </Link>
       </div>
     );
@@ -340,7 +339,7 @@ export function IssueDetailPage() {
               className="inline-flex items-center gap-1 font-medium text-indigo-600 hover:underline"
             >
               <ArrowLeft className="h-3.5 w-3.5" />
-              Issues
+              {t("nav.issues")}
             </Link>
             <span>/</span>
             <span className="font-mono text-slate-700">#{numericIssueId}</span>
@@ -349,7 +348,9 @@ export function IssueDetailPage() {
           <div className="flex flex-wrap items-center gap-2.5">
             <Layers className="h-5 w-5 text-indigo-600" />
             <h1 className="text-xl font-semibold text-slate-900">
-              {issue ? issue.title : `Issue #${numericIssueId}`}
+              {issue
+                ? issue.title
+                : t("issueDetail.fallbackTitle", { id: numericIssueId })}
             </h1>
             {issue && (
               <span
@@ -357,22 +358,34 @@ export function IssueDetailPage() {
                   STATUS_BADGE_CLASSES[issue.status]
                 }`}
               >
-                {issue.status}
+                {formatIssueStatus(issue.status)}
               </span>
             )}
           </div>
 
           {issue && (
             <div className="flex flex-wrap items-center gap-3 text-xs text-slate-500">
-              <span>Project: {projectLabel}</span>
-              <span>|</span>
-              <span className="font-mono font-medium text-slate-700">
-                {issue.crash_count.toLocaleString()} crashes
+              <span>
+                {t("issueDetail.projectMeta", { project: projectLabel ?? "" })}
               </span>
               <span>|</span>
-              <span>First seen: {formatDateTime(issue.first_seen_at)}</span>
+              <span className="font-mono font-medium text-slate-700">
+                {t("issueDetail.crashesCount", {
+                  value: formatNumber(issue.crash_count),
+                })}
+              </span>
               <span>|</span>
-              <span>Last seen: {formatDateTime(issue.last_seen_at)}</span>
+              <span>
+                {t("issueDetail.firstSeenMeta", {
+                  time: formatDateTime(issue.first_seen_at),
+                })}
+              </span>
+              <span>|</span>
+              <span>
+                {t("issueDetail.lastSeenMeta", {
+                  time: formatDateTime(issue.last_seen_at),
+                })}
+              </span>
             </div>
           )}
         </div>
@@ -390,13 +403,15 @@ export function IssueDetailPage() {
               }`}
             >
               <Pin className="h-3.5 w-3.5" />
-              {issue.is_pinned ? "Pinned (GC Protected)" : "Pin Issue"}
+              {issue.is_pinned
+                ? t("issueDetail.pinnedProtected")
+                : t("issueDetail.pinIssue")}
             </button>
             <Link
               to={`/crashes?issue_id=${issue.id}`}
               className="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 shadow-sm hover:bg-slate-50"
             >
-              View All Crashes
+              {t("issueDetail.viewAllCrashes")}
             </Link>
           </div>
         )}
@@ -412,14 +427,14 @@ export function IssueDetailPage() {
           <span>
             {issueQuery.error instanceof ApiError
               ? issueQuery.error.message
-              : "Failed to load issue details."}
+              : t("issueDetail.loadFailed")}
           </span>
           <button
             type="button"
             onClick={() => void issueQuery.refetch()}
             className="rounded border border-rose-300 bg-white px-2.5 py-1 text-xs font-medium text-rose-700"
           >
-            Retry
+            {t("common.retry")}
           </button>
         </div>
       )}
@@ -427,14 +442,17 @@ export function IssueDetailPage() {
       {splitBanner && (
         <div className="flex items-center justify-between rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-2.5 text-sm text-emerald-800">
           <span>
-            Cluster moved to{" "}
+            {t("issueDetail.clusterMovedPrefix")}
             <Link
               to={`/issues/${splitBanner.targetIssueId}`}
               className="font-semibold underline"
             >
-              Issue #{splitBanner.targetIssueId} ({splitBanner.targetTitle})
+              {t("issueDetail.clusterMovedIssue", {
+                id: splitBanner.targetIssueId,
+                title: splitBanner.targetTitle,
+              })}
             </Link>
-            .
+            {t("issueDetail.clusterMovedSuffix")}
           </span>
           <button
             type="button"
@@ -455,7 +473,7 @@ export function IssueDetailPage() {
           >
             <div className="flex items-center justify-between">
               <h2 className="text-sm font-semibold text-slate-900">
-                Knowledge Base Metadata
+                {t("issueDetail.metadataTitle")}
               </h2>
               {saveBanner && (
                 <span className="inline-flex items-center gap-1 text-xs font-medium text-emerald-700">
@@ -469,13 +487,13 @@ export function IssueDetailPage() {
               <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700">
                 {updateMutation.error instanceof ApiError
                   ? updateMutation.error.message
-                  : "Failed to save issue changes."}
+                  : t("issueDetail.saveFailed")}
               </div>
             )}
 
             <div>
               <label className="block text-xs font-medium text-slate-700">
-                Issue Title
+                {t("issueDetail.issueTitleLabel")}
               </label>
               <input
                 type="text"
@@ -489,7 +507,7 @@ export function IssueDetailPage() {
             <div className="grid gap-3 sm:grid-cols-3">
               <div>
                 <label className="block text-xs font-medium text-slate-700">
-                  Status
+                  {t("issueDetail.statusLabel")}
                 </label>
                 <select
                   value={status}
@@ -498,32 +516,32 @@ export function IssueDetailPage() {
                 >
                   {ISSUE_STATUSES.map((st) => (
                     <option key={st} value={st}>
-                      {st}
+                      {formatIssueStatus(st)}
                     </option>
                   ))}
                 </select>
               </div>
               <div>
                 <label className="block text-xs font-medium text-slate-700">
-                  Component
+                  {t("issueDetail.componentLabel")}
                 </label>
                 <input
                   type="text"
                   value={component}
                   onChange={(e) => setComponent(e.target.value)}
-                  placeholder="e.g. AudioEngine"
+                  placeholder={t("issueDetail.componentPlaceholder")}
                   className="mt-1 h-9 w-full rounded-md border border-slate-300 px-3 text-sm text-slate-900"
                 />
               </div>
               <div>
                 <label className="block text-xs font-medium text-slate-700">
-                  Fixed In Version
+                  {t("issueDetail.fixedInVersionLabel")}
                 </label>
                 <input
                   type="text"
                   value={fixedInVersion}
                   onChange={(e) => setFixedInVersion(e.target.value)}
-                  placeholder="e.g. 2.1.0"
+                  placeholder={t("issueDetail.fixedInVersionPlaceholder")}
                   className="mt-1 h-9 w-full rounded-md border border-slate-300 px-3 font-mono text-sm text-slate-900"
                 />
               </div>
@@ -531,13 +549,13 @@ export function IssueDetailPage() {
 
             <div>
               <label className="block text-xs font-medium text-slate-700">
-                Root Cause Analysis
+                {t("issueDetail.rootCauseLabel")}
               </label>
               <textarea
                 rows={4}
                 value={rootCause}
                 onChange={(e) => setRootCause(e.target.value)}
-                placeholder="Document confirmed root cause, affected invariants, and resolution..."
+                placeholder={t("issueDetail.rootCausePlaceholder")}
                 className="mt-1 w-full rounded-md border border-slate-300 p-2.5 text-sm text-slate-900 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
               />
             </div>
@@ -551,12 +569,12 @@ export function IssueDetailPage() {
               />
               <div>
                 <div className="text-xs font-semibold text-slate-800">
-                  Ambiguous Stack Signature
+                  {t("issueDetail.ambiguousTitle")}
                 </div>
                 <p className="text-[11px] text-slate-500">
-                  When enabled, <code className="font-mono">SMART_TRIAGE</code>{" "}
-                  always invokes AI log inspection for incoming crashes matching
-                  this issue.
+                  {t("issueDetail.ambiguousDescBefore")}
+                  <code className="font-mono">SMART_TRIAGE</code>
+                  {t("issueDetail.ambiguousDescAfter")}
                 </p>
               </div>
             </label>
@@ -564,7 +582,8 @@ export function IssueDetailPage() {
             {/* Log Patterns Tag / Regex Editor */}
             <div>
               <label className="block text-xs font-medium text-slate-700">
-                Key Log Patterns (<code className="font-mono">log_patterns_json</code>)
+                {t("issueDetail.logPatternsTitle")} (
+                <code className="font-mono">log_patterns_json</code>)
               </label>
               <div className="mt-1.5 flex gap-2">
                 <input
@@ -577,7 +596,7 @@ export function IssueDetailPage() {
                       handleAddPattern();
                     }
                   }}
-                  placeholder="Add regex or substring pattern..."
+                  placeholder={t("issueDetail.addPatternPlaceholder")}
                   className="h-9 flex-1 rounded-md border border-slate-300 px-3 font-mono text-xs text-slate-900"
                 />
                 <button
@@ -586,13 +605,13 @@ export function IssueDetailPage() {
                   className="inline-flex h-9 items-center gap-1 rounded-md border border-slate-300 bg-white px-3 text-xs font-medium text-slate-700 hover:bg-slate-50"
                 >
                   <Plus className="h-3.5 w-3.5" />
-                  Add
+                  {t("issueDetail.addPatternButton")}
                 </button>
               </div>
 
               {logPatterns.length === 0 ? (
                 <p className="mt-2 text-xs text-slate-400">
-                  No log patterns configured yet.
+                  {t("issueDetail.noPatterns")}
                 </p>
               ) : (
                 <div className="mt-2.5 flex flex-wrap gap-2">
@@ -608,8 +627,8 @@ export function IssueDetailPage() {
                         }`}
                         title={
                           regexOk
-                            ? "Valid regex pattern"
-                            : "Invalid regex syntax (will be treated as literal substring if supported)"
+                            ? t("issueDetail.validRegexTitle")
+                            : t("issueDetail.invalidRegexTitle")
                         }
                       >
                         {!regexOk && (
@@ -620,7 +639,9 @@ export function IssueDetailPage() {
                           type="button"
                           onClick={() => handleRemovePattern(pattern)}
                           className="rounded p-0.5 text-slate-500 hover:bg-slate-200 hover:text-slate-900"
-                          aria-label={`Remove pattern ${pattern}`}
+                          aria-label={t("issueDetail.removePatternAria", {
+                            pattern,
+                          })}
                         >
                           <X className="h-3 w-3" />
                         </button>
@@ -638,7 +659,9 @@ export function IssueDetailPage() {
                 className="inline-flex items-center gap-1.5 rounded-md bg-indigo-600 px-4 py-2 text-sm font-medium text-white shadow-sm hover:bg-indigo-700 disabled:opacity-50"
               >
                 <Save className="h-4 w-4" />
-                {updateMutation.isPending ? "Saving..." : "Save Knowledge Base"}
+                {updateMutation.isPending
+                  ? t("common.saving")
+                  : t("issueDetail.saveKnowledgeBase")}
               </button>
             </div>
           </form>
@@ -651,14 +674,16 @@ export function IssueDetailPage() {
                 <div className="flex items-center gap-2">
                   <GitBranch className="h-4 w-4 text-indigo-600" />
                   <h2 className="text-sm font-semibold text-slate-900">
-                    Associated Clusters ({issue.clusters.length})
+                    {t("issueDetail.associatedClusters", {
+                      count: issue.clusters.length,
+                    })}
                   </h2>
                 </div>
               </div>
 
               {issue.clusters.length === 0 ? (
                 <p className="text-xs text-slate-500">
-                  No crash clusters are currently assigned to this issue.
+                  {t("issueDetail.noClusters")}
                 </p>
               ) : (
                 <div className="space-y-3">
@@ -678,7 +703,9 @@ export function IssueDetailPage() {
                             </span>
                           )}
                           <span className="rounded-full bg-indigo-50 px-2 py-0.5 font-mono text-[11px] font-medium text-indigo-700">
-                            {cluster.crash_count} crashes
+                            {t("issueDetail.clusterCrashesBadge", {
+                              count: cluster.crash_count,
+                            })}
                           </span>
                         </div>
 
@@ -689,7 +716,7 @@ export function IssueDetailPage() {
                             )}`}
                             className="text-xs font-medium text-indigo-600 hover:underline"
                           >
-                            Crashes
+                            {t("issueDetail.crashesLink")}
                           </Link>
                           <button
                             type="button"
@@ -697,7 +724,7 @@ export function IssueDetailPage() {
                             className="inline-flex items-center gap-1 rounded border border-slate-200 bg-white px-2 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50"
                           >
                             <Split className="h-3 w-3" />
-                            Split / Reassign
+                            {t("issueDetail.splitReassign")}
                           </button>
                         </div>
                       </div>
@@ -717,29 +744,39 @@ export function IssueDetailPage() {
             <div className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
               <div className="mb-3 flex items-center justify-between">
                 <h2 className="text-sm font-semibold text-slate-900">
-                  Recent Crashes ({issue.recent_crashes.length})
+                  {t("issueDetail.recentCrashes", {
+                    count: issue.recent_crashes.length,
+                  })}
                 </h2>
                 <Link
                   to={`/crashes?issue_id=${issue.id}`}
                   className="text-xs font-medium text-indigo-600 hover:underline"
                 >
-                  View all in Crashes &rarr;
+                  {t("issueDetail.viewAllInCrashes")}
                 </Link>
               </div>
 
               {issue.recent_crashes.length === 0 ? (
                 <p className="text-xs text-slate-500">
-                  No recent crashes recorded for this issue.
+                  {t("issueDetail.noRecentCrashes")}
                 </p>
               ) : (
                 <div className="overflow-x-auto">
                   <table className="min-w-full divide-y divide-slate-200 text-left text-xs">
                     <thead>
                       <tr className="text-slate-500">
-                        <th className="pb-2 pr-3 font-medium">Crash</th>
-                        <th className="pb-2 pr-3 font-medium">Version</th>
-                        <th className="pb-2 pr-3 font-medium">Status / AI</th>
-                        <th className="pb-2 font-medium">Time</th>
+                        <th className="pb-2 pr-3 font-medium">
+                          {t("issueDetail.colCrash")}
+                        </th>
+                        <th className="pb-2 pr-3 font-medium">
+                          {t("issueDetail.colVersion")}
+                        </th>
+                        <th className="pb-2 pr-3 font-medium">
+                          {t("issueDetail.colStatusAi")}
+                        </th>
+                        <th className="pb-2 font-medium">
+                          {t("issueDetail.colTime")}
+                        </th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100">
@@ -766,17 +803,17 @@ export function IssueDetailPage() {
                             <td className="py-2 pr-3">
                               <div className="flex flex-wrap items-center gap-1">
                                 <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[11px] font-medium text-slate-700">
-                                  {crash.status}
+                                  {formatCrashStatus(crash.status)}
                                 </span>
                                 {crash.ai_verdict && (
                                   <span className="rounded bg-indigo-50 px-1.5 py-0.5 text-[11px] text-indigo-700">
-                                    {crash.ai_verdict}
+                                    {formatVerdict(crash.ai_verdict)}
                                     {conf ? ` (${conf})` : ""}
                                   </span>
                                 )}
                                 {crash.is_human_verified && (
                                   <span className="rounded bg-emerald-50 px-1.5 py-0.5 text-[11px] text-emerald-700">
-                                    Verified
+                                    {t("issueDetail.verifiedBadge")}
                                   </span>
                                 )}
                               </div>
@@ -812,7 +849,7 @@ export function IssueDetailPage() {
                 id="split-cluster-modal-title"
                 className="text-base font-semibold text-slate-900"
               >
-                Split / Reassign Cluster
+                {t("issueDetail.splitModalTitle")}
               </h2>
               <button
                 type="button"
@@ -823,12 +860,13 @@ export function IssueDetailPage() {
               </button>
             </div>
             <p className="mt-1 text-xs text-slate-500">
-              Move cluster{" "}
+              {t("issueDetail.splitModalDescBefore")}
               <code className="font-mono">
                 {splitTargetCluster.signature_hash.slice(0, 12)}
-              </code>{" "}
-              ({splitTargetCluster.crash_count} crashes) to a new or existing
-              issue.
+              </code>
+              {t("issueDetail.splitModalDescMiddle", {
+                count: splitTargetCluster.crash_count,
+              })}
             </p>
 
             <form onSubmit={handleSplitSubmit} className="mt-4 space-y-4">
@@ -836,7 +874,7 @@ export function IssueDetailPage() {
                 <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700">
                   {splitMutation.error instanceof ApiError
                     ? splitMutation.error.message
-                    : "Failed to split cluster."}
+                    : t("issueDetail.splitFailed")}
                 </div>
               )}
 
@@ -848,7 +886,7 @@ export function IssueDetailPage() {
                     checked={splitMode === "new"}
                     onChange={() => setSplitMode("new")}
                   />
-                  Create New Issue
+                  {t("issueDetail.splitCreateNew")}
                 </label>
                 {splitMode === "new" && (
                   <input
@@ -856,7 +894,7 @@ export function IssueDetailPage() {
                     required
                     value={splitNewTitle}
                     onChange={(e) => setSplitNewTitle(e.target.value)}
-                    placeholder="New issue title..."
+                    placeholder={t("issueDetail.splitNewTitlePlaceholder")}
                     className="h-9 w-full rounded-md border border-slate-300 px-3 text-sm text-slate-900"
                   />
                 )}
@@ -870,7 +908,7 @@ export function IssueDetailPage() {
                     checked={splitMode === "existing"}
                     onChange={() => setSplitMode("existing")}
                   />
-                  Reassign to Existing Issue
+                  {t("issueDetail.splitReassignExisting")}
                 </label>
                 {splitMode === "existing" && (
                   <select
@@ -879,10 +917,11 @@ export function IssueDetailPage() {
                     onChange={(e) => setSplitTargetIssueId(e.target.value)}
                     className="h-9 w-full rounded-md border border-slate-300 bg-white px-3 text-sm text-slate-900"
                   >
-                    <option value="">Select target issue...</option>
+                    <option value="">{t("issueDetail.splitSelectTarget")}</option>
                     {otherProjectIssues.map((cand) => (
                       <option key={cand.id} value={cand.id}>
-                        #{cand.id} — {cand.title} ({cand.status})
+                        #{cand.id} — {cand.title} (
+                        {formatIssueStatus(cand.status)})
                       </option>
                     ))}
                   </select>
@@ -895,7 +934,7 @@ export function IssueDetailPage() {
                   onClick={() => setSplitTargetCluster(null)}
                   className="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50"
                 >
-                  Cancel
+                  {t("common.cancel")}
                 </button>
                 <button
                   type="submit"
@@ -908,7 +947,9 @@ export function IssueDetailPage() {
                   className="inline-flex items-center gap-1.5 rounded-md bg-indigo-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-indigo-700 disabled:opacity-50"
                 >
                   <Split className="h-4 w-4" />
-                  {splitMutation.isPending ? "Moving..." : "Move Cluster"}
+                  {splitMutation.isPending
+                    ? t("issueDetail.moving")
+                    : t("issueDetail.moveCluster")}
                 </button>
               </div>
             </form>

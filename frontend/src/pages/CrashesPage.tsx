@@ -26,6 +26,7 @@ import { ApiError, listCrashes, pinCrash } from "../api/client";
 import type { AIVerdict, CrashStatus, CrashSummary } from "../api/types";
 import { useProjectContext } from "../components/Layout";
 import { UploadModal } from "../components/UploadModal";
+import { useAppI18n } from "../i18n";
 
 const PAGE_SIZE = 25;
 
@@ -76,17 +77,6 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
 }
 
-function formatDateTime(value: string | null | undefined): string {
-  if (!value) {
-    return "—";
-  }
-  const d = new Date(value);
-  if (Number.isNaN(d.getTime())) {
-    return value;
-  }
-  return d.toLocaleString();
-}
-
 function formatConfidence(confidence: number | null): string | null {
   if (confidence === null || !Number.isFinite(confidence)) {
     return null;
@@ -96,6 +86,13 @@ function formatConfidence(confidence: number | null): string | null {
 }
 
 export function CrashesPage() {
+  const {
+    t,
+    formatDateTime,
+    formatNumber,
+    formatCrashStatus,
+    formatVerdict,
+  } = useAppI18n();
   const { projects, selectedProject, selectedProjectId } = useProjectContext();
   const [searchParams, setSearchParams] = useSearchParams();
   const navigate = useNavigate();
@@ -305,7 +302,7 @@ export function CrashesPage() {
 
   const scopeLabel = selectedProject
     ? `${selectedProject.name} (${selectedProject.key})`
-    : selectedProjectId || "All Projects";
+    : selectedProjectId || t("nav.allProjects");
 
   return (
     <div className="space-y-6">
@@ -316,17 +313,16 @@ export function CrashesPage() {
             <Bug className="h-5 w-5" />
           </div>
           <div>
-            <h1 className="text-xl font-semibold text-slate-900">Crashes</h1>
-            <p className="text-sm text-slate-500">
-              Uploaded minidumps, pipeline status, AI verdicts, and human
-              verification
-            </p>
+            <h1 className="text-xl font-semibold text-slate-900">
+              {t("crashes.title")}
+            </h1>
+            <p className="text-sm text-slate-500">{t("crashes.subtitle")}</p>
           </div>
         </div>
 
         <div className="flex flex-wrap items-center gap-2.5">
           <span className="rounded-full border border-slate-200 bg-white px-3 py-1 text-xs font-medium text-slate-700">
-            Scope: {scopeLabel}
+            {t("crashes.scope", { scope: scopeLabel })}
           </span>
           <button
             type="button"
@@ -339,7 +335,7 @@ export function CrashesPage() {
                 crashesQuery.isFetching ? "animate-spin" : ""
               }`}
             />
-            Refresh
+            {t("common.refresh")}
           </button>
           <button
             type="button"
@@ -347,7 +343,7 @@ export function CrashesPage() {
             className="inline-flex items-center gap-1.5 rounded-md bg-indigo-600 px-3 py-1.5 text-sm font-medium text-white shadow-sm hover:bg-indigo-700"
           >
             <Upload className="h-4 w-4" />
-            Upload Crash
+            {t("crashes.uploadCrash")}
           </button>
         </div>
       </div>
@@ -361,39 +357,39 @@ export function CrashesPage() {
               type="text"
               value={searchInput}
               onChange={(e) => setSearchInput(e.target.value)}
-              placeholder="Search crash reason, address, OS, build..."
+              placeholder={t("crashes.searchPlaceholder")}
               className="h-9 w-full rounded-md border border-slate-300 pl-9 pr-3 text-sm text-slate-900 placeholder:text-slate-400 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
             />
           </div>
 
           <select
-            aria-label="Filter by crash status"
+            aria-label={t("crashes.filterStatusAria")}
             value={statusFilter}
             onChange={(e) =>
               setUrlParam("status", e.target.value || undefined)
             }
             className="h-9 rounded-md border border-slate-300 bg-white px-2.5 text-sm text-slate-800 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
           >
-            <option value="">All Statuses</option>
+            <option value="">{t("crashes.allStatuses")}</option>
             {CRASH_STATUSES.map((st) => (
               <option key={st} value={st}>
-                {st}
+                {formatCrashStatus(st)}
               </option>
             ))}
           </select>
 
           <select
-            aria-label="Filter by AI verdict"
+            aria-label={t("crashes.filterVerdictAria")}
             value={verdictFilter}
             onChange={(e) =>
               setVerdictFilter(e.target.value as "" | AIVerdict)
             }
             className="h-9 rounded-md border border-slate-300 bg-white px-2.5 text-sm text-slate-800 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
           >
-            <option value="">All AI Verdicts</option>
+            <option value="">{t("crashes.allVerdicts")}</option>
             {AI_VERDICTS.map((v) => (
               <option key={v} value={v}>
-                {v}
+                {formatVerdict(v)}
               </option>
             ))}
           </select>
@@ -402,14 +398,14 @@ export function CrashesPage() {
             type="text"
             value={appVersionInput}
             onChange={(e) => setAppVersionInput(e.target.value)}
-            placeholder="App version..."
-            aria-label="Filter by app version"
+            placeholder={t("crashes.appVersionPlaceholder")}
+            aria-label={t("crashes.filterAppVersionAria")}
             className="h-9 rounded-md border border-slate-300 px-3 text-sm text-slate-900 placeholder:text-slate-400 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
           />
 
           <div className="flex gap-2">
             <select
-              aria-label="Filter by human verification"
+              aria-label={t("crashes.filterVerifiedAria")}
               value={verifiedFilter}
               onChange={(e) =>
                 setVerifiedFilter(
@@ -418,13 +414,13 @@ export function CrashesPage() {
               }
               className="h-9 flex-1 rounded-md border border-slate-300 bg-white px-2 text-xs text-slate-800"
             >
-              <option value="all">Verification: All</option>
-              <option value="verified">Human Verified</option>
-              <option value="unverified">Unverified</option>
+              <option value="all">{t("crashes.verificationAll")}</option>
+              <option value="verified">{t("crashes.humanVerified")}</option>
+              <option value="unverified">{t("crashes.unverified")}</option>
             </select>
 
             <select
-              aria-label="Filter by pin status"
+              aria-label={t("crashes.filterPinnedAria")}
               value={pinnedFilter}
               onChange={(e) =>
                 setPinnedFilter(
@@ -433,9 +429,9 @@ export function CrashesPage() {
               }
               className="h-9 flex-1 rounded-md border border-slate-300 bg-white px-2 text-xs text-slate-800"
             >
-              <option value="all">Pin: All</option>
-              <option value="pinned">Pinned</option>
-              <option value="unpinned">Unpinned</option>
+              <option value="all">{t("crashes.pinAll")}</option>
+              <option value="pinned">{t("crashes.pinned")}</option>
+              <option value="unpinned">{t("crashes.unpinned")}</option>
             </select>
           </div>
         </div>
@@ -445,12 +441,12 @@ export function CrashesPage() {
           <div className="flex flex-wrap items-center gap-2 pt-1 text-xs">
             {parsedIssueId !== undefined && (
               <span className="inline-flex items-center gap-1 rounded-full border border-indigo-200 bg-indigo-50 px-2.5 py-0.5 font-medium text-indigo-700">
-                Issue #{parsedIssueId}
+                {t("crashes.issueChip", { id: parsedIssueId })}
                 <button
                   type="button"
                   onClick={() => setUrlParam("issue_id", undefined)}
                   className="rounded-full p-0.5 hover:bg-indigo-100"
-                  aria-label="Clear issue filter"
+                  aria-label={t("crashes.clearIssueFilter")}
                 >
                   <X className="h-3 w-3" />
                 </button>
@@ -458,12 +454,12 @@ export function CrashesPage() {
             )}
             {clusterIdFilter && (
               <span className="inline-flex items-center gap-1 rounded-full border border-indigo-200 bg-indigo-50 px-2.5 py-0.5 font-mono font-medium text-indigo-700">
-                Cluster {clusterIdFilter.slice(0, 8)}
+                {t("crashes.clusterChip", { id: clusterIdFilter.slice(0, 8) })}
                 <button
                   type="button"
                   onClick={() => setUrlParam("cluster_id", undefined)}
                   className="rounded-full p-0.5 hover:bg-indigo-100"
-                  aria-label="Clear cluster filter"
+                  aria-label={t("crashes.clearClusterFilter")}
                 >
                   <X className="h-3 w-3" />
                 </button>
@@ -476,7 +472,7 @@ export function CrashesPage() {
                 className="inline-flex items-center gap-1 rounded-md px-2 py-0.5 text-xs font-medium text-slate-600 hover:bg-slate-100 hover:text-slate-900"
               >
                 <RotateCcw className="h-3 w-3" />
-                Reset Filters
+                {t("crashes.resetFilters")}
               </button>
             )}
           </div>
@@ -491,7 +487,7 @@ export function CrashesPage() {
             <span>
               {crashesQuery.error instanceof ApiError
                 ? crashesQuery.error.message
-                : "Failed to load crashes."}
+                : t("crashes.loadFailed")}
             </span>
           </div>
           <button
@@ -499,7 +495,7 @@ export function CrashesPage() {
             onClick={() => void crashesQuery.refetch()}
             className="rounded border border-rose-300 bg-white px-2.5 py-1 text-xs font-medium text-rose-700"
           >
-            Retry
+            {t("common.retry")}
           </button>
         </div>
       )}
@@ -511,14 +507,14 @@ export function CrashesPage() {
             <span>
               {pinMutation.error instanceof ApiError
                 ? pinMutation.error.message
-                : "Failed to update crash pin status."}
+                : t("crashes.pinFailed")}
             </span>
           </div>
           <button
             type="button"
             onClick={() => pinMutation.reset()}
             className="rounded p-1 text-rose-700 hover:bg-rose-100"
-            aria-label="Dismiss pin error"
+            aria-label={t("crashes.dismissPinError")}
           >
             <X className="h-4 w-4" />
           </button>
@@ -531,14 +527,14 @@ export function CrashesPage() {
           <table className="min-w-full divide-y divide-slate-200 text-left text-sm">
             <thead className="bg-slate-50 text-xs font-medium uppercase tracking-wider text-slate-500">
               <tr>
-                <th className="px-4 py-3">Crash ID</th>
-                <th className="px-4 py-3">Version / OS</th>
-                <th className="px-4 py-3">Reason / Issue</th>
-                <th className="px-4 py-3">Status</th>
-                <th className="px-4 py-3">AI Verdict</th>
-                <th className="px-4 py-3">Dump Size</th>
-                <th className="px-4 py-3">Crash Time</th>
-                <th className="px-4 py-3 text-right">Pin</th>
+                <th className="px-4 py-3">{t("crashes.colCrashId")}</th>
+                <th className="px-4 py-3">{t("crashes.colVersionOs")}</th>
+                <th className="px-4 py-3">{t("crashes.colReasonIssue")}</th>
+                <th className="px-4 py-3">{t("crashes.colStatus")}</th>
+                <th className="px-4 py-3">{t("crashes.colAiVerdict")}</th>
+                <th className="px-4 py-3">{t("crashes.colDumpSize")}</th>
+                <th className="px-4 py-3">{t("crashes.colCrashTime")}</th>
+                <th className="px-4 py-3 text-right">{t("crashes.colPin")}</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
@@ -548,7 +544,7 @@ export function CrashesPage() {
                     colSpan={8}
                     className="px-4 py-10 text-center text-sm text-slate-500"
                   >
-                    Loading crashes...
+                    {t("crashes.loadingList")}
                   </td>
                 </tr>
               ) : crashes.length === 0 ? (
@@ -557,7 +553,7 @@ export function CrashesPage() {
                     colSpan={8}
                     className="px-4 py-12 text-center text-sm text-slate-500"
                   >
-                    No crash reports match the current filters.
+                    {t("crashes.emptyList")}
                   </td>
                 </tr>
               ) : (
@@ -593,13 +589,13 @@ export function CrashesPage() {
                           {crash.build_id ? ` (${crash.build_id})` : ""}
                         </div>
                         <div className="mt-0.5 text-[11px] text-slate-500">
-                          {crash.os_version || "Unknown OS"}
+                          {crash.os_version || t("crashes.unknownOs")}
                         </div>
                       </td>
 
                       <td className="max-w-xs px-4 py-3 text-xs">
                         <div className="truncate font-mono text-slate-800">
-                          {crash.crash_reason || "Pending symbolication..."}
+                          {crash.crash_reason || t("crashes.pendingSymbolication")}
                         </div>
                         <div className="mt-0.5 flex flex-wrap items-center gap-2 text-[11px] text-slate-500">
                           {crash.crash_address && (
@@ -612,7 +608,7 @@ export function CrashesPage() {
                               to={`/issues/${crash.issue_id}`}
                               className="font-medium text-indigo-600 hover:underline"
                             >
-                              Issue #{crash.issue_id}
+                              {t("crashes.issueChip", { id: crash.issue_id })}
                             </Link>
                           )}
                         </div>
@@ -631,7 +627,7 @@ export function CrashesPage() {
                           ) : (
                             <Clock className="h-3 w-3" />
                           )}
-                          {crash.status}
+                          {formatCrashStatus(crash.status)}
                         </span>
                       </td>
 
@@ -644,7 +640,7 @@ export function CrashesPage() {
                               }`}
                             >
                               <Sparkles className="h-3 w-3" />
-                              {crash.ai_verdict}
+                              {formatVerdict(crash.ai_verdict)}
                               {confLabel ? ` (${confLabel})` : ""}
                             </span>
                           ) : (
@@ -654,7 +650,7 @@ export function CrashesPage() {
                           {crash.is_human_verified && (
                             <span className="inline-flex items-center gap-1 rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[11px] font-medium text-emerald-700">
                               <CheckCircle2 className="h-3 w-3" />
-                              Verified
+                              {t("crashes.verifiedBadge")}
                             </span>
                           )}
                         </div>
@@ -664,7 +660,9 @@ export function CrashesPage() {
                         <div>{formatBytes(crash.dump_compressed_size)}</div>
                         {crash.dump_raw_size > 0 && (
                           <div className="text-[11px] text-slate-400">
-                            raw {formatBytes(crash.dump_raw_size)}
+                            {t("crashes.rawSize", {
+                              size: formatBytes(crash.dump_raw_size),
+                            })}
                           </div>
                         )}
                       </td>
@@ -688,8 +686,8 @@ export function CrashesPage() {
                           }
                           aria-label={
                             crash.is_pinned
-                              ? `Unpin crash ${crash.id}`
-                              : `Pin crash ${crash.id}`
+                              ? t("crashes.unpinAria", { id: crash.id })
+                              : t("crashes.pinAria", { id: crash.id })
                           }
                           className={`inline-flex items-center gap-1 rounded-md border px-2 py-1 text-xs font-medium transition-colors ${
                             crash.is_pinned
@@ -698,7 +696,9 @@ export function CrashesPage() {
                           }`}
                         >
                           <Pin className="h-3.5 w-3.5" />
-                          {crash.is_pinned ? "Pinned" : "Pin"}
+                          {crash.is_pinned
+                            ? t("crashes.pinned")
+                            : t("crashes.pinAction")}
                         </button>
                       </td>
                     </tr>
@@ -712,7 +712,11 @@ export function CrashesPage() {
         {/* Pagination Footer */}
         <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-200 bg-slate-50 px-4 py-3 text-xs text-slate-600">
           <span>
-            Showing {fromIdx}–{toIdx} of {total.toLocaleString()}
+            {t("common.showingRange", {
+              from: fromIdx,
+              to: toIdx,
+              total: formatNumber(total),
+            })}
           </span>
           <div className="flex items-center gap-2">
             <button
@@ -722,7 +726,7 @@ export function CrashesPage() {
               className="inline-flex items-center gap-1 rounded-md border border-slate-300 bg-white px-2.5 py-1 font-medium text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
             >
               <ChevronLeft className="h-3.5 w-3.5" />
-              Previous
+              {t("common.previous")}
             </button>
             <button
               type="button"
@@ -730,7 +734,7 @@ export function CrashesPage() {
               onClick={() => setOffset((prev) => prev + PAGE_SIZE)}
               className="inline-flex items-center gap-1 rounded-md border border-slate-300 bg-white px-2.5 py-1 font-medium text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
             >
-              Next
+              {t("common.next")}
               <ChevronRight className="h-3.5 w-3.5" />
             </button>
           </div>

@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 import {
   AlertTriangle,
   Bot,
+  Brain,
   Check,
   CheckCircle2,
   ChevronDown,
@@ -28,6 +29,7 @@ import type {
   AIVerdict,
   CrashDetailRead,
 } from "../api/types";
+import { useAppI18n } from "../i18n";
 
 export interface AgentTracePanelProps {
   crash: CrashDetailRead;
@@ -43,25 +45,21 @@ export interface AgentTracePanelProps {
 
 const VERDICT_META: Record<
   AIVerdict,
-  { label: string; badgeClass: string; icon: LucideIcon }
+  { badgeClass: string; icon: LucideIcon }
 > = {
   KNOWN_ISSUE: {
-    label: "Known Issue",
     badgeClass: "border-emerald-200 bg-emerald-50 text-emerald-700",
     icon: CheckCircle2,
   },
   NEW_ISSUE: {
-    label: "New Issue",
     badgeClass: "border-sky-200 bg-sky-50 text-sky-700",
     icon: Sparkles,
   },
   REGRESSION: {
-    label: "Regression",
     badgeClass: "border-rose-200 bg-rose-50 text-rose-700",
     icon: AlertTriangle,
   },
   NEEDS_REVIEW: {
-    label: "Needs Review",
     badgeClass: "border-amber-200 bg-amber-50 text-amber-800",
     icon: HelpCircle,
   },
@@ -181,14 +179,6 @@ function formatSafeLineRange(start: number, end: number): [number, number] {
   return [s, e];
 }
 
-function formatTimestamp(ts: string): string {
-  const d = new Date(ts);
-  if (Number.isNaN(d.getTime())) {
-    return ts;
-  }
-  return d.toLocaleString();
-}
-
 export function AgentTracePanel({
   crash,
   onSelectLogEvidence,
@@ -196,6 +186,7 @@ export function AgentTracePanel({
   onRerunAI,
   isRerunningAI = false,
 }: AgentTracePanelProps) {
+  const { t, formatDateTime, formatVerdict, formatAIRunStatus } = useAppI18n();
   const sortedRuns = useMemo(
     () => sortRunsNewestFirst(crash.ai_runs ?? []),
     [crash.ai_runs],
@@ -288,22 +279,22 @@ export function AgentTracePanel({
           <div className="flex items-center gap-2">
             <Bot className="h-4 w-4 text-indigo-600" />
             <h2 className="text-sm font-semibold text-slate-900">
-              AI Triage Analysis
+              {t("agent.title")}
             </h2>
           </div>
 
-          {verdictMeta && (
+          {verdictMeta && effectiveVerdict && (
             <span
               className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-0.5 text-xs font-semibold ${verdictMeta.badgeClass}`}
             >
               <VerdictIcon className="h-3.5 w-3.5" />
-              {verdictMeta.label}
+              {formatVerdict(effectiveVerdict)}
             </span>
           )}
 
           {effectiveConfidence !== null && (
             <div className="inline-flex items-center gap-1.5 rounded-full border border-slate-200 bg-white px-2.5 py-0.5 text-xs">
-              <span className="text-slate-500">Confidence</span>
+              <span className="text-slate-500">{t("agent.confidence")}</span>
               <span className="h-1.5 w-12 overflow-hidden rounded-full bg-slate-200">
                 <span
                   className={`block h-full rounded-full ${
@@ -325,7 +316,7 @@ export function AgentTracePanel({
           {crash.is_human_verified && (
             <span className="inline-flex items-center gap-1 rounded-full border border-emerald-200 bg-emerald-50 px-2.5 py-0.5 text-xs font-semibold text-emerald-700">
               <UserCheck className="h-3.5 w-3.5" />
-              Human Verified
+              {t("agent.humanVerified")}
             </span>
           )}
 
@@ -335,7 +326,7 @@ export function AgentTracePanel({
               className="inline-flex items-center gap-1 rounded-md border border-indigo-200 bg-indigo-50 px-2 py-0.5 text-xs font-medium text-indigo-700 hover:bg-indigo-100"
             >
               <span>
-                Issue #{linkedIssueId}
+                {t("agent.issueBadge", { id: linkedIssueId })}
                 {crash.issue?.title ? `: ${crash.issue.title}` : ""}
               </span>
               <ExternalLink className="h-3 w-3" />
@@ -346,7 +337,7 @@ export function AgentTracePanel({
         <div className="flex flex-wrap items-center gap-2">
           {sortedRuns.length > 1 && (
             <select
-              aria-label="Select AI analysis run"
+              aria-label={t("agent.selectRunAria")}
               value={activeRun?.id ?? ""}
               onChange={(e) => {
                 const nextId = e.target.value;
@@ -358,8 +349,11 @@ export function AgentTracePanel({
             >
               {sortedRuns.map((run, index) => (
                 <option key={run.id} value={run.id}>
-                  Run #{sortedRuns.length - index} · {run.status} ·{" "}
-                  {run.model_name}
+                  {t("agent.runOption", {
+                    num: sortedRuns.length - index,
+                    status: formatAIRunStatus(run.status),
+                    model: run.model_name,
+                  })}
                 </option>
               ))}
             </select>
@@ -373,7 +367,9 @@ export function AgentTracePanel({
             >
               <UserCheck className="h-3.5 w-3.5 text-slate-600" />
               <span>
-                {crash.is_human_verified ? "Edit Verdict" : "Verify / Assign"}
+                {crash.is_human_verified
+                  ? t("agent.editVerdict")
+                  : t("agent.verifyAssign")}
               </span>
             </button>
           )}
@@ -388,17 +384,17 @@ export function AgentTracePanel({
               {isBusy ? (
                 <>
                   <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                  <span>Running...</span>
+                  <span>{t("agent.running")}</span>
                 </>
               ) : sortedRuns.length > 0 ? (
                 <>
                   <RotateCcw className="h-3.5 w-3.5" />
-                  <span>Re-run AI</span>
+                  <span>{t("agent.rerunAi")}</span>
                 </>
               ) : (
                 <>
                   <Play className="h-3.5 w-3.5" />
-                  <span>Run AI</span>
+                  <span>{t("agent.runAi")}</span>
                 </>
               )}
             </button>
@@ -413,20 +409,14 @@ export function AgentTracePanel({
           !activeRun && (
             <div className="flex items-center gap-2.5 rounded-lg border border-slate-200 bg-slate-50 px-3.5 py-3 text-xs text-slate-700">
               <Loader2 className="h-4 w-4 shrink-0 animate-spin text-indigo-600" />
-              <span>
-                Waiting for minidump parsing and deterministic clustering before
-                AI triage begins.
-              </span>
+              <span>{t("agent.waitingParsing")}</span>
             </div>
           )}
 
         {(crash.status === "TRIAGING" || activeRun?.status === "RUNNING") && (
           <div className="flex items-center gap-2.5 rounded-lg border border-indigo-200 bg-indigo-50 px-3.5 py-3 text-xs text-indigo-900">
             <Loader2 className="h-4 w-4 shrink-0 animate-spin text-indigo-600" />
-            <span>
-              AI Agent is investigating stack frames, compressed logs, and known
-              issues...
-            </span>
+            <span>{t("agent.investigating")}</span>
           </div>
         )}
 
@@ -438,14 +428,14 @@ export function AgentTracePanel({
           >
             <XCircle className="mt-0.5 h-4 w-4 shrink-0 text-rose-600" />
             <div className="min-w-0 flex-1">
-              <p className="font-semibold">AI Analysis Failed</p>
+              <p className="font-semibold">{t("agent.analysisFailedTitle")}</p>
               {firstTraceError ? (
                 <p className="mt-1 break-words font-mono text-[11px] text-rose-800">
                   {firstTraceError}
                 </p>
               ) : (
                 <p className="mt-1 text-rose-700">
-                  The AI triage run did not complete with a structured verdict.
+                  {t("agent.analysisFailedFallback")}
                 </p>
               )}
             </div>
@@ -456,11 +446,9 @@ export function AgentTracePanel({
           <div className="flex items-start gap-2.5 rounded-lg border border-amber-200 bg-amber-50 px-3.5 py-3 text-xs text-amber-900">
             <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
             <div>
-              <p className="font-semibold">Needs Human Review</p>
+              <p className="font-semibold">{t("agent.needsReviewTitle")}</p>
               <p className="mt-0.5 text-amber-800">
-                The agent reached step/timeout guardrails or lacked sufficient
-                confidence. Inspect the evidence below and confirm or assign an
-                issue.
+                {t("agent.needsReviewDesc")}
               </p>
             </div>
           </div>
@@ -468,10 +456,7 @@ export function AgentTracePanel({
 
         {!activeRun && crash.status === "ANALYZED" && (
           <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3.5 py-3 text-xs text-slate-700">
-            <span>
-              AI triage was skipped for this crash (Smart Triage exact cluster
-              match or Manual mode).
-            </span>
+            <span>{t("agent.skippedBanner")}</span>
             {onRerunAI && (
               <button
                 type="button"
@@ -479,7 +464,7 @@ export function AgentTracePanel({
                 disabled={isBusy}
                 className="font-medium text-indigo-600 hover:text-indigo-700 disabled:opacity-50"
               >
-                Run AI analysis manually &rarr;
+                {t("agent.runManually")}
               </button>
             )}
           </div>
@@ -491,10 +476,10 @@ export function AgentTracePanel({
             <div className="flex flex-wrap items-start justify-between gap-2">
               <div>
                 <div className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
-                  Suggested Title
+                  {t("agent.suggestedTitle")}
                 </div>
                 <h3 className="mt-0.5 text-sm font-semibold text-slate-900">
-                  {result.suggested_title || "Untitled Finding"}
+                  {result.suggested_title || t("agent.untitledFinding")}
                 </h3>
               </div>
               {result.suggested_component && (
@@ -507,19 +492,19 @@ export function AgentTracePanel({
             <div className="grid gap-4 lg:grid-cols-2">
               <div className="rounded-lg border border-slate-200 bg-slate-50/70 p-3">
                 <div className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">
-                  Root Cause Analysis
+                  {t("agent.rootCauseAnalysis")}
                 </div>
                 <p className="mt-1.5 whitespace-pre-wrap text-xs leading-relaxed text-slate-800">
-                  {result.root_cause_analysis || "No root cause summary."}
+                  {result.root_cause_analysis || t("agent.noRootCause")}
                 </p>
               </div>
 
               <div className="rounded-lg border border-slate-200 bg-slate-50/70 p-3">
                 <div className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">
-                  Reasoning Summary
+                  {t("agent.reasoningSummary")}
                 </div>
                 <p className="mt-1.5 whitespace-pre-wrap text-xs leading-relaxed text-slate-700">
-                  {result.reasoning_summary || "No reasoning summary."}
+                  {result.reasoning_summary || t("agent.noReasoningSummary")}
                 </p>
               </div>
             </div>
@@ -528,8 +513,9 @@ export function AgentTracePanel({
             <div>
               <div className="mb-2 flex items-center justify-between">
                 <span className="text-xs font-semibold text-slate-700">
-                  Evidence Log Snippets (
-                  {result.evidence_log_snippets?.length ?? 0})
+                  {t("agent.evidenceLogSnippets", {
+                    count: result.evidence_log_snippets?.length ?? 0,
+                  })}
                 </span>
               </div>
               {result.evidence_log_snippets &&
@@ -565,7 +551,7 @@ export function AgentTracePanel({
                           {snippet.relevance}
                         </p>
                         <span className="mt-2 text-[11px] font-medium text-indigo-600 group-hover:underline">
-                          Jump to log &rarr;
+                          {t("agent.jumpToLog")}
                         </span>
                       </button>
                     );
@@ -573,7 +559,7 @@ export function AgentTracePanel({
                 </div>
               ) : (
                 <p className="text-xs text-slate-500">
-                  No log evidence snippets cited.
+                  {t("agent.noLogSnippets")}
                 </p>
               )}
             </div>
@@ -582,7 +568,7 @@ export function AgentTracePanel({
             {result.key_log_patterns && result.key_log_patterns.length > 0 && (
               <div>
                 <div className="mb-1.5 text-xs font-semibold text-slate-700">
-                  Key Log Patterns
+                  {t("agent.keyLogPatterns")}
                 </div>
                 <div className="flex flex-wrap gap-1.5">
                   {result.key_log_patterns.map((pattern, idx) => {
@@ -594,7 +580,7 @@ export function AgentTracePanel({
                         onClick={() => {
                           void handleCopyPattern(pattern);
                         }}
-                        title="Click to copy pattern"
+                        title={t("agent.clickToCopyPattern")}
                         className="inline-flex items-center gap-1.5 rounded-md border border-slate-200 bg-slate-100 px-2 py-1 font-mono text-xs text-slate-800 hover:border-slate-300 hover:bg-slate-200/70"
                       >
                         <span>{pattern}</span>
@@ -618,19 +604,21 @@ export function AgentTracePanel({
             <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500">
               <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
                 <span>
-                  Model:{" "}
+                  {t("agent.modelLabel")}
                   <span className="font-mono font-medium text-slate-700">
                     {activeRun.model_name}
                   </span>
                 </span>
                 <span>
-                  Tokens:{" "}
+                  {t("agent.tokensLabel")}
                   <span className="font-mono font-medium text-slate-700">
                     {activeRun.prompt_tokens + activeRun.completion_tokens}
                   </span>{" "}
                   <span className="font-mono text-[11px] text-slate-400">
-                    ({activeRun.prompt_tokens} in / {activeRun.completion_tokens}{" "}
-                    out)
+                    {t("agent.tokensBreakdown", {
+                      prompt: activeRun.prompt_tokens,
+                      completion: activeRun.completion_tokens,
+                    })}
                   </span>
                 </span>
                 <span className="inline-flex items-center gap-1">
@@ -639,7 +627,7 @@ export function AgentTracePanel({
                     {formatDuration(activeRun.duration_ms)}
                   </span>
                 </span>
-                <span>{formatTimestamp(activeRun.created_at)}</span>
+                <span>{formatDateTime(activeRun.created_at)}</span>
               </div>
 
               <button
@@ -655,8 +643,9 @@ export function AgentTracePanel({
                 )}
                 <Terminal className="h-3.5 w-3.5 text-slate-500" />
                 <span>
-                  Investigation Trace ({traceParse.steps.length} step
-                  {traceParse.steps.length === 1 ? "" : "s"})
+                  {t("agent.investigationTrace", {
+                    count: traceParse.steps.length,
+                  })}
                 </span>
               </button>
             </div>
@@ -665,10 +654,7 @@ export function AgentTracePanel({
               <div className="mt-3 space-y-2.5">
                 {traceParse.malformed && (
                   <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900">
-                    <p className="font-semibold">
-                      Trace payload is malformed or partially truncated; raw
-                      representation shown below.
-                    </p>
+                    <p className="font-semibold">{t("agent.malformedTrace")}</p>
                     <pre className="ck-scrollbar mt-2 max-h-48 overflow-auto rounded bg-white/80 p-2 font-mono text-[11px] text-slate-700">
                       {formatTraceValue(activeRun.trace_json)}
                     </pre>
@@ -677,7 +663,7 @@ export function AgentTracePanel({
 
                 {traceParse.steps.length === 0 && !traceParse.malformed ? (
                   <p className="rounded-lg border border-dashed border-slate-200 bg-slate-50 px-3 py-4 text-center text-xs text-slate-500">
-                    No tool-calling trace steps recorded for this run.
+                    {t("agent.emptyTrace")}
                   </p>
                 ) : (
                   <div className="ck-scrollbar max-h-[420px] space-y-2 overflow-y-auto pr-1">
@@ -691,20 +677,42 @@ export function AgentTracePanel({
                         isLongOutput && !isOutputExpanded
                           ? `${outputStr.slice(0, 400)}...`
                           : outputStr;
+                      const isReasoningStep = step.role === "reasoning";
+                      const roleDisplay =
+                        step.role === "reasoning"
+                          ? t("agent.roleReasoning")
+                          : step.role === "tool"
+                            ? t("agent.roleTool")
+                            : step.role === "system"
+                              ? t("agent.roleSystem")
+                              : step.role;
 
                       return (
                         <div
                           key={stepKey}
-                          className="rounded-lg border border-slate-200 bg-slate-50/60 p-3 text-xs"
+                          className={`rounded-lg border p-3 text-xs ${
+                            isReasoningStep
+                              ? "border-violet-200 bg-violet-50/40"
+                              : "border-slate-200 bg-slate-50/60"
+                          }`}
                         >
                           <div className="flex flex-wrap items-center justify-between gap-2">
                             <div className="flex flex-wrap items-center gap-2">
                               <span className="font-mono font-semibold text-slate-500">
                                 #{step.step ?? idx + 1}
                               </span>
-                              {step.role && (
-                                <span className="rounded bg-slate-200/80 px-1.5 py-0.5 font-mono text-[11px] font-medium text-slate-700">
-                                  {step.role}
+                              {roleDisplay && (
+                                <span
+                                  className={`inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-medium ${
+                                    isReasoningStep
+                                      ? "border border-violet-200 bg-violet-100 text-violet-800"
+                                      : "bg-slate-200/80 font-mono text-slate-700"
+                                  }`}
+                                >
+                                  {isReasoningStep && (
+                                    <Brain className="h-3 w-3" />
+                                  )}
+                                  {roleDisplay}
                                 </span>
                               )}
                               {step.tool_name && (
@@ -715,7 +723,7 @@ export function AgentTracePanel({
                               )}
                               {step.error && (
                                 <span className="rounded border border-rose-200 bg-rose-50 px-1.5 py-0.5 text-[11px] font-semibold text-rose-700">
-                                  Error
+                                  {t("agent.errorBadge")}
                                 </span>
                               )}
                             </div>
@@ -737,7 +745,7 @@ export function AgentTracePanel({
                           {argsStr && (
                             <div className="mt-2">
                               <div className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-slate-400">
-                                Arguments
+                                {t("agent.argumentsLabel")}
                               </div>
                               <pre className="ck-scrollbar max-h-36 overflow-auto rounded border border-slate-200 bg-white p-2 font-mono text-[11px] text-slate-700">
                                 {argsStr}
@@ -749,7 +757,9 @@ export function AgentTracePanel({
                             <div className="mt-2">
                               <div className="mb-1 flex items-center justify-between">
                                 <span className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">
-                                  Output Preview
+                                  {isReasoningStep
+                                    ? t("agent.reasoningPreviewLabel")
+                                    : t("agent.outputPreviewLabel")}
                                 </span>
                                 {isLongOutput && (
                                   <button
@@ -757,11 +767,19 @@ export function AgentTracePanel({
                                     onClick={() => toggleStepExpanded(stepKey)}
                                     className="text-[11px] font-medium text-indigo-600 hover:text-indigo-700"
                                   >
-                                    {isOutputExpanded ? "Show less" : "Show more"}
+                                    {isOutputExpanded
+                                      ? t("agent.showLess")
+                                      : t("agent.showMore")}
                                   </button>
                                 )}
                               </div>
-                              <pre className="ck-scrollbar max-h-56 overflow-auto rounded border border-slate-200 bg-slate-950 p-2 font-mono text-[11px] text-slate-100">
+                              <pre
+                                className={`ck-scrollbar max-h-56 overflow-auto whitespace-pre-wrap rounded border p-2 font-mono text-[11px] ${
+                                  isReasoningStep
+                                    ? "border-violet-200 bg-white text-slate-800"
+                                    : "border-slate-200 bg-slate-950 text-slate-100"
+                                }`}
+                              >
                                 {displayedOutput}
                               </pre>
                             </div>

@@ -15,13 +15,23 @@ from app.config import Settings
 from app.schemas.settings import (
     GCReport,
     GCRequest,
+    LLMProviderPresetRead,
     SystemSettingsRead,
     SystemSettingsUpdate,
 )
-from app.services import settings_service
+from app.services import llm_providers, settings_service
 from app.services.storage import StorageManager
 
 router = APIRouter(prefix="/settings", tags=["settings"])
+
+
+@router.get("/llm-providers", response_model=list[LLMProviderPresetRead])
+async def list_llm_providers() -> list[LLMProviderPresetRead]:
+    """Return the catalog of built-in LLM providers, default endpoints, and recommended models."""
+    return [
+        LLMProviderPresetRead.model_validate(item)
+        for item in llm_providers.list_provider_presets()
+    ]
 
 
 @router.get("", response_model=SystemSettingsRead)

@@ -12,6 +12,7 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
+import anthropic
 import openai
 from sqlalchemy import case, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -26,7 +27,7 @@ from app.db.models import (
     Issue,
     Project,
 )
-from app.services import settings_service
+from app.services import llm_providers, settings_service
 from app.services.clustering import ClusteringService, _compare_versions
 from app.services.log_engine import LogEngine
 from app.services.storage import StorageError, StorageManager
@@ -432,9 +433,11 @@ class AITriageAgent:
         base = self.settings or get_settings()
         effective = await settings_service.get_effective_settings(session, base_settings=base)
         cfg: dict[str, Any] = {
+            "llm_provider": effective.llm_provider,
             "llm_base_url": effective.llm_base_url,
             "llm_api_key": effective.llm_api_key,
             "llm_model": effective.llm_model,
+            "llm_thinking_level": effective.llm_thinking_level,
             "ai_triage_mode": effective.ai_triage_mode,
             "ai_max_steps": effective.ai_max_steps,
             "ai_timeout_seconds": effective.ai_timeout_seconds,
@@ -449,6 +452,16 @@ class AITriageAgent:
                 lower_key = str(key).strip().lower()
                 if lower_key in cfg:
                     cfg[lower_key] = value
+        try:
+            cfg["llm_provider"] = llm_providers.normalize_provider_id(cfg["llm_provider"])
+        except ValueError:
+            cfg["llm_provider"] = effective.llm_provider
+        try:
+            cfg["llm_thinking_level"] = llm_providers.normalize_thinking_level(
+                cfg["llm_thinking_level"]
+            )
+        except ValueError:
+            cfg["llm_thinking_level"] = effective.llm_thinking_level
         cfg["ai_max_steps"] = max(1, int(cfg["ai_max_steps"]))
         cfg["ai_timeout_seconds"] = max(1, int(cfg["ai_timeout_seconds"]))
         cfg["ai_tool_output_max_chars"] = max(50, int(cfg["ai_tool_output_max_chars"]))
@@ -993,29 +1006,94 @@ class AITriageAgent:
         model_name: str,
         messages: list[dict[str, Any]],
         timeout_budget: float,
+        *,
+        provider_id: str = "openai",
+        thinking_level: str = "auto",
     ) -> Any:
+        primary_kwargs = llm_providers.build_openai_completion_kwargs(
+            provider_id=provider_id,
+            model_name=model_name,
+            thinking_level=thinking_level,
+            messages=messages,
+            tools=AI_TOOL_DEFINITIONS,
+            include_response_format=True,
+            include_thinking=True,
+            include_temperature=True,
+        )
         try:
             return await asyncio.wait_for(
-                client.chat.completions.create(
-                    model=model_name,
-                    messages=messages,
-                    tools=AI_TOOL_DEFINITIONS,
-                    tool_choice="auto",
-                    temperature=0.1,
-                    response_format={"type": "json_object"},
-                ),
+                client.chat.completions.create(**primary_kwargs),
                 timeout=timeout_budget,
             )
         except openai.BadRequestError:
-            # Fallback for OpenAI-compatible endpoints that disallow response_format with tools.
-            return await asyncio.wait_for(
-                client.chat.completions.create(
-                    model=model_name,
+            # Fallback 1: drop response_format for endpoints disallowing json_object with tools.
+            no_rf_kwargs = llm_providers.build_openai_completion_kwargs(
+                provider_id=provider_id,
+                model_name=model_name,
+                thinking_level=thinking_level,
+                messages=messages,
+                tools=AI_TOOL_DEFINITIONS,
+                include_response_format=False,
+                include_thinking=True,
+                include_temperature=True,
+            )
+            try:
+                return await asyncio.wait_for(
+                    client.chat.completions.create(**no_rf_kwargs),
+                    timeout=timeout_budget,
+                )
+            except openai.BadRequestError:
+                # Fallback 2: drop thinking/reasoning params & custom temperature for older models.
+                if thinking_level == "auto" and "temperature" not in no_rf_kwargs:
+                    raise
+                safe_kwargs = llm_providers.build_openai_completion_kwargs(
+                    provider_id=provider_id,
+                    model_name=model_name,
+                    thinking_level="auto",
                     messages=messages,
                     tools=AI_TOOL_DEFINITIONS,
-                    tool_choice="auto",
-                    temperature=0.1,
-                ),
+                    include_response_format=False,
+                    include_thinking=False,
+                    include_temperature=False,
+                )
+                return await asyncio.wait_for(
+                    client.chat.completions.create(**safe_kwargs),
+                    timeout=timeout_budget,
+                )
+
+    async def _call_anthropic_completion(
+        self,
+        client: Any,
+        model_name: str,
+        messages: list[dict[str, Any]],
+        timeout_budget: float,
+        *,
+        thinking_level: str = "auto",
+    ) -> Any:
+        primary_kwargs = llm_providers.build_anthropic_messages_kwargs(
+            model_name=model_name,
+            thinking_level=thinking_level,
+            messages=messages,
+            tools=AI_TOOL_DEFINITIONS,
+            include_thinking=True,
+        )
+        try:
+            return await asyncio.wait_for(
+                client.messages.create(**primary_kwargs),
+                timeout=timeout_budget,
+            )
+        except anthropic.BadRequestError:
+            if thinking_level == "auto":
+                raise
+            fallback_kwargs = llm_providers.build_anthropic_messages_kwargs(
+                model_name=model_name,
+                thinking_level="auto",
+                messages=messages,
+                tools=AI_TOOL_DEFINITIONS,
+                include_thinking=False,
+            )
+            return await asyncio.wait_for(
+                client.messages.create(**fallback_kwargs),
                 timeout=timeout_budget,
             )
 
@@ -1026,11 +1104,16 @@ class AITriageAgent:
         settings_override: dict[str, Any] | None = None,
         openai_client: Any | None = None,
         *,
+        anthropic_client: Any | None = None,
         commit: bool = True,
     ) -> AIAnalysisRun:
         """Execute the ReAct tool-calling triage loop and persist verdict + trace."""
         start_mono = time.monotonic()
         runtime_cfg = await self._resolve_runtime_config(session, settings_override)
+
+        provider_id = str(runtime_cfg["llm_provider"])
+        thinking_level = str(runtime_cfg["llm_thinking_level"])
+        preset = llm_providers.get_provider_preset(provider_id)
 
         model_name = str(runtime_cfg["llm_model"])
         max_steps = int(runtime_cfg["ai_max_steps"])
@@ -1039,7 +1122,14 @@ class AITriageAgent:
         api_key = str(runtime_cfg["llm_api_key"] or "").strip()
         base_url = str(runtime_cfg["llm_base_url"])
 
-        if openai_client is None and not api_key:
+        use_anthropic = anthropic_client is not None or (
+            preset.protocol == "anthropic_messages" and openai_client is None
+        )
+        has_injected_client = (
+            anthropic_client is not None if use_anthropic else openai_client is not None
+        )
+
+        if not has_injected_client and preset.requires_api_key and not api_key:
             result_dict = _build_needs_review_result("LLM_API_KEY is not configured")
             trace = [
                 {
@@ -1062,17 +1152,29 @@ class AITriageAgent:
             )
 
         project = await session.get(Project, crash_report.project_id)
-        owns_client = openai_client is None
-        client = (
-            openai_client
-            if openai_client is not None
-            else openai.AsyncOpenAI(
-                api_key=api_key,
-                base_url=base_url,
-                timeout=float(timeout_seconds),
-                max_retries=0,
+        owns_client = not has_injected_client
+        if use_anthropic:
+            client: Any = (
+                anthropic_client
+                if anthropic_client is not None
+                else anthropic.AsyncAnthropic(
+                    api_key=api_key or "not-required",
+                    base_url=llm_providers.normalize_anthropic_base_url(base_url),
+                    timeout=float(timeout_seconds),
+                    max_retries=0,
+                )
             )
-        )
+        else:
+            client = (
+                openai_client
+                if openai_client is not None
+                else openai.AsyncOpenAI(
+                    api_key=api_key or "not-required",
+                    base_url=base_url,
+                    timeout=float(timeout_seconds),
+                    max_retries=0,
+                )
+            )
 
         trace: list[dict[str, Any]] = []
         prompt_tokens = 0
@@ -1101,26 +1203,72 @@ class AITriageAgent:
                 if remaining <= 0:
                     raise TimeoutError("AI triage exceeded AI_TIMEOUT_SECONDS budget")
 
-                resp = await self._call_completion(client, model_name, messages, remaining)
-                usage = getattr(resp, "usage", None)
-                if usage is not None:
-                    prompt_tokens += int(getattr(usage, "prompt_tokens", 0) or 0)
-                    completion_tokens += int(getattr(usage, "completion_tokens", 0) or 0)
+                reasoning_content: str | None = None
+                if use_anthropic:
+                    resp = await self._call_anthropic_completion(
+                        client,
+                        model_name,
+                        messages,
+                        remaining,
+                        thinking_level=thinking_level,
+                    )
+                    parsed = llm_providers.parse_anthropic_response(resp)
+                    prompt_tokens += int(parsed["prompt_tokens"])
+                    completion_tokens += int(parsed["completion_tokens"])
+                    msg_content = parsed["content"]
+                    reasoning_content = parsed["reasoning_content"]
+                    tool_calls = parsed["tool_calls"]
+                    assistant_msg: dict[str, Any] = {
+                        "role": "assistant",
+                        "content": msg_content,
+                        "_anthropic_content_blocks": parsed["raw_content_blocks"],
+                    }
+                    if tool_calls:
+                        assistant_msg["tool_calls"] = tool_calls
+                else:
+                    resp = await self._call_completion(
+                        client,
+                        model_name,
+                        messages,
+                        remaining,
+                        provider_id=provider_id,
+                        thinking_level=thinking_level,
+                    )
+                    usage = getattr(resp, "usage", None)
+                    if usage is not None:
+                        prompt_tokens += int(getattr(usage, "prompt_tokens", 0) or 0)
+                        completion_tokens += int(getattr(usage, "completion_tokens", 0) or 0)
 
-                choices = getattr(resp, "choices", None) or []
-                if not choices:
-                    raise ValueError("LLM response contained no choices")
-                msg = choices[0].message
-                msg_content = getattr(msg, "content", None)
-                tool_calls = getattr(msg, "tool_calls", None)
+                    choices = getattr(resp, "choices", None) or []
+                    if not choices:
+                        raise ValueError("LLM response contained no choices")
+                    msg = choices[0].message
+                    msg_content = getattr(msg, "content", None)
+                    raw_reasoning = getattr(msg, "reasoning_content", None) or getattr(
+                        msg, "reasoning", None
+                    )
+                    if isinstance(raw_reasoning, str) and raw_reasoning.strip():
+                        reasoning_content = raw_reasoning.strip()
+                    tool_calls = getattr(msg, "tool_calls", None)
 
-                assistant_msg: dict[str, Any] = {
-                    "role": "assistant",
-                    "content": msg_content,
-                }
-                if tool_calls:
-                    assistant_msg["tool_calls"] = _serialize_tool_calls_for_message(tool_calls)
+                    assistant_msg = {
+                        "role": "assistant",
+                        "content": msg_content,
+                    }
+                    if reasoning_content:
+                        assistant_msg["reasoning_content"] = reasoning_content
+                    if tool_calls:
+                        assistant_msg["tool_calls"] = _serialize_tool_calls_for_message(tool_calls)
+
                 messages.append(assistant_msg)
+                if reasoning_content:
+                    trace.append(
+                        {
+                            "step": len(trace) + 1,
+                            "role": "reasoning",
+                            "output_preview": reasoning_content[:1500],
+                        }
+                    )
 
                 if tool_calls:
                     for tc in tool_calls:
@@ -1505,6 +1653,7 @@ async def run_crash_triage(
     settings: Settings | None = None,
     settings_override: dict[str, Any] | None = None,
     openai_client: Any | None = None,
+    anthropic_client: Any | None = None,
 ) -> AIAnalysisRun:
     """Convenience wrapper executing AITriageAgent.run_triage for workers and callers."""
     agent = AITriageAgent(storage=storage, settings=settings)
@@ -1513,4 +1662,5 @@ async def run_crash_triage(
         crash_report=crash_report,
         settings_override=settings_override,
         openai_client=openai_client,
+        anthropic_client=anthropic_client,
     )

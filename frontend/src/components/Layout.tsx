@@ -25,11 +25,13 @@ import {
   RefreshCw,
   Settings,
   ShieldAlert,
+  ShieldCheck,
   Upload,
   X,
 } from "lucide-react";
 import { getHealth, listProjects } from "../api/client";
 import type { ProjectRead } from "../api/types";
+import { useAppI18n } from "../i18n";
 
 const PROJECT_STORAGE_KEY = "crashkiller.selectedProjectId";
 
@@ -182,17 +184,24 @@ export function useProjectContext(): ProjectContextValue {
 
 interface NavItem {
   to: string;
-  label: string;
+  labelKey:
+    | "nav.dashboard"
+    | "nav.issues"
+    | "nav.crashes"
+    | "nav.symbols"
+    | "nav.admin"
+    | "nav.settings";
   icon: typeof LayoutDashboard;
   end: boolean;
 }
 
 const NAV_ITEMS: NavItem[] = [
-  { to: "/", label: "Dashboard", icon: LayoutDashboard, end: true },
-  { to: "/issues", label: "Issues", icon: Layers, end: false },
-  { to: "/crashes", label: "Crashes", icon: Bug, end: false },
-  { to: "/symbols", label: "Symbols", icon: FileCode2, end: false },
-  { to: "/settings", label: "Settings", icon: Settings, end: false },
+  { to: "/", labelKey: "nav.dashboard", icon: LayoutDashboard, end: true },
+  { to: "/issues", labelKey: "nav.issues", icon: Layers, end: false },
+  { to: "/crashes", labelKey: "nav.crashes", icon: Bug, end: false },
+  { to: "/symbols", labelKey: "nav.symbols", icon: FileCode2, end: false },
+  { to: "/admin", labelKey: "nav.admin", icon: ShieldCheck, end: false },
+  { to: "/settings", labelKey: "nav.settings", icon: Settings, end: false },
 ];
 
 export interface LayoutProps {
@@ -201,6 +210,7 @@ export interface LayoutProps {
 }
 
 export function Layout({ children, onQuickUpload }: LayoutProps) {
+  const { t } = useAppI18n();
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const navigate = useNavigate();
   const {
@@ -242,7 +252,7 @@ export function Layout({ children, onQuickUpload }: LayoutProps) {
               CrashKiller
             </div>
             <div className="text-[11px] text-slate-400">
-              C++ Dump &amp; Log Triage
+              {t("app.subtitle")}
             </div>
           </div>
         </div>
@@ -250,13 +260,13 @@ export function Layout({ children, onQuickUpload }: LayoutProps) {
           type="button"
           onClick={() => setMobileNavOpen(false)}
           className="rounded-md p-1 text-slate-400 hover:bg-slate-800 hover:text-white lg:hidden"
-          aria-label="Close navigation menu"
+          aria-label={t("nav.closeMenu")}
         >
           <X className="h-5 w-5" />
         </button>
       </div>
 
-      <nav className="flex-1 space-y-1 px-3 py-4" aria-label="Main navigation">
+      <nav className="flex-1 space-y-1 px-3 py-4" aria-label={t("nav.mainLabel")}>
         {NAV_ITEMS.map((item) => {
           const Icon = item.icon;
           return (
@@ -274,7 +284,7 @@ export function Layout({ children, onQuickUpload }: LayoutProps) {
               }
             >
               <Icon className="h-4 w-4 shrink-0" />
-              <span>{item.label}</span>
+              <span>{t(item.labelKey)}</span>
             </NavLink>
           );
         })}
@@ -282,7 +292,7 @@ export function Layout({ children, onQuickUpload }: LayoutProps) {
 
       <div className="border-t border-slate-800 px-4 py-3">
         <div className="flex items-center justify-between text-xs">
-          <span className="text-slate-400">Backend API</span>
+          <span className="text-slate-400">{t("nav.backendApi")}</span>
           <span
             className="inline-flex items-center gap-1.5 font-medium"
             data-testid="health-status-indicator"
@@ -306,10 +316,10 @@ export function Layout({ children, onQuickUpload }: LayoutProps) {
               }
             >
               {healthQuery.isPending
-                ? "Checking..."
+                ? t("nav.statusChecking")
                 : isBackendHealthy
-                  ? "Online"
-                  : "Offline"}
+                  ? t("nav.statusOnline")
+                  : t("nav.statusOffline")}
             </span>
           </span>
         </div>
@@ -346,7 +356,7 @@ export function Layout({ children, onQuickUpload }: LayoutProps) {
               type="button"
               onClick={() => setMobileNavOpen(true)}
               className="rounded-md p-1.5 text-slate-600 hover:bg-slate-100 hover:text-slate-900 lg:hidden"
-              aria-label="Open navigation menu"
+              aria-label={t("nav.openMenu")}
             >
               <Menu className="h-5 w-5" />
             </button>
@@ -357,17 +367,17 @@ export function Layout({ children, onQuickUpload }: LayoutProps) {
                 htmlFor="global-project-selector"
                 className="sr-only"
               >
-                Project Scope
+                {t("nav.projectScope")}
               </label>
               <select
                 id="global-project-selector"
-                aria-label="Global project selector"
+                aria-label={t("nav.globalProjectSelector")}
                 value={selectedProjectId}
                 onChange={(e) => setSelectedProjectId(e.target.value)}
                 disabled={isLoadingProjects && projects.length === 0}
                 className="h-9 min-w-[180px] max-w-[280px] rounded-md border border-slate-300 bg-white px-2.5 text-sm font-medium text-slate-800 shadow-sm focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 disabled:bg-slate-100"
               >
-                <option value="">All Projects</option>
+                <option value="">{t("nav.allProjects")}</option>
                 {projects.map((project) => (
                   <option key={project.id} value={project.id}>
                     {project.name} ({project.key})
@@ -377,8 +387,8 @@ export function Layout({ children, onQuickUpload }: LayoutProps) {
               <button
                 type="button"
                 onClick={refreshProjects}
-                title="Refresh projects"
-                aria-label="Refresh projects"
+                title={t("nav.refreshProjects")}
+                aria-label={t("nav.refreshProjects")}
                 className="inline-flex h-9 w-9 items-center justify-center rounded-md border border-slate-200 bg-white text-slate-600 hover:bg-slate-50 hover:text-slate-900"
               >
                 <RefreshCw
@@ -395,7 +405,7 @@ export function Layout({ children, onQuickUpload }: LayoutProps) {
               className="inline-flex items-center gap-1.5 rounded-md bg-indigo-600 px-3 py-1.5 text-sm font-medium text-white shadow-sm hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-1"
             >
               <Upload className="h-4 w-4" />
-              <span className="hidden sm:inline">Upload</span>
+              <span className="hidden sm:inline">{t("nav.upload")}</span>
             </button>
           </div>
         </header>

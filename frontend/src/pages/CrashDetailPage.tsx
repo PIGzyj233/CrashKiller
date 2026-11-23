@@ -42,6 +42,7 @@ import {
   VirtualLogViewer,
   type LogHighlightRange,
 } from "../components/VirtualLogViewer";
+import { useAppI18n } from "../i18n";
 
 const PIPELINE_STEPS: readonly CrashStatus[] = [
   "PENDING",
@@ -60,17 +61,6 @@ const ISSUE_STATUSES: readonly IssueStatus[] = [
 
 function isCrashInFlight(status: CrashStatus | undefined): boolean {
   return status === "PENDING" || status === "PARSING" || status === "TRIAGING";
-}
-
-function formatDateTime(value: string | null | undefined): string {
-  if (!value) {
-    return "—";
-  }
-  const d = new Date(value);
-  if (Number.isNaN(d.getTime())) {
-    return value;
-  }
-  return d.toLocaleString();
 }
 
 function getLatestAIResult(crash: CrashDetailRead | undefined) {
@@ -94,6 +84,8 @@ function getLatestAIResult(crash: CrashDetailRead | undefined) {
 }
 
 export function CrashDetailPage() {
+  const { t, formatDateTime, formatCrashStatus, formatIssueStatus } =
+    useAppI18n();
   const { crashId } = useParams<{ crashId: string }>();
   const { projects } = useProjectContext();
   const queryClient = useQueryClient();
@@ -320,7 +312,7 @@ export function CrashDetailPage() {
     setNewIssueTitle(
       latestResult?.suggested_title ||
         crash.crash_reason ||
-        `Crash in ${crash.app_version}`,
+        t("crashDetail.defaultNewIssueTitle", { version: crash.app_version }),
     );
     setNewIssueComponent(latestResult?.suggested_component ?? "");
     setNewIssueStatus("KNOWN");
@@ -402,13 +394,13 @@ export function CrashDetailPage() {
   if (!crashId) {
     return (
       <div className="rounded-xl border border-rose-200 bg-white p-6">
-        <p className="text-sm text-rose-700">Missing crash ID in route.</p>
+        <p className="text-sm text-rose-700">{t("crashDetail.missingId")}</p>
         <Link
           to="/crashes"
           className="mt-3 inline-flex items-center gap-1 text-sm font-medium text-indigo-600 hover:underline"
         >
           <ArrowLeft className="h-4 w-4" />
-          Back to Crashes
+          {t("crashDetail.backToCrashes")}
         </Link>
       </div>
     );
@@ -425,7 +417,7 @@ export function CrashDetailPage() {
               className="inline-flex items-center gap-1 font-medium text-indigo-600 hover:underline"
             >
               <ArrowLeft className="h-3.5 w-3.5" />
-              Crashes
+              {t("nav.crashes")}
             </Link>
             <span>/</span>
             <span className="font-mono text-slate-700">{crashId}</span>
@@ -434,12 +426,12 @@ export function CrashDetailPage() {
           <div className="flex flex-wrap items-center gap-2.5">
             <Bug className="h-5 w-5 text-indigo-600" />
             <h1 className="text-xl font-semibold text-slate-900">
-              {crash?.crash_reason || "Crash Workbench"}
+              {crash?.crash_reason || t("crashDetail.workbenchTitle")}
             </h1>
             {crash?.is_human_verified && (
               <span className="inline-flex items-center gap-1 rounded-full border border-emerald-200 bg-emerald-50 px-2.5 py-0.5 text-xs font-medium text-emerald-700">
                 <CheckCircle2 className="h-3.5 w-3.5" />
-                Human Verified
+                {t("crashDetail.humanVerified")}
               </span>
             )}
           </div>
@@ -447,7 +439,7 @@ export function CrashDetailPage() {
           {crash && (
             <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-500">
               <span>
-                Project:{" "}
+                {t("crashDetail.projectLabel")}
                 <strong className="font-medium text-slate-700">
                   {project ? `${project.name} (${project.key})` : crash.project_id}
                 </strong>
@@ -465,7 +457,9 @@ export function CrashDetailPage() {
               )}
               <span>|</span>
               <span>
-                Crash Time: {formatDateTime(crash.crash_time || crash.created_at)}
+                {t("crashDetail.crashTimeLabel", {
+                  time: formatDateTime(crash.crash_time || crash.created_at),
+                })}
               </span>
               {crash.cluster && (
                 <>
@@ -476,8 +470,10 @@ export function CrashDetailPage() {
                     )}`}
                     className="font-mono text-indigo-600 hover:underline"
                   >
-                    Cluster {crash.cluster.signature_hash.slice(0, 10)} (
-                    {crash.cluster.crash_count})
+                    {t("crashDetail.clusterLink", {
+                      hash: crash.cluster.signature_hash.slice(0, 10),
+                      count: crash.cluster.crash_count,
+                    })}
                   </Link>
                 </>
               )}
@@ -488,7 +484,10 @@ export function CrashDetailPage() {
                     to={`/issues/${crash.issue.id}`}
                     className="font-medium text-indigo-600 hover:underline"
                   >
-                    Issue #{crash.issue.id}: {crash.issue.title}
+                    {t("crashDetail.issueLink", {
+                      id: crash.issue.id,
+                      title: crash.issue.title,
+                    })}
                   </Link>
                 </>
               )}
@@ -506,7 +505,7 @@ export function CrashDetailPage() {
               className="inline-flex items-center gap-1.5 rounded-md border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 shadow-sm hover:bg-slate-50 disabled:opacity-50"
             >
               <RotateCcw className="h-3.5 w-3.5" />
-              Reprocess Full
+              {t("crashDetail.reprocessFull")}
             </button>
 
             <button
@@ -516,7 +515,7 @@ export function CrashDetailPage() {
               className="inline-flex items-center gap-1.5 rounded-md border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 shadow-sm hover:bg-slate-50 disabled:opacity-50"
             >
               <Sparkles className="h-3.5 w-3.5 text-indigo-600" />
-              Re-run AI
+              {t("crashDetail.rerunAi")}
             </button>
 
             <button
@@ -525,7 +524,7 @@ export function CrashDetailPage() {
               className="inline-flex items-center gap-1.5 rounded-md bg-indigo-600 px-3 py-1.5 text-xs font-medium text-white shadow-sm hover:bg-indigo-700"
             >
               <UserCheck className="h-3.5 w-3.5" />
-              Verify / Assign
+              {t("crashDetail.verifyAssign")}
             </button>
 
             <button
@@ -539,7 +538,7 @@ export function CrashDetailPage() {
               }`}
             >
               <Pin className="h-3.5 w-3.5" />
-              {crash.is_pinned ? "Pinned" : "Pin"}
+              {crash.is_pinned ? t("crashDetail.pinned") : t("crashDetail.pin")}
             </button>
 
             {Boolean(crash.dump_path) ? (
@@ -554,7 +553,7 @@ export function CrashDetailPage() {
             ) : (
               <span
                 className="inline-flex cursor-not-allowed items-center gap-1 rounded-md border border-slate-200 bg-slate-100 px-2.5 py-1.5 text-xs text-slate-400"
-                title="Dump artifact unavailable or evicted by GC"
+                title={t("crashDetail.dumpUnavailableTitle")}
               >
                 <Download className="h-3.5 w-3.5" />
                 .dmp
@@ -573,7 +572,7 @@ export function CrashDetailPage() {
             ) : (
               <span
                 className="inline-flex cursor-not-allowed items-center gap-1 rounded-md border border-slate-200 bg-slate-100 px-2.5 py-1.5 text-xs text-slate-400"
-                title="Parsed stacks JSON not yet available"
+                title={t("crashDetail.stacksUnavailableTitle")}
               >
                 <Download className="h-3.5 w-3.5" />
                 stacks.json
@@ -595,7 +594,7 @@ export function CrashDetailPage() {
             <span>
               {crashQuery.error instanceof ApiError
                 ? crashQuery.error.message
-                : "Failed to load crash details."}
+                : t("crashDetail.loadFailed")}
             </span>
           </div>
           <button
@@ -603,7 +602,7 @@ export function CrashDetailPage() {
             onClick={() => void crashQuery.refetch()}
             className="rounded border border-rose-300 bg-white px-2.5 py-1 text-xs font-medium text-rose-700"
           >
-            Retry
+            {t("common.retry")}
           </button>
         </div>
       )}
@@ -612,7 +611,7 @@ export function CrashDetailPage() {
         <div className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-2.5 text-xs text-rose-700">
           {reprocessMutation.error instanceof ApiError
             ? reprocessMutation.error.message
-            : "Failed to queue reprocessing."}
+            : t("crashDetail.reprocessFailed")}
         </div>
       )}
 
@@ -621,13 +620,13 @@ export function CrashDetailPage() {
           <span>
             {pinMutation.error instanceof ApiError
               ? pinMutation.error.message
-              : "Failed to update crash pin status."}
+              : t("crashDetail.pinFailed")}
           </span>
           <button
             type="button"
             onClick={() => pinMutation.reset()}
             className="rounded p-0.5 text-rose-700 hover:bg-rose-100"
-            aria-label="Dismiss pin error"
+            aria-label={t("crashDetail.dismissPinError")}
           >
             <X className="h-3.5 w-3.5" />
           </button>
@@ -652,10 +651,10 @@ export function CrashDetailPage() {
               )}
               <span className="text-sm font-semibold">
                 {crash.status === "FAILED"
-                  ? "Crash processing failed"
-                  : `Live Pipeline: ${crash.status}${
-                      sseStage ? ` (${sseStage})` : ""
-                    }`}
+                  ? t("crashDetail.processingFailed")
+                  : `${t("crashDetail.livePipeline", {
+                      status: formatCrashStatus(crash.status),
+                    })}${sseStage ? ` (${sseStage})` : ""}`}
               </span>
             </div>
 
@@ -663,7 +662,9 @@ export function CrashDetailPage() {
               {inFlight && (
                 <span className="inline-flex items-center gap-1 rounded-full bg-white/80 px-2.5 py-0.5 font-medium text-indigo-700">
                   <Radio className="h-3 w-3" />
-                  {sseConnected ? "SSE Live" : "Polling (3s fallback)"}
+                  {sseConnected
+                    ? t("crashDetail.sseLive")
+                    : t("crashDetail.pollingFallback")}
                 </span>
               )}
               {crash.status === "FAILED" && (
@@ -673,7 +674,7 @@ export function CrashDetailPage() {
                   className="inline-flex items-center gap-1 rounded-md bg-rose-600 px-2.5 py-1 font-medium text-white hover:bg-rose-700"
                 >
                   <RefreshCw className="h-3 w-3" />
-                  Retry Full Pipeline
+                  {t("crashDetail.retryFullPipeline")}
                 </button>
               )}
             </div>
@@ -697,7 +698,7 @@ export function CrashDetailPage() {
                     }`}
                   >
                     <span>{idx + 1}.</span>
-                    <span>{step}</span>
+                    <span>{formatCrashStatus(step)}</span>
                   </div>
                 );
               })}
@@ -760,11 +761,10 @@ export function CrashDetailPage() {
                   id="verdict-modal-title"
                   className="text-base font-semibold text-slate-900"
                 >
-                  Human Verdict &amp; Knowledge Base Feedback
+                  {t("crashDetail.modalTitle")}
                 </h2>
                 <p className="mt-0.5 text-xs text-slate-500">
-                  Verify AI triage, assign or create a Known Issue, and save
-                  log patterns for future fuzzy recall.
+                  {t("crashDetail.modalSubtitle")}
                 </p>
               </div>
               <button
@@ -781,7 +781,7 @@ export function CrashDetailPage() {
                 <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700">
                   {verdictMutation.error instanceof ApiError
                     ? verdictMutation.error.message
-                    : "Failed to submit verdict."}
+                    : t("crashDetail.submitFailed")}
                 </div>
               )}
 
@@ -801,15 +801,23 @@ export function CrashDetailPage() {
                       : "border-slate-200 hover:bg-slate-50"
                   }`}
                 >
-                  <div className="font-semibold">Confirm Current</div>
+                  <div className="font-semibold">
+                    {t("crashDetail.actionConfirm")}
+                  </div>
                   <div className="mt-0.5 text-[11px] text-slate-500">
                     {crash.issue_id
-                      ? `Confirm Issue #${crash.issue_id}`
+                      ? t("crashDetail.actionConfirmIssue", {
+                          id: crash.issue_id,
+                        })
                       : crash.cluster?.issue_id
-                        ? `Confirm Cluster Issue #${crash.cluster.issue_id}`
+                        ? t("crashDetail.actionConfirmClusterIssue", {
+                            id: crash.cluster.issue_id,
+                          })
                         : latestAIResult?.matched_issue_id != null
-                          ? `Confirm AI #${latestAIResult.matched_issue_id}`
-                          : "Requires linked issue"}
+                          ? t("crashDetail.actionConfirmAiIssue", {
+                              id: latestAIResult.matched_issue_id,
+                            })
+                          : t("crashDetail.actionConfirmRequiresLink")}
                   </div>
                 </button>
 
@@ -822,9 +830,11 @@ export function CrashDetailPage() {
                       : "border-slate-200 hover:bg-slate-50"
                   }`}
                 >
-                  <div className="font-semibold">Assign Existing Issue</div>
+                  <div className="font-semibold">
+                    {t("crashDetail.actionAssign")}
+                  </div>
                   <div className="mt-0.5 text-[11px] text-slate-500">
-                    Link cluster to a known issue
+                    {t("crashDetail.actionAssignDesc")}
                   </div>
                 </button>
 
@@ -837,9 +847,11 @@ export function CrashDetailPage() {
                       : "border-slate-200 hover:bg-slate-50"
                   }`}
                 >
-                  <div className="font-semibold">Create New Issue</div>
+                  <div className="font-semibold">
+                    {t("crashDetail.actionCreate")}
+                  </div>
                   <div className="mt-0.5 text-[11px] text-slate-500">
-                    Add a new issue to KB
+                    {t("crashDetail.actionCreateDesc")}
                   </div>
                 </button>
               </div>
@@ -847,13 +859,13 @@ export function CrashDetailPage() {
               {verdictAction === "assign_issue" && (
                 <div className="space-y-2 rounded-lg border border-slate-200 bg-slate-50 p-3">
                   <label className="block text-xs font-medium text-slate-700">
-                    Search &amp; Select Target Issue
+                    {t("crashDetail.searchSelectIssue")}
                   </label>
                   <input
                     type="text"
                     value={issueSearchInput}
                     onChange={(e) => setIssueSearchInput(e.target.value)}
-                    placeholder="Filter issues by title or root cause..."
+                    placeholder={t("crashDetail.filterIssuesPlaceholder")}
                     className="h-8 w-full rounded-md border border-slate-300 bg-white px-2.5 text-xs text-slate-900"
                   />
                   <select
@@ -862,10 +874,12 @@ export function CrashDetailPage() {
                     onChange={(e) => setAssignIssueId(e.target.value)}
                     className="h-9 w-full rounded-md border border-slate-300 bg-white px-2.5 text-sm text-slate-900"
                   >
-                    <option value="">Select an issue...</option>
+                    <option value="">
+                      {t("crashDetail.selectIssueOption")}
+                    </option>
                     {(issuesPickerQuery.data?.items ?? []).map((iss) => (
                       <option key={iss.id} value={iss.id}>
-                        #{iss.id} — {iss.title} [{iss.status}]
+                        #{iss.id} — {iss.title} [{formatIssueStatus(iss.status)}]
                       </option>
                     ))}
                   </select>
@@ -876,7 +890,8 @@ export function CrashDetailPage() {
                 <div className="space-y-3 rounded-lg border border-slate-200 bg-slate-50 p-3">
                   <div>
                     <label className="block text-xs font-medium text-slate-700">
-                      New Issue Title <span className="text-rose-500">*</span>
+                      {t("crashDetail.newIssueTitle")}{" "}
+                      <span className="text-rose-500">*</span>
                     </label>
                     <input
                       type="text"
@@ -889,19 +904,19 @@ export function CrashDetailPage() {
                   <div className="grid gap-3 sm:grid-cols-2">
                     <div>
                       <label className="block text-xs font-medium text-slate-700">
-                        Component
+                        {t("crashDetail.component")}
                       </label>
                       <input
                         type="text"
                         value={newIssueComponent}
                         onChange={(e) => setNewIssueComponent(e.target.value)}
-                        placeholder="e.g. Network"
+                        placeholder={t("crashDetail.componentPlaceholder")}
                         className="mt-1 h-9 w-full rounded-md border border-slate-300 bg-white px-3 text-sm text-slate-900"
                       />
                     </div>
                     <div>
                       <label className="block text-xs font-medium text-slate-700">
-                        Initial Status
+                        {t("crashDetail.initialStatus")}
                       </label>
                       <select
                         value={newIssueStatus}
@@ -912,7 +927,7 @@ export function CrashDetailPage() {
                       >
                         {ISSUE_STATUSES.map((st) => (
                           <option key={st} value={st}>
-                            {st}
+                            {formatIssueStatus(st)}
                           </option>
                         ))}
                       </select>
@@ -923,20 +938,20 @@ export function CrashDetailPage() {
 
               <div>
                 <label className="block text-xs font-medium text-slate-700">
-                  Root Cause Analysis
+                  {t("crashDetail.rootCauseAnalysis")}
                 </label>
                 <textarea
                   rows={3}
                   value={verdictRootCause}
                   onChange={(e) => setVerdictRootCause(e.target.value)}
-                  placeholder="Confirmed root cause to persist to the issue knowledge base..."
+                  placeholder={t("crashDetail.rootCausePlaceholder")}
                   className="mt-1 w-full rounded-md border border-slate-300 p-2.5 text-sm text-slate-900"
                 />
               </div>
 
               <div>
                 <label className="block text-xs font-medium text-slate-700">
-                  Add Log Patterns to Knowledge Base
+                  {t("crashDetail.addLogPatterns")}
                 </label>
                 <div className="mt-1 flex gap-2">
                   <input
@@ -949,7 +964,7 @@ export function CrashDetailPage() {
                         handleAddVerdictPattern();
                       }
                     }}
-                    placeholder="Regex or literal log signature..."
+                    placeholder={t("crashDetail.logPatternPlaceholder")}
                     className="h-9 flex-1 rounded-md border border-slate-300 px-3 font-mono text-xs text-slate-900"
                   />
                   <button
@@ -958,14 +973,16 @@ export function CrashDetailPage() {
                     className="inline-flex h-9 items-center gap-1 rounded-md border border-slate-300 bg-white px-3 text-xs font-medium text-slate-700 hover:bg-slate-50"
                   >
                     <Plus className="h-3.5 w-3.5" />
-                    Add
+                    {t("crashDetail.addPatternButton")}
                   </button>
                 </div>
 
                 {latestAIResult &&
                   latestAIResult.key_log_patterns.length > 0 && (
                     <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[11px]">
-                      <span className="text-slate-500">AI suggestions:</span>
+                      <span className="text-slate-500">
+                        {t("crashDetail.aiSuggestions")}
+                      </span>
                       {latestAIResult.key_log_patterns.map((pat) => (
                         <button
                           key={pat}
@@ -1011,8 +1028,7 @@ export function CrashDetailPage() {
                   onChange={(e) => setVerdictAmbiguousStack(e.target.checked)}
                   className="h-4 w-4 rounded border-slate-300 text-indigo-600"
                 />
-                Mark stack as ambiguous (always require AI log triage for this
-                issue)
+                {t("crashDetail.ambiguousStackLabel")}
               </label>
 
               <div className="flex justify-end gap-2 pt-2">
@@ -1021,7 +1037,7 @@ export function CrashDetailPage() {
                   onClick={() => setIsVerdictModalOpen(false)}
                   className="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50"
                 >
-                  Cancel
+                  {t("common.cancel")}
                 </button>
                 <button
                   type="submit"
@@ -1033,7 +1049,9 @@ export function CrashDetailPage() {
                   className="inline-flex items-center gap-1.5 rounded-md bg-indigo-600 px-4 py-1.5 text-sm font-medium text-white hover:bg-indigo-700 disabled:opacity-50"
                 >
                   <UserCheck className="h-4 w-4" />
-                  {verdictMutation.isPending ? "Saving..." : "Submit Verdict"}
+                  {verdictMutation.isPending
+                    ? t("common.saving")
+                    : t("crashDetail.submitVerdict")}
                 </button>
               </div>
             </form>

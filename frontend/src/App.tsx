@@ -1,6 +1,7 @@
 import { Component, type ErrorInfo, type ReactNode } from "react";
 import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 import { AlertTriangle, RotateCcw } from "lucide-react";
+import { i18n } from "./i18n";
 import { Layout, ProjectProvider } from "./components/Layout";
 import { DashboardPage } from "./pages/DashboardPage";
 import { IssuesPage } from "./pages/IssuesPage";
@@ -8,6 +9,7 @@ import { IssueDetailPage } from "./pages/IssueDetailPage";
 import { CrashesPage } from "./pages/CrashesPage";
 import { CrashDetailPage } from "./pages/CrashDetailPage";
 import { SymbolsPage } from "./pages/SymbolsPage";
+import { AdminPage } from "./pages/AdminPage";
 import { SettingsPage } from "./pages/SettingsPage";
 
 interface ErrorBoundaryProps {
@@ -52,14 +54,13 @@ class AppErrorBoundary extends Component<
               </div>
               <div className="min-w-0 flex-1">
                 <h1 className="text-base font-semibold text-slate-900">
-                  Something went wrong
+                  {i18n.t("errorBoundary.title")}
                 </h1>
                 <p className="mt-1 text-sm text-slate-600">
-                  An unexpected rendering error occurred in the console. You can
-                  retry the current view or return to the dashboard.
+                  {i18n.t("errorBoundary.description")}
                 </p>
                 <pre className="mt-3 max-h-36 overflow-auto rounded-lg bg-slate-950 p-3 font-mono text-xs text-rose-200">
-                  {this.state.error.message || "Unknown render error"}
+                  {this.state.error.message || i18n.t("errorBoundary.unknownError")}
                 </pre>
                 <div className="mt-4 flex flex-wrap items-center gap-2">
                   <button
@@ -68,14 +69,14 @@ class AppErrorBoundary extends Component<
                     className="inline-flex items-center gap-1.5 rounded-md bg-indigo-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-indigo-700"
                   >
                     <RotateCcw className="h-4 w-4" />
-                    Try Again
+                    {i18n.t("errorBoundary.tryAgain")}
                   </button>
                   <button
                     type="button"
                     onClick={this.handleGoHome}
                     className="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50"
                   >
-                    Return to Dashboard
+                    {i18n.t("errorBoundary.returnDashboard")}
                   </button>
                 </div>
               </div>
@@ -102,6 +103,7 @@ export function App() {
               <Route path="/crashes" element={<CrashesPage />} />
               <Route path="/crashes/:crashId" element={<CrashDetailPage />} />
               <Route path="/symbols" element={<SymbolsPage />} />
+              <Route path="/admin" element={<AdminPage />} />
               <Route path="/settings" element={<SettingsPage />} />
               <Route path="*" element={<Navigate to="/" replace />} />
             </Route>

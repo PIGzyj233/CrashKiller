@@ -39,6 +39,7 @@ import type {
 } from "../api/types";
 import { useProjectContext } from "../components/Layout";
 import { UploadModal } from "../components/UploadModal";
+import { useAppI18n } from "../i18n";
 
 const PAGE_SIZE = 25;
 
@@ -55,18 +56,8 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
 }
 
-function formatDateTime(value: string | null | undefined): string {
-  if (!value) {
-    return "—";
-  }
-  const d = new Date(value);
-  if (Number.isNaN(d.getTime())) {
-    return value;
-  }
-  return d.toLocaleString();
-}
-
 export function SymbolsPage() {
+  const { t, formatDateTime, formatNumber } = useAppI18n();
   const { projects, selectedProject, selectedProjectId } = useProjectContext();
   const [searchParams, setSearchParams] = useSearchParams();
   const queryClient = useQueryClient();
@@ -240,7 +231,7 @@ export function SymbolsPage() {
 
   const scopeLabel = selectedProject
     ? `${selectedProject.name} (${selectedProject.key})`
-    : selectedProjectId || "All Projects";
+    : selectedProjectId || t("nav.allProjects");
 
   return (
     <div className="space-y-6">
@@ -252,18 +243,15 @@ export function SymbolsPage() {
           </div>
           <div>
             <h1 className="text-xl font-semibold text-slate-900">
-              Symbols &amp; SymSrv
+              {t("symbols.title")}
             </h1>
-            <p className="text-sm text-slate-500">
-              Breakpad symbol inventory, missing symbols queue, and WinDbg
-              symbol server
-            </p>
+            <p className="text-sm text-slate-500">{t("symbols.subtitle")}</p>
           </div>
         </div>
 
         <div className="flex flex-wrap items-center gap-2.5">
           <span className="rounded-full border border-slate-200 bg-white px-3 py-1 text-xs font-medium text-slate-700">
-            Scope: {scopeLabel}
+            {t("symbols.scope", { scope: scopeLabel })}
           </span>
           <button
             type="button"
@@ -271,14 +259,14 @@ export function SymbolsPage() {
             className="inline-flex items-center gap-1.5 rounded-md bg-indigo-600 px-3 py-1.5 text-sm font-medium text-white shadow-sm hover:bg-indigo-700"
           >
             <Upload className="h-4 w-4" />
-            Upload Symbol
+            {t("symbols.uploadSymbol")}
           </button>
         </div>
       </div>
 
       {/* Tabs */}
       <div className="border-b border-slate-200">
-        <nav className="-mb-px flex gap-6" aria-label="Symbols tabs">
+        <nav className="-mb-px flex gap-6" aria-label={t("symbols.tabsAria")}>
           <button
             type="button"
             onClick={() => setActiveTab("inventory")}
@@ -288,7 +276,7 @@ export function SymbolsPage() {
                 : "border-transparent text-slate-500 hover:border-slate-300 hover:text-slate-700"
             }`}
           >
-            Symbol Inventory
+            {t("symbols.tabInventory")}
             {typeof symbolsQuery.data?.total === "number" && (
               <span className="ml-2 rounded-full bg-slate-100 px-2 py-0.5 font-mono text-xs text-slate-700">
                 {symbolsQuery.data.total}
@@ -305,7 +293,7 @@ export function SymbolsPage() {
                 : "border-transparent text-slate-500 hover:border-slate-300 hover:text-slate-700"
             }`}
           >
-            Missing Symbols Queue
+            {t("symbols.tabMissingQueue")}
             {sortedMissingItems.length > 0 && (
               <span className="ml-2 rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 font-mono text-xs font-semibold text-amber-700">
                 {sortedMissingItems.length}
@@ -325,7 +313,7 @@ export function SymbolsPage() {
                 type="text"
                 value={searchInput}
                 onChange={(e) => setSearchInput(e.target.value)}
-                placeholder="Search module, debug file, or debug ID..."
+                placeholder={t("symbols.searchPlaceholder")}
                 className="h-9 w-full rounded-md border border-slate-300 pl-9 pr-3 text-sm text-slate-900 placeholder:text-slate-400 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
               />
             </div>
@@ -334,22 +322,22 @@ export function SymbolsPage() {
               type="text"
               value={appVersionInput}
               onChange={(e) => setAppVersionInput(e.target.value)}
-              placeholder="App version (e.g. 1.2.0)"
-              aria-label="Filter by app version"
+              placeholder={t("symbols.appVersionPlaceholder")}
+              aria-label={t("symbols.filterAppVersionAria")}
               className="h-9 w-44 rounded-md border border-slate-300 px-3 text-sm text-slate-900 placeholder:text-slate-400 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
             />
 
             <select
-              aria-label="Filter by PE unwind status"
+              aria-label={t("symbols.filterPeUnwindAria")}
               value={peUnwindFilter}
               onChange={(e) =>
                 setPeUnwindFilter(e.target.value as "all" | "true" | "false")
               }
               className="h-9 rounded-md border border-slate-300 bg-white px-2.5 text-sm text-slate-800"
             >
-              <option value="all">All Symbols</option>
-              <option value="true">Full PE Unwind</option>
-              <option value="false">Missing PE Companion</option>
+              <option value="all">{t("symbols.peAll")}</option>
+              <option value="true">{t("symbols.peFull")}</option>
+              <option value="false">{t("symbols.peMissing")}</option>
             </select>
 
             {(searchInput || appVersionInput || peUnwindFilter !== "all") && (
@@ -363,7 +351,7 @@ export function SymbolsPage() {
                 className="inline-flex h-9 items-center gap-1 rounded-md px-2.5 text-xs font-medium text-slate-600 hover:bg-slate-100"
               >
                 <RotateCcw className="h-3.5 w-3.5" />
-                Reset
+                {t("common.reset")}
               </button>
             )}
 
@@ -378,7 +366,7 @@ export function SymbolsPage() {
                   symbolsQuery.isFetching ? "animate-spin" : ""
                 }`}
               />
-              Refresh
+              {t("common.refresh")}
             </button>
           </div>
 
@@ -387,14 +375,14 @@ export function SymbolsPage() {
               <span>
                 {symbolsQuery.error instanceof ApiError
                   ? symbolsQuery.error.message
-                  : "Failed to load symbol inventory."}
+                  : t("symbols.loadInventoryFailed")}
               </span>
               <button
                 type="button"
                 onClick={() => void symbolsQuery.refetch()}
                 className="rounded border border-rose-300 bg-white px-2.5 py-1 text-xs font-medium text-rose-700"
               >
-                Retry
+                {t("common.retry")}
               </button>
             </div>
           )}
@@ -404,13 +392,17 @@ export function SymbolsPage() {
               <table className="min-w-full divide-y divide-slate-200 text-left text-sm">
                 <thead className="bg-slate-50 text-xs font-medium uppercase tracking-wider text-slate-500">
                   <tr>
-                    <th className="px-4 py-3">Module / Debug File</th>
-                    <th className="px-4 py-3">Debug ID</th>
-                    <th className="px-4 py-3">App Version</th>
-                    <th className="px-4 py-3">PE Unwind</th>
-                    <th className="px-4 py-3">Sizes</th>
-                    <th className="px-4 py-3">Last Used</th>
-                    <th className="px-4 py-3 text-right">Actions</th>
+                    <th className="px-4 py-3">
+                      {t("symbols.colModuleDebugFile")}
+                    </th>
+                    <th className="px-4 py-3">{t("symbols.colDebugId")}</th>
+                    <th className="px-4 py-3">{t("symbols.colAppVersion")}</th>
+                    <th className="px-4 py-3">{t("symbols.colPeUnwind")}</th>
+                    <th className="px-4 py-3">{t("symbols.colSizes")}</th>
+                    <th className="px-4 py-3">{t("symbols.colLastUsed")}</th>
+                    <th className="px-4 py-3 text-right">
+                      {t("symbols.colActions")}
+                    </th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
@@ -420,7 +412,7 @@ export function SymbolsPage() {
                         colSpan={7}
                         className="px-4 py-10 text-center text-sm text-slate-500"
                       >
-                        Loading symbol inventory...
+                        {t("symbols.loadingInventory")}
                       </td>
                     </tr>
                   ) : symbolsList.length === 0 ? (
@@ -429,13 +421,13 @@ export function SymbolsPage() {
                         colSpan={7}
                         className="px-4 py-12 text-center text-sm text-slate-500"
                       >
-                        No Breakpad symbols found.{" "}
+                        {t("symbols.emptyInventoryPrefix")}
                         <button
                           type="button"
                           onClick={() => setIsUploadOpen(true)}
                           className="font-medium text-indigo-600 hover:underline"
                         >
-                          Upload a PDB / EXE / DLL
+                          {t("symbols.emptyInventoryAction")}
                         </button>
                       </td>
                     </tr>
@@ -470,7 +462,7 @@ export function SymbolsPage() {
                                 type="button"
                                 onClick={() => handleCopy(sym.debug_id)}
                                 className="rounded p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-700"
-                                title="Copy debug_id"
+                                title={t("symbols.copyDebugId")}
                               >
                                 {copiedText === sym.debug_id ? (
                                   <Check className="h-3.5 w-3.5 text-emerald-600" />
@@ -489,7 +481,7 @@ export function SymbolsPage() {
                             {sym.has_pe_unwind ? (
                               <span className="inline-flex items-center gap-1 rounded-full border border-emerald-200 bg-emerald-50 px-2.5 py-0.5 text-xs font-medium text-emerald-700">
                                 <CheckCircle2 className="h-3.5 w-3.5" />
-                                PE Unwind OK
+                                {t("symbols.peUnwindOk")}
                               </span>
                             ) : (
                               <span
@@ -497,7 +489,7 @@ export function SymbolsPage() {
                                 className="inline-flex items-center gap-1 rounded-full border border-amber-300 bg-amber-50 px-2.5 py-0.5 text-xs font-medium text-amber-800"
                               >
                                 <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-amber-600" />
-                                缺少 PE 伴随文件，x64 栈展开可能受限
+                                {t("symbols.peUnwindMissing")}
                               </span>
                             )}
                           </td>
@@ -508,7 +500,7 @@ export function SymbolsPage() {
                               raw:{" "}
                               {sym.raw_size > 0
                                 ? formatBytes(sym.raw_size)
-                                : "Not archived"}
+                                : t("symbols.rawNotArchived")}
                             </div>
                           </td>
 
@@ -523,11 +515,13 @@ export function SymbolsPage() {
                                 deleteMutation.reset();
                                 setConfirmDeleteSymbol(sym);
                               }}
-                              aria-label={`Delete symbol ${sym.debug_file}`}
+                              aria-label={t("symbols.deleteSymbolAria", {
+                                file: sym.debug_file,
+                              })}
                               className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-rose-600 hover:border-rose-200 hover:bg-rose-50"
                             >
                               <Trash2 className="h-3.5 w-3.5" />
-                              Delete
+                              {t("common.delete")}
                             </button>
                           </td>
                         </tr>
@@ -540,7 +534,11 @@ export function SymbolsPage() {
 
             <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-200 bg-slate-50 px-4 py-3 text-xs text-slate-600">
               <span>
-                Showing {fromIdx}–{toIdx} of {symbolsTotal.toLocaleString()}
+                {t("common.showingRange", {
+                  from: fromIdx,
+                  to: toIdx,
+                  total: formatNumber(symbolsTotal),
+                })}
               </span>
               <div className="flex items-center gap-2">
                 <button
@@ -550,7 +548,7 @@ export function SymbolsPage() {
                   className="inline-flex items-center gap-1 rounded-md border border-slate-300 bg-white px-2.5 py-1 font-medium text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   <ChevronLeft className="h-3.5 w-3.5" />
-                  Previous
+                  {t("common.previous")}
                 </button>
                 <button
                   type="button"
@@ -558,7 +556,7 @@ export function SymbolsPage() {
                   onClick={() => setOffset((p) => p + PAGE_SIZE)}
                   className="inline-flex items-center gap-1 rounded-md border border-slate-300 bg-white px-2.5 py-1 font-medium text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
                 >
-                  Next
+                  {t("common.next")}
                   <ChevronRight className="h-3.5 w-3.5" />
                 </button>
               </div>
@@ -573,10 +571,7 @@ export function SymbolsPage() {
           <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-200 bg-white p-3.5 shadow-sm">
             <div className="flex items-center gap-2 text-xs text-slate-600">
               <AlertCircle className="h-4 w-4 text-amber-500" />
-              <span>
-                Missing symbols ordered by impacted crash count descending.
-                Upload the missing PDB + EXE/DLL then click Re-symbolicate.
-              </span>
+              <span>{t("symbols.missingHint")}</span>
             </div>
 
             <div className="flex items-center gap-2">
@@ -591,7 +586,7 @@ export function SymbolsPage() {
                     missingQuery.isFetching ? "animate-spin" : ""
                   }`}
                 />
-                Refresh
+                {t("common.refresh")}
               </button>
               <button
                 type="button"
@@ -611,7 +606,7 @@ export function SymbolsPage() {
                 ) : (
                   <RefreshCw className="h-3.5 w-3.5" />
                 )}
-                Re-symbolicate All Missing
+                {t("symbols.resymAllMissing")}
               </button>
             </div>
           </div>
@@ -619,18 +614,18 @@ export function SymbolsPage() {
           {resymFeedback && (
             <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-900">
               <div>
-                Queued{" "}
+                {t("symbols.resymQueuedPrefix")}
                 <strong className="font-semibold">
                   {resymFeedback.queued_count}
-                </strong>{" "}
-                crash(es) for re-symbolication
+                </strong>
+                {t("symbols.resymQueuedSuffix")}
                 {resymFeedback.debug_id
                   ? ` (debug_id: ${resymFeedback.debug_id})`
                   : ""}
                 .
                 {resymFeedback.crash_ids.length > 0 && (
                   <span className="ml-2 text-xs">
-                    IDs:{" "}
+                    {t("symbols.resymIdsLabel")}
                     {resymFeedback.crash_ids.slice(0, 4).map((cid, i) => (
                       <span key={cid}>
                         {i > 0 ? ", " : ""}
@@ -659,7 +654,7 @@ export function SymbolsPage() {
             <div className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-xs text-rose-700">
               {resymMutation.error instanceof ApiError
                 ? resymMutation.error.message
-                : "Failed to queue re-symbolication."}
+                : t("symbols.resymFailed")}
             </div>
           )}
 
@@ -668,14 +663,14 @@ export function SymbolsPage() {
               <span>
                 {missingQuery.error instanceof ApiError
                   ? missingQuery.error.message
-                  : "Failed to load missing symbols queue."}
+                  : t("symbols.loadMissingFailed")}
               </span>
               <button
                 type="button"
                 onClick={() => void missingQuery.refetch()}
                 className="rounded border border-rose-300 bg-white px-2.5 py-1 text-xs font-medium text-rose-700"
               >
-                Retry
+                {t("common.retry")}
               </button>
             </div>
           )}
@@ -685,12 +680,18 @@ export function SymbolsPage() {
               <table className="min-w-full divide-y divide-slate-200 text-left text-sm">
                 <thead className="bg-slate-50 text-xs font-medium uppercase tracking-wider text-slate-500">
                   <tr>
-                    <th className="px-4 py-3">Module &amp; Debug File</th>
-                    <th className="px-4 py-3">Debug ID</th>
-                    <th className="px-4 py-3">Code File / ID</th>
-                    <th className="px-4 py-3">Crashes</th>
-                    <th className="px-4 py-3">Affected Crashes</th>
-                    <th className="px-4 py-3 text-right">Actions</th>
+                    <th className="px-4 py-3">
+                      {t("symbols.colModuleAndDebug")}
+                    </th>
+                    <th className="px-4 py-3">{t("symbols.colDebugId")}</th>
+                    <th className="px-4 py-3">{t("symbols.colCodeFileId")}</th>
+                    <th className="px-4 py-3">{t("symbols.colCrashes")}</th>
+                    <th className="px-4 py-3">
+                      {t("symbols.colAffectedCrashes")}
+                    </th>
+                    <th className="px-4 py-3 text-right">
+                      {t("symbols.colActions")}
+                    </th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
@@ -700,7 +701,7 @@ export function SymbolsPage() {
                         colSpan={6}
                         className="px-4 py-10 text-center text-sm text-slate-500"
                       >
-                        Loading missing symbols queue...
+                        {t("symbols.loadingMissing")}
                       </td>
                     </tr>
                   ) : sortedMissingItems.length === 0 ? (
@@ -710,7 +711,7 @@ export function SymbolsPage() {
                         className="px-4 py-12 text-center text-sm text-slate-500"
                       >
                         <CheckCircle2 className="mx-auto mb-2 h-6 w-6 text-emerald-500" />
-                        No missing symbols detected across parsed crashes.
+                        {t("symbols.emptyMissing")}
                       </td>
                     </tr>
                   ) : (
@@ -748,7 +749,7 @@ export function SymbolsPage() {
                                 type="button"
                                 onClick={() => handleCopy(item.debug_id)}
                                 className="rounded p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-700"
-                                title="Copy debug_id"
+                                title={t("symbols.copyDebugId")}
                               >
                                 {copiedText === item.debug_id ? (
                                   <Check className="h-3.5 w-3.5 text-emerald-600" />
@@ -771,7 +772,9 @@ export function SymbolsPage() {
                               {item.crash_count}
                             </span>
                             <div className="mt-1 text-[11px] text-slate-500">
-                              Latest: {formatDateTime(item.latest_crash_at)}
+                              {t("symbols.latestLabel", {
+                                time: formatDateTime(item.latest_crash_at),
+                              })}
                             </div>
                           </td>
 
@@ -791,7 +794,9 @@ export function SymbolsPage() {
                                 ))}
                                 {extraCrashes > 0 && (
                                   <span className="text-[11px] text-slate-500">
-                                    +{extraCrashes} more
+                                    {t("symbols.moreCrashes", {
+                                      count: extraCrashes,
+                                    })}
                                   </span>
                                 )}
                               </div>
@@ -806,7 +811,7 @@ export function SymbolsPage() {
                                 className="inline-flex items-center gap-1 rounded-md border border-slate-300 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50"
                               >
                                 <Upload className="h-3.5 w-3.5" />
-                                Upload
+                                {t("symbols.uploadBtn")}
                               </button>
                               <button
                                 type="button"
@@ -828,7 +833,7 @@ export function SymbolsPage() {
                                 ) : (
                                   <RefreshCw className="h-3.5 w-3.5" />
                                 )}
-                                Re-symbolicate
+                                {t("symbols.resymBtn")}
                               </button>
                             </div>
                           </td>
@@ -848,8 +853,9 @@ export function SymbolsPage() {
         <div className="flex items-center gap-2">
           <Terminal className="h-4 w-4 text-indigo-600" />
           <h2 className="text-sm font-semibold text-slate-900">
-            WinDbg <code className="font-mono">/symsrv</code> &amp; CI/CD CLI
-            Quick Reference
+            {t("symbols.quickRefTitleBefore")}
+            <code className="font-mono">/symsrv</code>
+            {t("symbols.quickRefTitleAfter")}
           </h2>
         </div>
 
@@ -857,7 +863,7 @@ export function SymbolsPage() {
           <div className="rounded-lg border border-slate-200 bg-slate-50 p-3.5">
             <div className="flex items-center justify-between">
               <span className="text-xs font-semibold text-slate-800">
-                WinDbg / Visual Studio Symbol Path
+                {t("symbols.windbgPathTitle")}
               </span>
               <button
                 type="button"
@@ -867,12 +873,12 @@ export function SymbolsPage() {
                 {copiedText === windbgSymPath ? (
                   <>
                     <Check className="h-3 w-3 text-emerald-600" />
-                    Copied
+                    {t("common.copied")}
                   </>
                 ) : (
                   <>
                     <Copy className="h-3 w-3" />
-                    Copy
+                    {t("common.copy")}
                   </>
                 )}
               </button>
@@ -881,19 +887,22 @@ export function SymbolsPage() {
               {windbgSymPath}
             </pre>
             <p className="mt-2 text-[11px] text-slate-500">
-              Enable <code className="font-mono">archive_raw_symbols</code> in{" "}
-              <Link to="/settings" className="text-indigo-600 hover:underline">
-                Settings
-              </Link>{" "}
-              to allow WinDbg and Visual Studio to pull original PDB/EXE/DLL
-              files from <code className="font-mono">/symsrv</code>.
+              {t("symbols.windbgHintBefore")}
+              <Link to="/admin" className="text-indigo-600 hover:underline">
+                {t("symbols.windbgHintLink")}
+              </Link>
+              {t("symbols.windbgHintMiddle")}
+              <code className="font-mono">archive_raw_symbols</code>
+              {t("symbols.windbgHintAfter")}
             </p>
           </div>
 
           <div className="rounded-lg border border-slate-200 bg-slate-50 p-3.5">
             <div className="flex items-center justify-between">
               <span className="text-xs font-semibold text-slate-800">
-                CI/CD Symbol Upload (<code className="font-mono">crashkiller_cli.py</code>)
+                {t("symbols.cliTitleBefore")}
+                <code className="font-mono">crashkiller_cli.py</code>
+                {t("symbols.cliTitleAfter")}
               </span>
               <button
                 type="button"
@@ -903,12 +912,12 @@ export function SymbolsPage() {
                 {copiedText === cliSnippet ? (
                   <>
                     <Check className="h-3 w-3 text-emerald-600" />
-                    Copied
+                    {t("common.copied")}
                   </>
                 ) : (
                   <>
                     <Copy className="h-3 w-3" />
-                    Copy
+                    {t("common.copy")}
                   </>
                 )}
               </button>
@@ -917,10 +926,13 @@ export function SymbolsPage() {
               {cliSnippet}
             </pre>
             <p className="mt-2 text-[11px] text-slate-500">
-              The CLI automatically pairs each <code className="font-mono">.pdb</code>{" "}
-              with its matching <code className="font-mono">.exe/.dll</code> so{" "}
-              <code className="font-mono">has_pe_unwind</code> remains enabled
-              for x64 CFI unwinding.
+              {t("symbols.cliHintBefore")}
+              <code className="font-mono">.pdb</code>
+              {t("symbols.cliHintMid1")}
+              <code className="font-mono">.exe/.dll</code>
+              {t("symbols.cliHintMid2")}
+              <code className="font-mono">has_pe_unwind</code>
+              {t("symbols.cliHintAfter")}
             </p>
           </div>
         </div>
@@ -939,23 +951,22 @@ export function SymbolsPage() {
               id="delete-symbol-modal-title"
               className="text-base font-semibold text-slate-900"
             >
-              Delete Symbol
+              {t("symbols.deleteModalTitle")}
             </h2>
             <p className="mt-2 text-sm text-slate-600">
-              Are you sure you want to delete{" "}
+              {t("symbols.deleteModalDescBefore")}
               <code className="font-mono font-semibold text-slate-900">
                 {confirmDeleteSymbol.debug_file}
               </code>{" "}
-              (<code className="font-mono text-xs">{confirmDeleteSymbol.debug_id}</code>)?
-              This removes the indexed <code className="font-mono">.sym</code>{" "}
-              and any archived raw PDB/PE binaries.
+              (<code className="font-mono text-xs">{confirmDeleteSymbol.debug_id}</code>)
+              {t("symbols.deleteModalDescAfter")}
             </p>
 
             {deleteMutation.isError && (
               <div className="mt-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700">
                 {deleteMutation.error instanceof ApiError
                   ? deleteMutation.error.message
-                  : "Failed to delete symbol."}
+                  : t("symbols.deleteFailed")}
               </div>
             )}
 
@@ -965,7 +976,7 @@ export function SymbolsPage() {
                 onClick={() => setConfirmDeleteSymbol(null)}
                 className="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50"
               >
-                Cancel
+                {t("common.cancel")}
               </button>
               <button
                 type="button"
@@ -974,7 +985,9 @@ export function SymbolsPage() {
                 className="inline-flex items-center gap-1.5 rounded-md bg-rose-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-rose-700 disabled:opacity-50"
               >
                 <Trash2 className="h-4 w-4" />
-                {deleteMutation.isPending ? "Deleting..." : "Confirm Delete"}
+                {deleteMutation.isPending
+                  ? t("common.deleting")
+                  : t("symbols.confirmDelete")}
               </button>
             </div>
           </div>
