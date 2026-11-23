@@ -24,11 +24,14 @@ import {
 import {
   ApiError,
   createProject,
+  getProjectApiKey,
   getStoredProjectApiKey,
   getSystemSettings,
   listLLMProviders,
+  removeStoredProjectApiKey,
   rotateProjectKey,
   setStoredProjectApiKey,
+  syncProjectApiKey,
   triggerGC,
   updateProject,
   updateSystemSettings,
@@ -190,6 +193,52 @@ function parseLineInput(raw: string): string[] {
     .filter((item) => item.length > 0);
 }
 
+function maskProjectApiKey(rawKey: string): string {
+  const trimmed = rawKey.trim();
+  if (!trimmed) {
+    return "";
+  }
+  if (trimmed.length <= 10) {
+    return "•".repeat(Math.max(8, trimmed.length));
+  }
+  return `${trimmed.slice(0, 6)}${"•".repeat(14)}${trimmed.slice(-4)}`;
+}
+
+async function copyTextToClipboard(text: string): Promise<boolean> {
+  if (!text) {
+    return false;
+  }
+  if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      // Fall through to execCommand fallback for non-HTTPS origins
+    }
+  }
+  if (typeof document === "undefined") {
+    return false;
+  }
+  try {
+    const textarea = document.createElement("textarea");
+    textarea.value = text;
+    textarea.setAttribute("readonly", "");
+    textarea.style.position = "fixed";
+    textarea.style.top = "-9999px";
+    textarea.style.left = "-9999px";
+    textarea.style.opacity = "0";
+    document.body.appendChild(textarea);
+    textarea.focus();
+    textarea.select();
+    textarea.setSelectionRange(0, text.length);
+    const ok = document.execCommand("copy");
+    document.body.removeChild(textarea);
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
 function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes < 0) {
     return "0 B";
@@ -297,6 +346,21 @@ export function AdminPage() {
   const [confirmRotateProjectId, setConfirmRotateProjectId] = useState<
     string | null
   >(null);
+  const [showEditorApiKey, setShowEditorApiKey] = useState(false);
+  const [visibleCardKeyIds, setVisibleCardKeyIds] = useState<
+    Record<string, boolean>
+  >({});
+  const [resolvedProjectKeys, setResolvedProjectKeys] = useState<
+    Record<string, string | null>
+  >({});
+  const [loadingCardKeyId, setLoadingCardKeyId] = useState<string | null>(null);
+  const [copiedProjectKeyTarget, setCopiedProjectKeyTarget] = useState<
+    string | null
+  >(null);
+  const [projectKeyError, setProjectKeyError] = useState<{
+    projectId: string;
+    message: string;
+  } | null>(null);
   const [editName, setEditName] = useState("");
   const [editAiTriageMode, setEditAiTriageMode] = useState<AITriageMode | "">(
     "",
@@ -403,6 +467,62 @@ export function AdminPage() {
     [projects, editingProjectId],
   );
 
+  const fetchAndResolveProjectApiKey = async (
+    proj: ProjectRead,
+  ): Promise<string | null> => {
+    const localKey = getStoredProjectApiKey(proj.key);
+    try {
+      const res = await getProjectApiKey(proj.id);
+      if (res.api_key) {
+        setStoredProjectApiKey(proj.key, res.api_key);
+        return res.api_key;
+      }
+      if (localKey) {
+        try {
+          const synced = await syncProjectApiKey(proj.id, localKey);
+          if (synced.api_key) {
+            setStoredProjectApiKey(proj.key, synced.api_key);
+            return synced.api_key;
+          }
+        } catch (syncErr) {
+          if (syncErr instanceof ApiError && syncErr.status === 400) {
+            removeStoredProjectApiKey(proj.key);
+            return null;
+          }
+          return localKey;
+        }
+      }
+      return null;
+    } catch (err) {
+      if (
+        localKey &&
+        err instanceof ApiError &&
+        (err.status === 404 || err.status === 405)
+      ) {
+        return localKey;
+      }
+      throw err;
+    }
+  };
+
+  const editingProjectKeyQuery = useQuery({
+    queryKey: ["project-api-key", editingProject?.id],
+    queryFn: () => fetchAndResolveProjectApiKey(editingProject!),
+    enabled: Boolean(editingProject),
+    staleTime: 60_000,
+  });
+
+  useEffect(() => {
+    if (!editingProject || editingProjectKeyQuery.data === undefined) {
+      return;
+    }
+    setResolvedProjectKeys((prev) =>
+      prev[editingProject.id] === editingProjectKeyQuery.data
+        ? prev
+        : { ...prev, [editingProject.id]: editingProjectKeyQuery.data },
+    );
+  }, [editingProject, editingProjectKeyQuery.data]);
+
   const syncedProjectIdRef = useRef<string | null>(null);
 
   const syncProjectForm = (proj: ProjectRead) => {
@@ -434,6 +554,7 @@ export function AdminPage() {
       syncedProjectIdRef.current = editingProject.id;
       syncProjectForm(editingProject);
       setProjectSavedMsg(null);
+      setShowEditorApiKey(false);
     }
   }, [editingProject]);
 
@@ -508,6 +629,11 @@ export function AdminPage() {
     mutationFn: createProject,
     onSuccess: (created) => {
       setStoredProjectApiKey(created.key, created.api_key);
+      queryClient.setQueryData(["project-api-key", created.id], created.api_key);
+      setResolvedProjectKeys((prev) => ({
+        ...prev,
+        [created.id]: created.api_key,
+      }));
       setRevealedKey({
         projectKey: created.key,
         projectName: created.name,
@@ -548,6 +674,14 @@ export function AdminPage() {
     mutationFn: (projectId: string) => rotateProjectKey(projectId),
     onSuccess: (rotated) => {
       setStoredProjectApiKey(rotated.key, rotated.api_key);
+      queryClient.setQueryData(["project-api-key", rotated.id], rotated.api_key);
+      setResolvedProjectKeys((prev) => ({
+        ...prev,
+        [rotated.id]: rotated.api_key,
+      }));
+      setProjectKeyError((prev) =>
+        prev?.projectId === rotated.id ? null : prev,
+      );
       const matched = projects.find((p) => p.id === rotated.id);
       setRevealedKey({
         projectKey: rotated.key,
@@ -821,12 +955,92 @@ export function AdminPage() {
   );
 
   const handleCopyRevealedKey = () => {
-    if (!revealedKey || !navigator.clipboard) {
+    if (!revealedKey) {
       return;
     }
-    void navigator.clipboard.writeText(revealedKey.apiKey);
-    setCopiedKey(true);
-    window.setTimeout(() => setCopiedKey(false), 1800);
+    void copyTextToClipboard(revealedKey.apiKey).then((ok) => {
+      if (ok) {
+        setCopiedKey(true);
+        window.setTimeout(() => setCopiedKey(false), 1800);
+      }
+    });
+  };
+
+  const ensureProjectApiKey = async (
+    proj: ProjectRead,
+  ): Promise<string | null> => {
+    setProjectKeyError((prev) => (prev?.projectId === proj.id ? null : prev));
+    setLoadingCardKeyId(proj.id);
+    try {
+      const key = await queryClient.fetchQuery({
+        queryKey: ["project-api-key", proj.id],
+        queryFn: () => fetchAndResolveProjectApiKey(proj),
+        staleTime: 60_000,
+      });
+      setResolvedProjectKeys((prev) => ({ ...prev, [proj.id]: key }));
+      return key;
+    } catch (err) {
+      setProjectKeyError({
+        projectId: proj.id,
+        message:
+          err instanceof ApiError
+            ? err.message
+            : t("admin.projects.loadKeyFailed"),
+      });
+      return null;
+    } finally {
+      setLoadingCardKeyId((prev) => (prev === proj.id ? null : prev));
+    }
+  };
+
+  const handleToggleCardApiKey = async (proj: ProjectRead) => {
+    const isCurrentlyVisible = Boolean(visibleCardKeyIds[proj.id]);
+    if (isCurrentlyVisible) {
+      setVisibleCardKeyIds((prev) => ({ ...prev, [proj.id]: false }));
+      return;
+    }
+    setVisibleCardKeyIds((prev) => ({ ...prev, [proj.id]: true }));
+    if (resolvedProjectKeys[proj.id] === undefined) {
+      await ensureProjectApiKey(proj);
+    }
+  };
+
+  const handleCopyProjectApiKey = async (
+    proj: ProjectRead,
+    targetKey: string,
+  ) => {
+    let keyToCopy =
+      proj.id === editingProject?.id && editingProjectKeyQuery.data !== undefined
+        ? editingProjectKeyQuery.data
+        : resolvedProjectKeys[proj.id];
+
+    if (keyToCopy === undefined) {
+      keyToCopy = await ensureProjectApiKey(proj);
+    }
+    if (!keyToCopy) {
+      setVisibleCardKeyIds((prev) => ({ ...prev, [proj.id]: true }));
+      return;
+    }
+    const ok = await copyTextToClipboard(keyToCopy);
+    if (ok) {
+      setProjectKeyError((prev) => (prev?.projectId === proj.id ? null : prev));
+      setCopiedProjectKeyTarget(targetKey);
+      window.setTimeout(() => {
+        setCopiedProjectKeyTarget((curr) =>
+          curr === targetKey ? null : curr,
+        );
+      }, 1800);
+    } else {
+      setProjectKeyError({
+        projectId: proj.id,
+        message: t("admin.projects.copyKeyFailed"),
+      });
+      if (targetKey.startsWith("editor:")) {
+        setShowEditorApiKey(true);
+      } else {
+        setVisibleCardKeyIds((prev) => ({ ...prev, [proj.id]: true }));
+      }
+    }
   };
 
   const providerLabel = (id: LLMProviderId, fallbackName: string): string => {
@@ -1722,9 +1936,26 @@ export function AdminPage() {
               <div className="divide-y divide-slate-200">
                 {projects.map((proj) => {
                   const isSelected = proj.id === editingProjectId;
-                  const hasStoredKey = Boolean(getStoredProjectApiKey(proj.key));
+                  const resolvedKey =
+                    proj.id === editingProject?.id &&
+                    editingProjectKeyQuery.data !== undefined
+                      ? editingProjectKeyQuery.data
+                      : resolvedProjectKeys[proj.id];
+                  const hasStoredKey = Boolean(
+                    resolvedKey || getStoredProjectApiKey(proj.key),
+                  );
                   const isConfirmingRotate =
                     confirmRotateProjectId === proj.id;
+                  const isCardKeyVisible = Boolean(visibleCardKeyIds[proj.id]);
+                  const isCardLoading =
+                    loadingCardKeyId === proj.id ||
+                    (isSelected && editingProjectKeyQuery.isLoading);
+                  const cardCopyTarget = `card:${proj.id}`;
+                  const isCardCopied = copiedProjectKeyTarget === cardCopyTarget;
+                  const cardErr =
+                    projectKeyError?.projectId === proj.id
+                      ? projectKeyError.message
+                      : null;
 
                   return (
                     <div
@@ -1763,7 +1994,59 @@ export function AdminPage() {
                         </button>
                       </div>
 
-                      <div className="mt-2.5 flex items-center justify-between border-t border-slate-100 pt-2 text-xs">
+                      {isCardKeyVisible && (
+                        <div className="mt-2.5 rounded-md border border-slate-200 bg-slate-50 p-2 text-xs">
+                          {isCardLoading ? (
+                            <div className="flex items-center gap-1.5 text-slate-500">
+                              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                              <span>{t("admin.projects.loadingKey")}</span>
+                            </div>
+                          ) : resolvedKey ? (
+                            <div className="flex items-center gap-1.5">
+                              <code
+                                data-testid={`project-card-api-key-${proj.key}`}
+                                className="flex-1 select-all break-all rounded border border-slate-200 bg-white px-2 py-1 font-mono text-[11px] text-slate-900"
+                              >
+                                {resolvedKey}
+                              </code>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  void handleCopyProjectApiKey(
+                                    proj,
+                                    cardCopyTarget,
+                                  )
+                                }
+                                className="inline-flex shrink-0 items-center gap-1 rounded border border-slate-300 bg-white px-2 py-1 text-[11px] font-medium text-slate-700 hover:bg-slate-100"
+                              >
+                                {isCardCopied ? (
+                                  <>
+                                    <Check className="h-3 w-3 text-emerald-600" />
+                                    {t("common.copied")}
+                                  </>
+                                ) : (
+                                  <>
+                                    <Copy className="h-3 w-3" />
+                                    {t("common.copy")}
+                                  </>
+                                )}
+                              </button>
+                            </div>
+                          ) : (
+                            <p className="text-[11px] text-amber-800">
+                              {t("admin.projects.keyUnavailable")}
+                            </p>
+                          )}
+                        </div>
+                      )}
+
+                      {cardErr && (
+                        <div className="mt-2 rounded border border-rose-200 bg-rose-50 px-2 py-1 text-[11px] text-rose-700">
+                          {cardErr}
+                        </div>
+                      )}
+
+                      <div className="mt-2.5 flex flex-wrap items-center justify-between gap-2 border-t border-slate-100 pt-2 text-xs">
                         {isConfirmingRotate ? (
                           <div className="flex w-full items-center justify-between gap-2">
                             <span className="font-medium text-amber-800">
@@ -1790,17 +2073,66 @@ export function AdminPage() {
                             </div>
                           </div>
                         ) : (
-                          <button
-                            type="button"
-                            onClick={() => {
-                              rotateKeyMutation.reset();
-                              setConfirmRotateProjectId(proj.id);
-                            }}
-                            className="inline-flex items-center gap-1 font-medium text-slate-600 hover:text-indigo-600"
-                          >
-                            <RefreshCw className="h-3 w-3" />
-                            {t("admin.projects.rotateKey")}
-                          </button>
+                          <>
+                            <div className="flex flex-wrap items-center gap-3">
+                              <button
+                                type="button"
+                                disabled={isCardLoading}
+                                onClick={() =>
+                                  void handleToggleCardApiKey(proj)
+                                }
+                                className="inline-flex items-center gap-1 font-medium text-indigo-600 hover:text-indigo-800 disabled:opacity-50"
+                              >
+                                {isCardKeyVisible ? (
+                                  <>
+                                    <EyeOff className="h-3.5 w-3.5" />
+                                    {t("admin.projects.hideKey")}
+                                  </>
+                                ) : (
+                                  <>
+                                    <Eye className="h-3.5 w-3.5" />
+                                    {t("admin.projects.viewKey")}
+                                  </>
+                                )}
+                              </button>
+                              <button
+                                type="button"
+                                disabled={isCardLoading}
+                                onClick={() =>
+                                  void handleCopyProjectApiKey(
+                                    proj,
+                                    cardCopyTarget,
+                                  )
+                                }
+                                className="inline-flex items-center gap-1 font-medium text-slate-600 hover:text-indigo-600 disabled:opacity-50"
+                              >
+                                {isCardCopied ? (
+                                  <>
+                                    <Check className="h-3.5 w-3.5 text-emerald-600" />
+                                    <span className="text-emerald-700">
+                                      {t("common.copied")}
+                                    </span>
+                                  </>
+                                ) : (
+                                  <>
+                                    <Copy className="h-3.5 w-3.5" />
+                                    {t("admin.projects.copyKey")}
+                                  </>
+                                )}
+                              </button>
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                rotateKeyMutation.reset();
+                                setConfirmRotateProjectId(proj.id);
+                              }}
+                              className="inline-flex items-center gap-1 font-medium text-slate-600 hover:text-amber-700"
+                            >
+                              <RefreshCw className="h-3 w-3" />
+                              {t("admin.projects.rotateKey")}
+                            </button>
+                          </>
                         )}
                       </div>
                     </div>
@@ -1836,6 +2168,102 @@ export function AdminPage() {
                       : t("admin.projects.saveFailed")}
                   </div>
                 )}
+
+                {/* Project API Key Viewer & Copier */}
+                <div className="rounded-lg border border-slate-200 bg-slate-50/80 p-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex items-center gap-1.5 text-xs font-medium text-slate-700">
+                      <KeyRound className="h-3.5 w-3.5 text-indigo-600" />
+                      <span>{t("admin.projects.apiKeyLabel")}</span>
+                    </div>
+                    <span className="text-[11px] text-slate-500">
+                      {t("admin.projects.apiKeyHeaderHint")}
+                    </span>
+                  </div>
+
+                  {editingProjectKeyQuery.isLoading ? (
+                    <div className="mt-2 flex items-center gap-1.5 text-xs text-slate-500">
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      <span>{t("admin.projects.loadingKey")}</span>
+                    </div>
+                  ) : editingProjectKeyQuery.isError ? (
+                    <div className="mt-2 rounded border border-rose-200 bg-rose-50 px-2.5 py-1.5 text-xs text-rose-700">
+                      {editingProjectKeyQuery.error instanceof ApiError
+                        ? editingProjectKeyQuery.error.message
+                        : t("admin.projects.loadKeyFailed")}
+                    </div>
+                  ) : editingProjectKeyQuery.data ? (
+                    <div className="mt-2 flex flex-wrap items-center gap-2">
+                      <input
+                        type="text"
+                        readOnly
+                        aria-label={t("admin.projects.apiKeyLabel")}
+                        data-testid="editor-project-api-key"
+                        value={
+                          showEditorApiKey
+                            ? editingProjectKeyQuery.data
+                            : maskProjectApiKey(editingProjectKeyQuery.data)
+                        }
+                        onFocus={(e) => {
+                          if (showEditorApiKey) {
+                            e.currentTarget.select();
+                          }
+                        }}
+                        className="h-9 min-w-[200px] flex-1 rounded-md border border-slate-300 bg-white px-2.5 font-mono text-xs text-slate-900 focus:border-indigo-500 focus:outline-none"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setShowEditorApiKey((prev) => !prev)}
+                        className="inline-flex h-9 items-center gap-1.5 rounded-md border border-slate-300 bg-white px-2.5 text-xs font-medium text-slate-700 hover:bg-slate-50"
+                      >
+                        {showEditorApiKey ? (
+                          <>
+                            <EyeOff className="h-3.5 w-3.5" />
+                            {t("admin.projects.hideKey")}
+                          </>
+                        ) : (
+                          <>
+                            <Eye className="h-3.5 w-3.5" />
+                            {t("admin.projects.showKey")}
+                          </>
+                        )}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          void handleCopyProjectApiKey(
+                            editingProject,
+                            `editor:${editingProject.id}`,
+                          )
+                        }
+                        className="inline-flex h-9 items-center gap-1.5 rounded-md bg-indigo-600 px-3 text-xs font-medium text-white hover:bg-indigo-700"
+                      >
+                        {copiedProjectKeyTarget ===
+                        `editor:${editingProject.id}` ? (
+                          <>
+                            <Check className="h-3.5 w-3.5" />
+                            {t("common.copied")}
+                          </>
+                        ) : (
+                          <>
+                            <Copy className="h-3.5 w-3.5" />
+                            {t("admin.projects.copyKey")}
+                          </>
+                        )}
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="mt-2 rounded border border-amber-200 bg-amber-50 px-2.5 py-2 text-xs text-amber-800">
+                      {t("admin.projects.keyUnavailable")}
+                    </div>
+                  )}
+
+                  {projectKeyError?.projectId === editingProject.id && (
+                    <div className="mt-2 rounded border border-rose-200 bg-rose-50 px-2.5 py-1.5 text-xs text-rose-700">
+                      {projectKeyError.message}
+                    </div>
+                  )}
+                </div>
 
                 <div className="grid gap-3 sm:grid-cols-2">
                   <div>

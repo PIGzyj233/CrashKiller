@@ -29,6 +29,7 @@ import type {
   LogSearchResponse,
   LogSummaryResponse,
   MissingSymbolQueueItem,
+  ProjectApiKeyResponse,
   ProjectCreate,
   ProjectCreateResponse,
   ProjectRead,
@@ -295,6 +296,35 @@ export async function rotateProjectKey(
     setStoredProjectApiKey(rotated.key, rotated.api_key);
   }
   return rotated;
+}
+
+export async function getProjectApiKey(
+  projectId: string,
+): Promise<ProjectApiKeyResponse> {
+  const res = await requestJson<ProjectApiKeyResponse>(
+    `${API_BASE}/projects/${encodeURIComponent(projectId)}/api-key`,
+  );
+  if (res.key && res.api_key) {
+    setStoredProjectApiKey(res.key, res.api_key);
+  }
+  return res;
+}
+
+export async function syncProjectApiKey(
+  projectId: string,
+  apiKey: string,
+): Promise<ProjectApiKeyResponse> {
+  const res = await requestJson<ProjectApiKeyResponse>(
+    `${API_BASE}/projects/${encodeURIComponent(projectId)}/api-key/sync`,
+    {
+      method: "POST",
+      body: JSON.stringify({ api_key: apiKey }),
+    },
+  );
+  if (res.key && res.api_key) {
+    setStoredProjectApiKey(res.key, res.api_key);
+  }
+  return res;
 }
 
 // ============================================================================

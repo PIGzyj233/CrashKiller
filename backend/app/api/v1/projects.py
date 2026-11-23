@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import hmac
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -13,6 +14,8 @@ from app.api.deps import generate_api_key, get_db, hash_api_key
 from app.db.base import utcnow
 from app.db.models import Project
 from app.schemas.project import (
+    ProjectApiKeyResponse,
+    ProjectApiKeySyncRequest,
     ProjectCreate,
     ProjectCreateResponse,
     ProjectRead,
@@ -42,6 +45,7 @@ async def create_project(
         key=payload.key,
         name=payload.name,
         api_key_hash=hash_api_key(raw_api_key),
+        api_key=raw_api_key,
         settings_json=dict(payload.settings_json or {}),
         created_at=utcnow(),
     )
@@ -118,6 +122,7 @@ async def rotate_project_key(
 
     new_key = generate_api_key()
     project.api_key_hash = hash_api_key(new_key)
+    project.api_key = new_key
     await session.commit()
     await session.refresh(project)
 
@@ -125,4 +130,52 @@ async def rotate_project_key(
         id=project.id,
         key=project.key,
         api_key=new_key,
+    )
+
+
+@router.get("/{project_id}/api-key", response_model=ProjectApiKeyResponse)
+async def get_project_api_key(
+    project_id: uuid.UUID,
+    response: Response,
+    session: AsyncSession = Depends(get_db),
+) -> ProjectApiKeyResponse:
+    project = await session.get(Project, project_id)
+    if project is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+
+    response.headers["Cache-Control"] = "no-store"
+    return ProjectApiKeyResponse(
+        id=project.id,
+        key=project.key,
+        api_key=project.api_key,
+    )
+
+
+@router.post("/{project_id}/api-key/sync", response_model=ProjectApiKeyResponse)
+async def sync_project_api_key(
+    project_id: uuid.UUID,
+    payload: ProjectApiKeySyncRequest,
+    response: Response,
+    session: AsyncSession = Depends(get_db),
+) -> ProjectApiKeyResponse:
+    project = await session.get(Project, project_id)
+    if project is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+
+    if not hmac.compare_digest(hash_api_key(payload.api_key), project.api_key_hash):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Provided API key does not match this project",
+        )
+
+    if project.api_key != payload.api_key:
+        project.api_key = payload.api_key
+        await session.commit()
+        await session.refresh(project)
+
+    response.headers["Cache-Control"] = "no-store"
+    return ProjectApiKeyResponse(
+        id=project.id,
+        key=project.key,
+        api_key=project.api_key,
     )

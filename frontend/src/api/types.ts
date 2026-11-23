@@ -109,6 +109,16 @@ export interface ProjectRotateKeyResponse {
   api_key: string;
 }
 
+export interface ProjectApiKeyResponse {
+  id: string;
+  key: string;
+  api_key: string | null;
+}
+
+export interface ProjectApiKeySyncRequest {
+  api_key: string;
+}
+
 // ============================================================================
 // Symbols (/api/v1/symbols)
 // ============================================================================

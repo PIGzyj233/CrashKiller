@@ -29,6 +29,7 @@ class Project(Base):
     key: Mapped[str] = mapped_column(String(128), nullable=False, unique=True, index=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     api_key_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    api_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
     settings_json: Mapped[dict[str, Any]] = mapped_column(JSONBType, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(TZDateTime, nullable=False, default=utcnow)
 

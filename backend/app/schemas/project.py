@@ -56,3 +56,21 @@ class ProjectRotateKeyResponse(BaseModel):
     id: uuid.UUID
     key: str
     api_key: str
+
+
+class ProjectApiKeyResponse(BaseModel):
+    id: uuid.UUID
+    key: str
+    api_key: str | None = None
+
+
+class ProjectApiKeySyncRequest(BaseModel):
+    api_key: str = Field(min_length=1, max_length=255)
+
+    @field_validator("api_key")
+    @classmethod
+    def _strip_non_empty(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("API key must not be empty")
+        return cleaned

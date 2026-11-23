@@ -45,6 +45,8 @@ from app.schemas.log import (
     LogSummaryResponse,
 )
 from app.schemas.project import (
+    ProjectApiKeyResponse,
+    ProjectApiKeySyncRequest,
     ProjectCreate,
     ProjectCreateResponse,
     ProjectRead,
@@ -100,6 +102,8 @@ __all__ = [
     "LogSearchResponse",
     "LogSummaryResponse",
     "MissingSymbolQueueItem",
+    "ProjectApiKeyResponse",
+    "ProjectApiKeySyncRequest",
     "ProjectCreate",
     "ProjectCreateResponse",
     "ProjectRead",

@@ -472,6 +472,84 @@ async def test_health_projects_auth_and_key_rotation(api_harness: Any) -> None:
     assert new_try.status_code == 201
 
 
+async def test_project_api_key_retrieval_and_legacy_sync(api_harness: Any) -> None:
+    from app.db.models import Project
+
+    client: httpx.AsyncClient = api_harness.client
+
+    created = (
+        await client.post(
+            "/api/v1/projects",
+            json={"key": "key-inspect", "name": "Key Inspect"},
+        )
+    ).json()
+    project_id = created["id"]
+    initial_key = created["api_key"]
+
+    # List endpoint continues to omit secrets
+    listed = (await client.get("/api/v1/projects")).json()
+    assert all("api_key" not in item and "api_key_hash" not in item for item in listed)
+
+    # Admin can fetch the stored key directly with no-store cache headers
+    key_resp = await client.get(f"/api/v1/projects/{project_id}/api-key")
+    assert key_resp.status_code == 200
+    assert key_resp.headers.get("cache-control") == "no-store"
+    assert key_resp.json() == {
+        "id": project_id,
+        "key": "key-inspect",
+        "api_key": initial_key,
+    }
+
+    # Anonymous access is rejected
+    anon_resp = await client.get(f"/api/v1/projects/{project_id}/api-key", auth=None)
+    assert anon_resp.status_code == 401
+
+    # Unknown project returns 404
+    missing_resp = await client.get(f"/api/v1/projects/{uuid.uuid4()}/api-key")
+    assert missing_resp.status_code == 404
+
+    # Rotating updates the retrievable key
+    rot_resp = await client.post(f"/api/v1/projects/{project_id}/rotate-key")
+    assert rot_resp.status_code == 200
+    rotated_key = rot_resp.json()["api_key"]
+    assert rotated_key != initial_key
+
+    after_rot = await client.get(f"/api/v1/projects/{project_id}/api-key")
+    assert after_rot.status_code == 200
+    assert after_rot.json()["api_key"] == rotated_key
+
+    # Simulate a legacy pre-migration project with api_key=None in DB
+    async with api_harness.app.state.session_factory() as session:
+        row = await session.get(Project, uuid.UUID(project_id))
+        assert row is not None
+        row.api_key = None
+        await session.commit()
+
+    legacy_resp = await client.get(f"/api/v1/projects/{project_id}/api-key")
+    assert legacy_resp.status_code == 200
+    assert legacy_resp.json()["api_key"] is None
+
+    # Sync rejects a mismatched key
+    bad_sync = await client.post(
+        f"/api/v1/projects/{project_id}/api-key/sync",
+        json={"api_key": initial_key},
+    )
+    assert bad_sync.status_code == 400
+
+    # Sync accepts the matching key and persists it for future lookups
+    good_sync = await client.post(
+        f"/api/v1/projects/{project_id}/api-key/sync",
+        json={"api_key": rotated_key},
+    )
+    assert good_sync.status_code == 200
+    assert good_sync.headers.get("cache-control") == "no-store"
+    assert good_sync.json()["api_key"] == rotated_key
+
+    after_sync = await client.get(f"/api/v1/projects/{project_id}/api-key")
+    assert after_sync.status_code == 200
+    assert after_sync.json()["api_key"] == rotated_key
+
+
 async def test_symbol_upload_dedup_symsrv_and_refcounted_delete(api_harness: Any) -> None:
     client: httpx.AsyncClient = api_harness.client
 

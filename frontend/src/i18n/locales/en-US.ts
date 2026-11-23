@@ -153,7 +153,7 @@ const enUS: DeepStringify<typeof zhCN> = {
       createdTitle: "Project API Key Created: {{name}} ({{key}})",
       rotatedTitle: "Project API Key Rotated: {{name}} ({{key}})",
       descBefore:
-        "Copy this API key now — it will not be shown again. It has also been saved to browser ",
+        "Copy this API key now, or view and copy it anytime in Project Management below. It has also been saved to browser ",
       descAfter: " for UploadModal pre-fill.",
       dismissAria: "Dismiss API key banner",
       copyKey: "Copy API Key",
@@ -161,7 +161,7 @@ const enUS: DeepStringify<typeof zhCN> = {
     projects: {
       title: "Project Management & API Keys",
       subtitle:
-        "Create projects, rotate upload API keys, and override per-project triage & clustering noise rules",
+        "Create projects, view/copy or rotate upload API keys, and override per-project triage & clustering noise rules",
       createTitle: "Create New Project",
       createFailed: "Failed to create project.",
       projectKey: "Project Key",
@@ -176,6 +176,17 @@ const enUS: DeepStringify<typeof zhCN> = {
       empty:
         "No projects created yet. Create a project above to receive an upload API key.",
       keyInBrowser: "Key in Browser",
+      apiKeyLabel: "Project API Key",
+      apiKeyHeaderHint: "Used for upload authentication (X-API-Key)",
+      viewKey: "View Key",
+      showKey: "Show Key",
+      hideKey: "Hide Key",
+      copyKey: "Copy Key",
+      loadingKey: "Loading API key...",
+      keyUnavailable:
+        "This project was created before server-side key storage and has no valid key cached in this browser. Rotate the API key to generate a viewable key.",
+      loadKeyFailed: "Failed to load project API key.",
+      copyKeyFailed: "Automatic copy failed. Reveal the key and copy it manually.",
       confirmRotatePrompt: "Invalidate old API key?",
       confirmRotate: "Confirm Rotate",
       rotateKey: "Rotate API Key",
