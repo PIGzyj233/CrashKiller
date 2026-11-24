@@ -75,6 +75,7 @@ backend/.venv/bin/python cli/crashkiller_cli.py upload-crash \
   --project demo-game \
   --api-key ck_your_api_key \
   --app-version 1.4.2 \
+  --session-id sess-20261124-001 \
   --dump ./crash.dmp \
   --log ./game.log \
   --wait

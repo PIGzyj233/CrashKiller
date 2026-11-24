@@ -30,6 +30,7 @@ struct UploadConfig {
     std::string project_key;
     std::string api_key;
     std::string app_version;
+    std::string session_id;
     fs::path dump_path;
     std::vector<fs::path> log_paths;
 };
@@ -105,6 +106,9 @@ bool UploadCrashWinHttp(const UploadConfig& cfg) {
 
     add_field("project_key", cfg.project_key);
     add_field("app_version", cfg.app_version);
+    if (!cfg.session_id.empty()) {
+        add_field("session_id", cfg.session_id);
+    }
     if (!add_file("dump_file", cfg.dump_path, "application/octet-stream")) {
         return false;
     }
@@ -257,28 +261,47 @@ bool UploadCrashWinHttp(const UploadConfig& cfg) {
 }  // namespace
 
 int main(int argc, char* argv[]) {
-    if (argc < 6) {
-        std::cerr << "Usage: crashkiller_uploader <server_url> <project_key> <api_key> "
-                  << "<app_version> <dump_path> [log_path ...]\n";
+    std::string session_id;
+    std::vector<std::string> positional;
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--session-id") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --session-id requires a value\n";
+                return 2;
+            }
+            session_id = argv[++i];
+        } else if (arg.rfind("--session-id=", 0) == 0) {
+            session_id = arg.substr(13);
+        } else {
+            positional.push_back(arg);
+        }
+    }
+
+    if (positional.size() < 5) {
+        std::cerr << "Usage: crashkiller_uploader [--session-id <id>] <server_url> "
+                  << "<project_key> <api_key> <app_version> <dump_path> [log_path ...]\n";
         return 2;
     }
 
 #ifdef _WIN32
     UploadConfig cfg;
-    if (!ParseServerUrl(argv[1], cfg)) {
-        std::cerr << "Invalid server URL: " << argv[1] << "\n";
+    if (!ParseServerUrl(positional[0], cfg)) {
+        std::cerr << "Invalid server URL: " << positional[0] << "\n";
         return 2;
     }
-    cfg.project_key = argv[2];
-    cfg.api_key = argv[3];
-    cfg.app_version = argv[4];
-    cfg.dump_path = argv[5];
-    for (int i = 6; i < argc; ++i) {
-        cfg.log_paths.emplace_back(argv[i]);
+    cfg.project_key = positional[1];
+    cfg.api_key = positional[2];
+    cfg.app_version = positional[3];
+    cfg.session_id = session_id;
+    cfg.dump_path = positional[4];
+    for (size_t i = 5; i < positional.size(); ++i) {
+        cfg.log_paths.emplace_back(positional[i]);
     }
     return UploadCrashWinHttp(cfg) ? 0 : 1;
 #else
-    (void)argv;
+    (void)session_id;
+    (void)positional;
     std::cerr << "WinHTTP uploader is Windows-only. On POSIX/CI use cli/crashkiller_cli.py.\n";
     return 1;
 #endif

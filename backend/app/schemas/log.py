@@ -51,6 +51,16 @@ class LogAroundTimeResponse(BaseModel):
     window_sec: int
     start_line: int
     end_line: int
+    session_id: str | None = None
+    lines: list[LogLine]
+
+
+class LogSessionLinesResponse(BaseModel):
+    log_id: uuid.UUID
+    session_id: str
+    total_matches: int
+    start_index: int
+    end_index: int
     lines: list[LogLine]
 
 
@@ -67,4 +77,5 @@ class LogSearchResponse(BaseModel):
     total_matches: int
     truncated: bool
     elapsed_ms: float
+    session_id: str | None = None
     matches: list[LogSearchMatch]

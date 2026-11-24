@@ -27,6 +27,7 @@ import type {
   LogAroundTimeResponse,
   LogLinesResponse,
   LogSearchResponse,
+  LogSessionLinesResponse,
   LogSummaryResponse,
   MissingSymbolQueueItem,
   ProjectApiKeyResponse,
@@ -434,6 +435,7 @@ export interface ListCrashesParams {
   issue_id?: number;
   cluster_id?: string;
   app_version?: string;
+  session_id?: string;
   is_pinned?: boolean;
   is_human_verified?: boolean;
   q?: string;
@@ -449,6 +451,7 @@ export interface UploadCrashParams {
   logFiles?: File[];
   buildId?: string;
   osVersion?: string;
+  sessionId?: string;
   crashTime?: string;
   apiKey?: string;
   onProgress?: (percent: number) => void;
@@ -495,6 +498,9 @@ export function uploadCrash(
   }
   if (params.osVersion) {
     formData.append("os_version", params.osVersion);
+  }
+  if (params.sessionId) {
+    formData.append("session_id", params.sessionId);
   }
   if (params.crashTime) {
     formData.append("crash_time", params.crashTime);
@@ -605,6 +611,14 @@ export interface LogAroundTimeParams {
   timestamp: string;
   window_sec?: number;
   max_lines?: number;
+  session_id?: string;
+  only_session?: boolean;
+}
+
+export interface LogSessionLinesParams {
+  session_id?: string;
+  start?: number;
+  end?: number;
 }
 
 export interface SearchLogParams {
@@ -612,6 +626,8 @@ export interface SearchLogParams {
   is_regex?: boolean;
   max_matches?: number;
   case_sensitive?: boolean;
+  session_id?: string;
+  only_session?: boolean;
 }
 
 export function getLogSummary(logId: string): Promise<LogSummaryResponse> {
@@ -631,6 +647,20 @@ export function getLogLines(
   );
 }
 
+export function getLogSessionLines(
+  logId: string,
+  params?: LogSessionLinesParams,
+): Promise<LogSessionLinesResponse> {
+  const qs = buildQueryString({
+    session_id: params?.session_id,
+    start: params?.start ?? 1,
+    end: params?.end ?? 200,
+  });
+  return requestJson<LogSessionLinesResponse>(
+    `${API_BASE}/logs/${encodeURIComponent(logId)}/session-lines${qs}`,
+  );
+}
+
 export function getLogAroundTime(
   logId: string,
   params: LogAroundTimeParams,
@@ -639,6 +669,8 @@ export function getLogAroundTime(
     timestamp: params.timestamp,
     window_sec: params.window_sec,
     max_lines: params.max_lines,
+    session_id: params.session_id,
+    only_session: params.only_session ? true : undefined,
   });
   return requestJson<LogAroundTimeResponse>(
     `${API_BASE}/logs/${encodeURIComponent(logId)}/around-time${qs}`,
@@ -654,6 +686,8 @@ export function searchLog(
     is_regex: params.is_regex,
     max_matches: params.max_matches,
     case_sensitive: params.case_sensitive,
+    session_id: params.session_id,
+    only_session: params.only_session ? true : undefined,
   });
   return requestJson<LogSearchResponse>(
     `${API_BASE}/logs/${encodeURIComponent(logId)}/search${qs}`,

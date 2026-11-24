@@ -530,6 +530,17 @@ def resolve_project_settings(
     ):
         dump_retention_days = raw_dump_days
 
+    raw_session_label = proj.get("session_id_label")
+    session_id_label: str | None = None
+    if isinstance(raw_session_label, str):
+        cleaned_label = raw_session_label.strip()
+        if (
+            cleaned_label
+            and len(cleaned_label) <= 64
+            and not any(ch in cleaned_label for ch in ("\r", "\n", "\x00"))
+        ):
+            session_id_label = cleaned_label
+
     return {
         "ai_triage_mode": triage_mode,
         "noise_modules": noise_modules,
@@ -537,4 +548,5 @@ def resolve_project_settings(
         "replace_default_noise": replace_defaults,
         "log_retention_days": log_retention_days,
         "dump_retention_days": dump_retention_days,
+        "session_id_label": session_id_label,
     }

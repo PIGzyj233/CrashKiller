@@ -77,6 +77,7 @@ export interface ProjectSettings {
   custom_crash_handlers?: string[];
   log_retention_days?: number;
   dump_retention_days?: number;
+  session_id_label?: string | null;
   [key: string]: unknown;
 }
 
@@ -272,12 +273,28 @@ export interface LogDigestErrorEntry {
   level?: string | null;
 }
 
+export interface LogSessionDigest {
+  session_id: string;
+  match_count: number;
+  error_count: number;
+  warn_count: number;
+  first_line: number | null;
+  last_line: number | null;
+  first_ts?: string | null;
+  last_ts?: string | null;
+  trailing_lines_after_session?: number;
+  tail_lines?: LogDigestErrorEntry[];
+  recent_errors?: LogDigestErrorEntry[];
+  post_session_lines?: LogDigestErrorEntry[];
+}
+
 export interface LogDigest {
   total_lines: number;
   error_count?: number;
   warn_count?: number;
   tail_lines?: LogDigestErrorEntry[];
   recent_errors?: LogDigestErrorEntry[];
+  session?: LogSessionDigest | null;
 }
 
 export interface CrashLogRead {
@@ -315,12 +332,22 @@ export interface LogLinesResponse {
   lines: LogLine[];
 }
 
+export interface LogSessionLinesResponse {
+  log_id: string;
+  session_id: string;
+  total_matches: number;
+  start_index: number;
+  end_index: number;
+  lines: LogLine[];
+}
+
 export interface LogAroundTimeResponse {
   log_id: string;
   center_timestamp: string;
   window_sec: number;
   start_line: number;
   end_line: number;
+  session_id?: string | null;
   lines: LogLine[];
 }
 
@@ -337,6 +364,7 @@ export interface LogSearchResponse {
   total_matches: number;
   truncated: boolean;
   elapsed_ms: number;
+  session_id?: string | null;
   matches: LogSearchMatch[];
 }
 
@@ -489,6 +517,7 @@ export interface CrashSummary {
   app_version: string;
   build_id: string | null;
   os_version: string | null;
+  session_id: string | null;
   dump_raw_size: number;
   dump_compressed_size: number;
   crash_reason: string | null;
@@ -515,6 +544,8 @@ export interface CrashDetailRead extends CrashSummary {
   cluster: CrashClusterRead | null;
   issue: IssueRead | null;
   ai_runs: AIAnalysisRunRead[];
+  related_session_crashes: CrashSummary[];
+  related_session_crash_count: number;
 }
 
 export interface IssueDetailRead extends IssueRead {

@@ -233,6 +233,8 @@ def _cmd_upload_crash(args: argparse.Namespace) -> int:
         data["build_id"] = args.build_id
     if args.os_version:
         data["os_version"] = args.os_version
+    if args.session_id:
+        data["session_id"] = args.session_id
     if args.crash_time:
         data["crash_time"] = args.crash_time
 
@@ -345,6 +347,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     crash_p.add_argument("--build-id", help="Optional build identifier")
     crash_p.add_argument("--os-version", help="Optional OS version")
+    crash_p.add_argument(
+        "--session-id",
+        help="Optional custom application session identifier (e.g., FlowID / TraceID)",
+    )
     crash_p.add_argument("--crash-time", help="Optional ISO-8601 crash timestamp")
     crash_p.add_argument(
         "--wait",

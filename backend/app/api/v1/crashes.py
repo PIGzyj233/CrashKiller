@@ -66,7 +66,7 @@ from app.services.events import (
     EventBus,
     normalize_event_payload,
 )
-from app.services.log_engine import LogEngine
+from app.services.log_engine import LogEngine, normalize_session_id
 from app.services.storage import StorageCapacityError, StorageError, StorageManager
 from app.services.symbol_service import stream_decompressed_zst
 from app.workers.jobs import ACTIVE_CRASH_STATUSES, crash_has_job, stage_crash_job
@@ -121,7 +121,11 @@ def _cleanup_crash_upload_artifacts(written_files: list[Path], crash_dirs: list[
             shutil.rmtree(dir_path, ignore_errors=True)
 
 
-def _serialize_crash_detail(crash: CrashReport) -> CrashDetailRead:
+def _serialize_crash_detail(
+    crash: CrashReport,
+    related_session_crashes: list[CrashReport] | None = None,
+    related_session_crash_count: int = 0,
+) -> CrashDetailRead:
     sorted_runs = sorted(
         list(crash.ai_runs or []),
         key=lambda r: (r.created_at, str(r.id)),
@@ -141,6 +145,10 @@ def _serialize_crash_detail(crash: CrashReport) -> CrashDetailRead:
         cluster=CrashClusterRead.model_validate(crash.cluster) if crash.cluster else None,
         issue=IssueRead.model_validate(crash.issue) if crash.issue else None,
         ai_runs=[AIAnalysisRunRead.model_validate(run) for run in sorted_runs],
+        related_session_crashes=[
+            CrashSummary.model_validate(item) for item in (related_session_crashes or [])
+        ],
+        related_session_crash_count=related_session_crash_count,
     )
 
 
@@ -161,7 +169,41 @@ async def _load_crash_detail(session: AsyncSession, crash_id: uuid.UUID) -> Cras
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Crash report not found",
         )
-    return _serialize_crash_detail(crash)
+
+    related_rows: list[CrashReport] = []
+    related_count = 0
+    if crash.session_id:
+        rel_filters = (
+            CrashReport.project_id == crash.project_id,
+            CrashReport.session_id == crash.session_id,
+            CrashReport.id != crash.id,
+        )
+        related_count = int(
+            (
+                await session.execute(
+                    select(func.count()).select_from(CrashReport).where(*rel_filters)
+                )
+            ).scalar_one()
+        )
+        if related_count > 0:
+            related_rows = list(
+                (
+                    await session.execute(
+                        select(CrashReport)
+                        .where(*rel_filters)
+                        .order_by(CrashReport.crash_time.desc(), CrashReport.created_at.desc())
+                        .limit(20)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+
+    return _serialize_crash_detail(
+        crash,
+        related_session_crashes=related_rows,
+        related_session_crash_count=related_count,
+    )
 
 
 def _format_sse_event(payload: dict[str, Any]) -> str:
@@ -197,6 +239,7 @@ async def upload_crash(
     log_files: list[UploadFile] | None = File(default=None),
     build_id: str | None = Form(default=None),
     os_version: str | None = Form(default=None),
+    session_id: str | None = Form(default=None),
     crash_time: str | None = Form(default=None),
     api_key: str | None = Form(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
@@ -238,6 +281,14 @@ async def upload_crash(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="os_version must not exceed 255 characters",
         )
+
+    try:
+        cleaned_session_id = normalize_session_id(session_id)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=str(exc),
+        ) from exc
 
     parsed_crash_time = _parse_optional_crash_time(crash_time)
     effective_app, eff_storage = await get_effective_storage(session, storage, base_settings)
@@ -293,6 +344,7 @@ async def upload_crash(
                         idx_abs,
                         effective_app.LOG_CHUNK_SIZE_BYTES,
                         effective_app.LOG_ZSTD_LEVEL,
+                        cleaned_session_id,
                     )
                 except OSError as exc:
                     raise HTTPException(
@@ -324,6 +376,7 @@ async def upload_crash(
                 app_version=cleaned_version,
                 build_id=cleaned_build_id,
                 os_version=cleaned_os_version,
+                session_id=cleaned_session_id,
                 dump_path=dump_rel,
                 dump_raw_size=dump_raw_size,
                 dump_compressed_size=dump_comp_size,
@@ -368,6 +421,7 @@ async def list_crashes(
     issue_id: int | None = None,
     cluster_id: uuid.UUID | None = None,
     app_version: str | None = None,
+    session_id: str | None = None,
     is_pinned: bool | None = None,
     is_human_verified: bool | None = None,
     q: str | None = None,
@@ -388,6 +442,8 @@ async def list_crashes(
         filters.append(CrashReport.cluster_id == cluster_id)
     if app_version is not None and app_version.strip():
         filters.append(CrashReport.app_version == app_version.strip())
+    if session_id is not None and session_id.strip():
+        filters.append(CrashReport.session_id == session_id.strip())
     if is_pinned is not None:
         filters.append(CrashReport.is_pinned == is_pinned)
     if is_human_verified is not None:
@@ -401,6 +457,7 @@ async def list_crashes(
                 CrashReport.app_version.ilike(pattern),
                 CrashReport.build_id.ilike(pattern),
                 CrashReport.os_version.ilike(pattern),
+                CrashReport.session_id.ilike(pattern),
             )
         )
 

@@ -5,8 +5,12 @@ import {
   AlertTriangle,
   ArrowLeft,
   Bug,
+  Check,
   CheckCircle2,
+  Copy,
   Download,
+  FileSearch,
+  Link2,
   Loader2,
   Pin,
   Plus,
@@ -30,6 +34,7 @@ import {
 import type {
   CrashDetailRead,
   CrashStatus,
+  CrashSummary,
   CrashVerdictRequest,
   IssueStatus,
   ReprocessMode,
@@ -43,6 +48,7 @@ import {
   type LogHighlightRange,
 } from "../components/VirtualLogViewer";
 import { useAppI18n } from "../i18n";
+import { getSessionIdLabel } from "../utils/sessionLabel";
 
 const PIPELINE_STEPS: readonly CrashStatus[] = [
   "PENDING",
@@ -84,7 +90,7 @@ function getLatestAIResult(crash: CrashDetailRead | undefined) {
 }
 
 export function CrashDetailPage() {
-  const { t, formatDateTime, formatCrashStatus, formatIssueStatus } =
+  const { t, formatDateTime, formatCrashStatus, formatIssueStatus, formatVerdict } =
     useAppI18n();
   const { crashId } = useParams<{ crashId: string }>();
   const { projects } = useProjectContext();
@@ -93,6 +99,7 @@ export function CrashDetailPage() {
   const [activeLogId, setActiveLogId] = useState<string>("");
   const [highlightRange, setHighlightRange] =
     useState<LogHighlightRange | null>(null);
+  const [copiedSessionId, setCopiedSessionId] = useState(false);
   const [sseConnected, setSseConnected] = useState(false);
   const [sseStage, setSseStage] = useState<string | null>(null);
   const [sseError, setSseError] = useState<string | null>(null);
@@ -389,6 +396,46 @@ export function CrashDetailPage() {
     [crash, projects],
   );
 
+  const sessionLabel = useMemo(
+    () => getSessionIdLabel(project, t("common.sessionId")),
+    [project, t],
+  );
+
+  const handleCopySessionId = () => {
+    if (!crash?.session_id) {
+      return;
+    }
+    void navigator.clipboard?.writeText(crash.session_id).then(() => {
+      setCopiedSessionId(true);
+      window.setTimeout(() => setCopiedSessionId(false), 1800);
+    });
+  };
+
+  const handleLocateSessionLogs = () => {
+    if (!crash?.logs || crash.logs.length === 0) {
+      return;
+    }
+    const matchedLog =
+      crash.logs.find((lg) => (lg.digest_json?.session?.match_count ?? 0) > 0) ??
+      crash.logs[0];
+    if (matchedLog) {
+      setActiveLogId(matchedLog.id);
+      const lastLine = matchedLog.digest_json?.session?.last_line;
+      if (typeof lastLine === "number" && lastLine >= 1) {
+        setHighlightRange((prev) => ({
+          logId: matchedLog.id,
+          startLine: lastLine,
+          endLine: lastLine,
+          nonce: (prev?.nonce ?? 0) + 1,
+        }));
+      }
+    }
+    logViewerSectionRef.current?.scrollIntoView({
+      behavior: "smooth",
+      block: "nearest",
+    });
+  };
+
   const latestAIResult = useMemo(() => getLatestAIResult(crash), [crash]);
 
   if (!crashId) {
@@ -489,6 +536,49 @@ export function CrashDetailPage() {
                       title: crash.issue.title,
                     })}
                   </Link>
+                </>
+              )}
+              {crash.session_id && (
+                <>
+                  <span>|</span>
+                  <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-200 bg-emerald-50 px-2.5 py-0.5 text-emerald-800">
+                    <span className="font-medium">{sessionLabel}:</span>
+                    <Link
+                      to={`/crashes?session_id=${encodeURIComponent(crash.session_id)}`}
+                      title={t("crashDetail.sessionFilterLink", {
+                        label: sessionLabel,
+                      })}
+                      className="font-mono font-semibold text-emerald-700 hover:underline"
+                    >
+                      {crash.session_id}
+                    </Link>
+                    <button
+                      type="button"
+                      onClick={handleCopySessionId}
+                      aria-label={t("crashDetail.sessionCopyAria", {
+                        label: sessionLabel,
+                      })}
+                      title={t("common.copy")}
+                      className="rounded p-0.5 text-emerald-700 hover:bg-emerald-100"
+                    >
+                      {copiedSessionId ? (
+                        <Check className="h-3 w-3" />
+                      ) : (
+                        <Copy className="h-3 w-3" />
+                      )}
+                    </button>
+                    {crash.logs.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={handleLocateSessionLogs}
+                        title={t("crashDetail.sessionJumpLogs")}
+                        className="inline-flex items-center gap-0.5 rounded bg-white/80 px-1.5 py-0.5 text-[11px] font-medium text-emerald-800 hover:bg-white"
+                      >
+                        <FileSearch className="h-3 w-3" />
+                        <span>{t("crashDetail.sessionJumpLogs")}</span>
+                      </button>
+                    )}
+                  </span>
                 </>
               )}
             </div>
@@ -733,6 +823,93 @@ export function CrashDetailPage() {
             status={crash.status}
           />
 
+          {crash.session_id &&
+            (crash.related_session_crashes?.length ?? 0) > 0 && (
+              <div className="rounded-xl border border-emerald-200 bg-white p-4 shadow-sm">
+                <div className="mb-2.5 flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 text-sm font-semibold text-slate-900">
+                    <Link2 className="h-4 w-4 text-emerald-600" />
+                    <span>
+                      {t("crashDetail.relatedSessionTitle", {
+                        label: sessionLabel,
+                        id: crash.session_id,
+                        count:
+                          crash.related_session_crash_count ||
+                          crash.related_session_crashes.length,
+                      })}
+                    </span>
+                  </div>
+                  <Link
+                    to={`/crashes?session_id=${encodeURIComponent(crash.session_id)}`}
+                    className="text-xs font-medium text-indigo-600 hover:underline"
+                  >
+                    {t("crashDetail.relatedSessionViewAll", {
+                      count:
+                        (crash.related_session_crash_count ||
+                          crash.related_session_crashes.length) + 1,
+                    })}
+                  </Link>
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="min-w-full divide-y divide-slate-200 text-left text-xs">
+                    <thead>
+                      <tr className="text-slate-500">
+                        <th className="pb-1.5 pr-3 font-medium">
+                          {t("crashes.colCrashId")}
+                        </th>
+                        <th className="pb-1.5 pr-3 font-medium">
+                          {t("crashes.colReasonIssue")}
+                        </th>
+                        <th className="pb-1.5 pr-3 font-medium">
+                          {t("crashes.colVersionOs")}
+                        </th>
+                        <th className="pb-1.5 pr-3 font-medium">
+                          {t("crashes.colStatus")}
+                        </th>
+                        <th className="pb-1.5 font-medium">
+                          {t("crashes.colCrashTime")}
+                        </th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {crash.related_session_crashes.map((rel: CrashSummary) => (
+                        <tr key={rel.id} className="hover:bg-slate-50">
+                          <td className="py-1.5 pr-3">
+                            <Link
+                              to={`/crashes/${encodeURIComponent(rel.id)}`}
+                              className="font-mono font-semibold text-indigo-600 hover:underline"
+                            >
+                              {rel.id.slice(0, 8)}
+                            </Link>
+                          </td>
+                          <td className="max-w-xs truncate py-1.5 pr-3 font-mono text-slate-700">
+                            {rel.crash_reason ||
+                              t("crashes.pendingSymbolication")}
+                          </td>
+                          <td className="py-1.5 pr-3 font-mono text-slate-600">
+                            v{rel.app_version}
+                          </td>
+                          <td className="py-1.5 pr-3">
+                            <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[11px] font-medium text-slate-700">
+                              {formatCrashStatus(rel.status)}
+                            </span>
+                            {rel.ai_verdict && (
+                              <span className="ml-1 rounded bg-indigo-50 px-1.5 py-0.5 text-[11px] text-indigo-700">
+                                {formatVerdict(rel.ai_verdict)}
+                              </span>
+                            )}
+                          </td>
+                          <td className="whitespace-nowrap py-1.5 font-mono text-slate-500">
+                            {formatDateTime(rel.crash_time || rel.created_at)}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
           <div ref={logViewerSectionRef}>
             <VirtualLogViewer
               key={crash.id}
@@ -740,6 +917,8 @@ export function CrashDetailPage() {
               activeLogId={activeLogId}
               onSelectLog={setActiveLogId}
               crashTime={crash.crash_time}
+              sessionId={crash.session_id}
+              sessionLabel={sessionLabel}
               highlightRange={highlightRange}
             />
           </div>

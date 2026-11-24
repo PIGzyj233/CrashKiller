@@ -791,6 +791,16 @@ export function IssueDetailPage() {
                               >
                                 {crash.id.slice(0, 8)}
                               </Link>
+                              {crash.session_id && (
+                                <div className="mt-0.5">
+                                  <Link
+                                    to={`/crashes?session_id=${encodeURIComponent(crash.session_id)}`}
+                                    className="inline-block max-w-[160px] truncate rounded border border-emerald-200 bg-emerald-50 px-1.5 py-0.5 font-mono text-[10px] text-emerald-700 hover:bg-emerald-100"
+                                  >
+                                    {crash.session_id}
+                                  </Link>
+                                </div>
+                              )}
                               {crash.crash_reason && (
                                 <div className="max-w-[180px] truncate text-[11px] text-slate-500">
                                   {crash.crash_reason}

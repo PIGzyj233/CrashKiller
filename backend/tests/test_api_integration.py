@@ -1013,3 +1013,202 @@ async def test_settings_llm_providers_catalog_and_thinking_level_api(
         json={"llm_thinking_level": "ultra"},
     )
     assert bad_resp.status_code == 422
+
+
+async def test_crash_session_id_upload_filter_related_logs_and_project_label(
+    api_harness: Any,
+) -> None:
+    import sys
+    from pathlib import Path
+
+    client: httpx.AsyncClient = api_harness.client
+
+    # 1. Project with custom session_id_label + validation
+    proj_a_resp = await client.post(
+        "/api/v1/projects",
+        json={
+            "key": "sess-proj-a",
+            "name": "Session Project A",
+            "settings_json": {"session_id_label": "  FlowID  "},
+        },
+    )
+    assert proj_a_resp.status_code == 201
+    proj_a = proj_a_resp.json()
+    assert proj_a["settings_json"]["session_id_label"] == "FlowID"
+
+    bad_label_resp = await client.patch(
+        f"/api/v1/projects/{proj_a['id']}",
+        json={"settings_json": {"session_id_label": "x" * 65}},
+    )
+    assert bad_label_resp.status_code == 422
+
+    proj_b_resp = await client.post(
+        "/api/v1/projects",
+        json={"key": "sess-proj-b", "name": "Session Project B"},
+    )
+    assert proj_b_resp.status_code == 201
+    proj_b = proj_b_resp.json()
+
+    # 2. Invalid session_id rejected on upload
+    bad_upload = await client.post(
+        "/api/v1/crashes/upload",
+        headers={"X-API-Key": proj_a["api_key"]},
+        data={
+            "project_key": proj_a["key"],
+            "app_version": "2.0.0",
+            "session_id": "bad\nline",
+        },
+        files={"dump_file": ("crash.dmp", b"MDMP_TEST", "application/octet-stream")},
+    )
+    assert bad_upload.status_code == 422
+
+    # 3. Upload crash #1 with mid-file restart log + session_id
+    log_text = "\n".join(
+        [
+            "2026-11-24 09:50:00.000 INFO [other-flow-1] pre-crash noise",
+            "2026-11-24 10:00:01.000 INFO [flow-shared-99] session start",
+            "2026-11-24 10:00:05.000 ERROR [flow-shared-99] fatal GPU hang",
+            "2026-11-24 10:00:05.200 FATAL Unhandled exception dump start",
+            "2026-11-24 10:00:09.000 INFO === Process restarted ===",
+            "2026-11-24 10:05:00.000 ERROR [after-restart-2] unrelated error after restart",
+        ]
+    ).encode("utf-8")
+
+    up1 = await client.post(
+        "/api/v1/crashes/upload",
+        headers={"X-API-Key": proj_a["api_key"]},
+        data={
+            "project_key": proj_a["key"],
+            "app_version": "2.0.0",
+            "session_id": "  flow-shared-99  ",
+        },
+        files=[
+            ("dump_file", ("c1.dmp", b"MDMP_ONE", "application/octet-stream")),
+            ("log_files", ("runtime.log", log_text, "text/plain")),
+        ],
+    )
+    assert up1.status_code == 202
+    c1_id = up1.json()["crash_id"]
+    log1_id = up1.json()["log_ids"][0]
+
+    # Upload crash #2 in SAME project with SAME session_id
+    up2 = await client.post(
+        "/api/v1/crashes/upload",
+        headers={"X-API-Key": proj_a["api_key"]},
+        data={
+            "project_key": proj_a["key"],
+            "app_version": "2.0.0",
+            "session_id": "flow-shared-99",
+        },
+        files={"dump_file": ("c2.dmp", b"MDMP_TWO", "application/octet-stream")},
+    )
+    assert up2.status_code == 202
+    c2_id = up2.json()["crash_id"]
+
+    # Upload crash #3 in OTHER project with SAME session_id (must NOT leak into related crashes)
+    up3 = await client.post(
+        "/api/v1/crashes/upload",
+        headers={"X-API-Key": proj_b["api_key"]},
+        data={
+            "project_key": proj_b["key"],
+            "app_version": "2.0.0",
+            "session_id": "flow-shared-99",
+        },
+        files={"dump_file": ("c3.dmp", b"MDMP_THREE", "application/octet-stream")},
+    )
+    assert up3.status_code == 202
+    c3_id = up3.json()["crash_id"]
+
+    await _drain(api_harness)
+
+    # 4. Exact filter & fuzzy search by session_id
+    exact_list = (
+        await client.get(
+            "/api/v1/crashes",
+            params={"project_id": proj_a["id"], "session_id": "flow-shared-99"},
+        )
+    ).json()
+    assert exact_list["total"] == 2
+    assert {item["id"] for item in exact_list["items"]} == {c1_id, c2_id}
+    assert all(item["session_id"] == "flow-shared-99" for item in exact_list["items"])
+
+    fuzzy_list = (
+        await client.get(
+            "/api/v1/crashes",
+            params={"project_id": proj_a["id"], "q": "shared-99"},
+        )
+    ).json()
+    assert fuzzy_list["total"] == 2
+
+    # 5. Crash detail includes session_id, mid-file session digest, and isolated related crashes
+    detail = (await client.get(f"/api/v1/crashes/{c1_id}")).json()
+    assert detail["session_id"] == "flow-shared-99"
+    assert detail["related_session_crash_count"] == 1
+    assert [r["id"] for r in detail["related_session_crashes"]] == [c2_id]
+    assert c3_id not in {r["id"] for r in detail["related_session_crashes"]}
+    sess_digest = detail["logs"][0]["digest_json"]["session"]
+    assert sess_digest["match_count"] == 2
+    assert sess_digest["first_line"] == 2
+    assert sess_digest["last_line"] == 3
+    assert sess_digest["trailing_lines_after_session"] == 3
+    assert len(sess_digest["post_session_lines"]) == 3
+    assert "Unhandled exception" in sess_digest["post_session_lines"][0]["text"]
+
+    # 6. Log session-lines, session-scoped search, and session-scoped around-time
+    sess_lines_resp = await client.get(
+        f"/api/v1/logs/{log1_id}/session-lines",
+        params={"start": 1, "end": 10},
+    )
+    assert sess_lines_resp.status_code == 200
+    sl_body = sess_lines_resp.json()
+    assert sl_body["session_id"] == "flow-shared-99"
+    assert sl_body["total_matches"] == 2
+    assert [ln["line_number"] for ln in sl_body["lines"]] == [2, 3]
+
+    sess_search = (
+        await client.get(
+            f"/api/v1/logs/{log1_id}/search",
+            params={"pattern": "ERROR", "only_session": "true"},
+        )
+    ).json()
+    assert sess_search["session_id"] == "flow-shared-99"
+    assert [m["line_number"] for m in sess_search["matches"]] == [3]
+
+    sess_around = (
+        await client.get(
+            f"/api/v1/logs/{log1_id}/around-time",
+            params={
+                "timestamp": "2026-11-24T10:00:05Z",
+                "window_sec": 10,
+                "only_session": "true",
+            },
+        )
+    ).json()
+    assert sess_around["session_id"] == "flow-shared-99"
+    assert [ln["line_number"] for ln in sess_around["lines"]] == [2, 3]
+
+    # 7. CLI upload-crash parser accepts --session-id
+    cli_dir = str(Path(__file__).resolve().parents[2] / "cli")
+    if cli_dir not in sys.path:
+        sys.path.insert(0, cli_dir)
+    import crashkiller_cli
+
+    parsed_cli = crashkiller_cli.build_parser().parse_args(
+        [
+            "upload-crash",
+            "--server",
+            "http://localhost:8080",
+            "--project",
+            "demo-game",
+            "--api-key",
+            "ck_key",
+            "--app-version",
+            "2.0.0",
+            "--session-id",
+            "flow-cli-01",
+            "--dump",
+            "c.dmp",
+        ]
+    )
+    assert parsed_cli.session_id == "flow-cli-01"
+

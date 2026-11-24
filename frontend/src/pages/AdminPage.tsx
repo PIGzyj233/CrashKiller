@@ -340,6 +340,7 @@ export function AdminPage() {
   const [newProjectTriageMode, setNewProjectTriageMode] = useState<
     AITriageMode | ""
   >("");
+  const [newProjectSessionIdLabel, setNewProjectSessionIdLabel] = useState("");
 
   // Edit Project state
   const [editingProjectId, setEditingProjectId] = useState<string>("");
@@ -365,6 +366,7 @@ export function AdminPage() {
   const [editAiTriageMode, setEditAiTriageMode] = useState<AITriageMode | "">(
     "",
   );
+  const [editSessionIdLabel, setEditSessionIdLabel] = useState("");
   const [editNoiseModulesText, setEditNoiseModulesText] = useState("");
   const [editNoiseFunctionsText, setEditNoiseFunctionsText] = useState("");
   const [editCustomHandlersText, setEditCustomHandlersText] = useState("");
@@ -529,6 +531,9 @@ export function AdminPage() {
     const s = proj.settings_json ?? {};
     setEditName(proj.name);
     setEditAiTriageMode(s.ai_triage_mode ?? "");
+    setEditSessionIdLabel(
+      typeof s.session_id_label === "string" ? s.session_id_label : "",
+    );
     setEditNoiseModulesText((s.noise_modules ?? []).join("\n"));
     setEditNoiseFunctionsText((s.noise_functions ?? []).join("\n"));
     setEditCustomHandlersText((s.custom_crash_handlers ?? []).join("\n"));
@@ -644,6 +649,7 @@ export function AdminPage() {
       setNewProjectKey("");
       setNewProjectName("");
       setNewProjectTriageMode("");
+      setNewProjectSessionIdLabel("");
       setEditingProjectId(created.id);
       refreshProjects();
     },
@@ -726,6 +732,9 @@ export function AdminPage() {
     if (newProjectTriageMode) {
       settings_json.ai_triage_mode = newProjectTriageMode;
     }
+    if (newProjectSessionIdLabel.trim()) {
+      settings_json.session_id_label = newProjectSessionIdLabel.trim();
+    }
     createProjectMutation.mutate({ key, name, settings_json });
   };
 
@@ -741,6 +750,12 @@ export function AdminPage() {
       noise_functions: parseLineInput(editNoiseFunctionsText),
       custom_crash_handlers: parseLineInput(editCustomHandlersText),
     };
+
+    if (editSessionIdLabel.trim()) {
+      nextSettings.session_id_label = editSessionIdLabel.trim();
+    } else {
+      delete nextSettings.session_id_label;
+    }
 
     const logRet = Number(editLogRetentionDays.trim());
     if (editLogRetentionDays.trim() && Number.isInteger(logRet) && logRet > 0) {
@@ -1890,6 +1905,19 @@ export function AdminPage() {
                 ))}
               </select>
             </div>
+            <div>
+              <label className="block text-xs font-medium text-slate-700">
+                {t("admin.projects.sessionIdLabel")}
+              </label>
+              <input
+                type="text"
+                maxLength={64}
+                value={newProjectSessionIdLabel}
+                onChange={(e) => setNewProjectSessionIdLabel(e.target.value)}
+                placeholder={t("admin.projects.sessionIdLabelPlaceholder")}
+                className="mt-1 h-9 w-full rounded-md border border-slate-300 bg-white px-3 text-sm text-slate-900"
+              />
+            </div>
             <div className="flex items-end">
               <button
                 type="submit"
@@ -2303,7 +2331,7 @@ export function AdminPage() {
                   </div>
                 </div>
 
-                <div className="grid gap-3 sm:grid-cols-2">
+                <div className="grid gap-3 sm:grid-cols-3">
                   <div>
                     <label className="block text-xs font-medium text-slate-700">
                       {t("admin.projects.logRetentionOverride")}
@@ -2328,6 +2356,19 @@ export function AdminPage() {
                       onChange={(e) => setEditDumpRetentionDays(e.target.value)}
                       placeholder={t("admin.projects.inheritGlobalPlaceholder")}
                       className="mt-1 h-9 w-full rounded-md border border-slate-300 px-3 font-mono text-sm text-slate-900"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-slate-700">
+                      {t("admin.projects.sessionIdLabel")}
+                    </label>
+                    <input
+                      type="text"
+                      maxLength={64}
+                      value={editSessionIdLabel}
+                      onChange={(e) => setEditSessionIdLabel(e.target.value)}
+                      placeholder={t("admin.projects.sessionIdLabelPlaceholder")}
+                      className="mt-1 h-9 w-full rounded-md border border-slate-300 px-3 text-sm text-slate-900"
                     />
                   </div>
                 </div>

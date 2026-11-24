@@ -13,6 +13,7 @@ cmake --build build --config Release
 
 ```powershell
 .\build\Release\crashkiller_uploader.exe `
+  --session-id sess-20261124-001 `
   http://localhost:8080 `
   demo-game `
   ck_your_project_api_key `

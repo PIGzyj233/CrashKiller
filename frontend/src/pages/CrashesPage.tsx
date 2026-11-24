@@ -27,6 +27,7 @@ import type { AIVerdict, CrashStatus, CrashSummary } from "../api/types";
 import { useProjectContext } from "../components/Layout";
 import { UploadModal } from "../components/UploadModal";
 import { useAppI18n } from "../i18n";
+import { getSessionIdLabel } from "../utils/sessionLabel";
 
 const PAGE_SIZE = 25;
 
@@ -109,11 +110,22 @@ export function CrashesPage() {
       ? Number(rawIssueId)
       : undefined;
   const clusterIdFilter = searchParams.get("cluster_id")?.trim() || undefined;
+  const sessionIdUrlFilter = searchParams.get("session_id")?.trim() || undefined;
+  const activeSessionLabel = getSessionIdLabel(
+    selectedProject,
+    t("common.sessionId"),
+  );
 
   // Local filters
   const [verdictFilter, setVerdictFilter] = useState<"" | AIVerdict>("");
   const [appVersionInput, setAppVersionInput] = useState("");
   const [debouncedAppVersion, setDebouncedAppVersion] = useState("");
+  const [sessionIdInput, setSessionIdInput] = useState(
+    () => sessionIdUrlFilter ?? "",
+  );
+  const [debouncedSessionId, setDebouncedSessionId] = useState(
+    () => sessionIdUrlFilter ?? "",
+  );
   const [verifiedFilter, setVerifiedFilter] = useState<
     "all" | "verified" | "unverified"
   >("all");
@@ -132,12 +144,18 @@ export function CrashesPage() {
   const pendingCrashNavRef = useRef<string | null>(null);
 
   useEffect(() => {
+    setSessionIdInput(sessionIdUrlFilter ?? "");
+    setDebouncedSessionId(sessionIdUrlFilter ?? "");
+  }, [sessionIdUrlFilter]);
+
+  useEffect(() => {
     const timer = window.setTimeout(() => {
       setDebouncedQ(searchInput.trim());
       setDebouncedAppVersion(appVersionInput.trim());
+      setDebouncedSessionId(sessionIdInput.trim());
     }, 300);
     return () => window.clearTimeout(timer);
-  }, [searchInput, appVersionInput]);
+  }, [searchInput, appVersionInput, sessionIdInput]);
 
   useEffect(() => {
     setOffset(0);
@@ -146,8 +164,10 @@ export function CrashesPage() {
     statusFilter,
     parsedIssueId,
     clusterIdFilter,
+    sessionIdUrlFilter,
     verdictFilter,
     debouncedAppVersion,
+    debouncedSessionId,
     verifiedFilter,
     pinnedFilter,
     debouncedQ,
@@ -171,6 +191,8 @@ export function CrashesPage() {
         ? false
         : undefined;
 
+  const effectiveSessionId = sessionIdUrlFilter || debouncedSessionId || undefined;
+
   const crashesQuery = useQuery({
     queryKey: [
       "crashes",
@@ -181,6 +203,7 @@ export function CrashesPage() {
         issue_id: parsedIssueId ?? null,
         cluster_id: clusterIdFilter ?? null,
         app_version: debouncedAppVersion,
+        session_id: effectiveSessionId ?? "",
         is_pinned: isPinnedParam ?? null,
         is_human_verified: isVerifiedParam ?? null,
         q: debouncedQ,
@@ -196,6 +219,7 @@ export function CrashesPage() {
         issue_id: parsedIssueId,
         cluster_id: clusterIdFilter,
         app_version: debouncedAppVersion || undefined,
+        session_id: effectiveSessionId,
         is_pinned: isPinnedParam,
         is_human_verified: isVerifiedParam,
         q: debouncedQ || undefined,
@@ -249,6 +273,8 @@ export function CrashesPage() {
   const handleResetFilters = () => {
     setVerdictFilter("");
     setAppVersionInput("");
+    setSessionIdInput("");
+    setDebouncedSessionId("");
     setVerifiedFilter("all");
     setPinnedFilter("all");
     setSearchInput("");
@@ -258,6 +284,7 @@ export function CrashesPage() {
         next.delete("status");
         next.delete("issue_id");
         next.delete("cluster_id");
+        next.delete("session_id");
         return next;
       },
       { replace: true },
@@ -293,11 +320,13 @@ export function CrashesPage() {
     statusFilter ||
       verdictFilter ||
       appVersionInput ||
+      sessionIdInput ||
       verifiedFilter !== "all" ||
       pinnedFilter !== "all" ||
       searchInput ||
       parsedIssueId ||
-      clusterIdFilter,
+      clusterIdFilter ||
+      sessionIdUrlFilter,
   );
 
   const scopeLabel = selectedProject
@@ -350,7 +379,7 @@ export function CrashesPage() {
 
       {/* Filters Toolbar */}
       <div className="space-y-3 rounded-xl border border-slate-200 bg-white p-3.5 shadow-sm">
-        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-6">
+        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-7">
           <div className="relative lg:col-span-2">
             <Search className="pointer-events-none absolute left-3 top-2.5 h-4 w-4 text-slate-400" />
             <input
@@ -361,6 +390,25 @@ export function CrashesPage() {
               className="h-9 w-full rounded-md border border-slate-300 pl-9 pr-3 text-sm text-slate-900 placeholder:text-slate-400 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
             />
           </div>
+
+          <input
+            type="text"
+            value={sessionIdInput}
+            onChange={(e) => {
+              const val = e.target.value;
+              setSessionIdInput(val);
+              if (sessionIdUrlFilter && val.trim() !== sessionIdUrlFilter) {
+                setUrlParam("session_id", undefined);
+              }
+            }}
+            placeholder={t("crashes.sessionIdPlaceholder", {
+              label: activeSessionLabel,
+            })}
+            aria-label={t("crashes.filterSessionIdAria", {
+              label: activeSessionLabel,
+            })}
+            className="h-9 rounded-md border border-slate-300 px-3 font-mono text-xs text-slate-900 placeholder:font-sans placeholder:text-slate-400 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+          />
 
           <select
             aria-label={t("crashes.filterStatusAria")}
@@ -437,7 +485,10 @@ export function CrashesPage() {
         </div>
 
         {/* Active URL Scope Chips + Reset */}
-        {(parsedIssueId !== undefined || clusterIdFilter || hasAnyFilter) && (
+        {(parsedIssueId !== undefined ||
+          clusterIdFilter ||
+          sessionIdUrlFilter ||
+          hasAnyFilter) && (
           <div className="flex flex-wrap items-center gap-2 pt-1 text-xs">
             {parsedIssueId !== undefined && (
               <span className="inline-flex items-center gap-1 rounded-full border border-indigo-200 bg-indigo-50 px-2.5 py-0.5 font-medium text-indigo-700">
@@ -460,6 +511,28 @@ export function CrashesPage() {
                   onClick={() => setUrlParam("cluster_id", undefined)}
                   className="rounded-full p-0.5 hover:bg-indigo-100"
                   aria-label={t("crashes.clearClusterFilter")}
+                >
+                  <X className="h-3 w-3" />
+                </button>
+              </span>
+            )}
+            {sessionIdUrlFilter && (
+              <span className="inline-flex items-center gap-1 rounded-full border border-emerald-200 bg-emerald-50 px-2.5 py-0.5 font-mono font-medium text-emerald-700">
+                {t("crashes.sessionChip", {
+                  label: activeSessionLabel,
+                  id: sessionIdUrlFilter,
+                })}
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSessionIdInput("");
+                    setDebouncedSessionId("");
+                    setUrlParam("session_id", undefined);
+                  }}
+                  className="rounded-full p-0.5 hover:bg-emerald-100"
+                  aria-label={t("crashes.clearSessionFilter", {
+                    label: activeSessionLabel,
+                  })}
                 >
                   <X className="h-3 w-3" />
                 </button>
@@ -579,6 +652,25 @@ export function CrashesPage() {
                             <span className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[11px] text-slate-600">
                               {project.key}
                             </span>
+                          </div>
+                        )}
+                        {crash.session_id && (
+                          <div className="mt-1">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setUrlParam("session_id", crash.session_id || undefined)
+                              }
+                              title={t("crashes.filterBySessionTitle", {
+                                label: getSessionIdLabel(
+                                  project,
+                                  t("common.sessionId"),
+                                ),
+                              })}
+                              className="max-w-[160px] truncate rounded border border-emerald-200 bg-emerald-50 px-1.5 py-0.5 font-mono text-[11px] text-emerald-700 hover:bg-emerald-100"
+                            >
+                              {crash.session_id}
+                            </button>
                           </div>
                         )}
                       </td>

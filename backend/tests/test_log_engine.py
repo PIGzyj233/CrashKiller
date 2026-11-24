@@ -654,3 +654,121 @@ def test_parse_ts_invalid_tz_offset_no_crash(tmp_path: Path) -> None:
     assert nano_dt is not None
     assert nano_dt.hour == 2
     assert nano_dt.microsecond == 123456
+
+
+def test_session_midfile_restart_digest_boundary_and_filtering(tmp_path: Path) -> None:
+    """Mid-file crashing session followed by untagged fatal + process restart + new session."""
+    from app.services.log_engine import normalize_session_id
+
+    assert normalize_session_id("  flow-mid-42  ") == "flow-mid-42"
+    assert normalize_session_id("   ") is None
+    with pytest.raises(ValueError):
+        normalize_session_id("bad\nsession")
+    with pytest.raises(ValueError):
+        normalize_session_id("x" * 129)
+
+    lines: list[str] = []
+    # Lines 1..20: earlier session
+    for i in range(1, 21):
+        lvl = "ERROR" if i == 10 else "INFO"
+        lines.append(f"2026-11-24 09:00:{i:02d}.000 {lvl} [old-sess-000] earlier activity {i}")
+    # Lines 21..35: target crashing session (mixed case in log vs lowercase upload)
+    for i in range(1, 16):
+        if i == 5:
+            lvl = "WARN"
+        elif i in (12, 15):
+            lvl = "ERROR"
+        else:
+            lvl = "INFO"
+        lines.append(
+            f"2026-11-24 10:15:{i:02d}.000 {lvl} [Flow-MID-42] render step {i} payload={'z' * 24}"
+        )
+    # Lines 36..40: untagged crash moment & process restart boundary
+    lines.append("2026-11-24 10:15:15.500 FATAL Unhandled exception 0xC0000005 writing dump")
+    lines.append("2026-11-24 10:15:18.000 INFO === Process auto-restarted pid=9912 ===")
+    # Lines 38..97: 60 lines of post-restart new session with unrelated errors
+    for i in range(1, 61):
+        lvl = "ERROR" if i % 10 == 0 else "INFO"
+        lines.append(
+            f"2026-11-24 11:00:{i % 60:02d}.000 {lvl} "
+            f"[new-sess-999] post-restart work {i} {'q' * 24}"
+        )
+
+    raw_log = tmp_path / "restart_multi.log"
+    zst_path = tmp_path / "restart_multi.log.zst"
+    idx_path = tmp_path / "restart_multi.idx.json"
+    raw_log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    engine = LogEngine()
+    res = engine.ingest_log(
+        raw_log,
+        zst_path,
+        idx_path,
+        chunk_size_bytes=512,
+        session_id="flow-mid-42",
+    )
+
+    digest = res["digest_json"]
+    sess = digest["session"]
+    assert sess["session_id"] == "flow-mid-42"
+    assert sess["match_count"] == 15
+    assert sess["error_count"] == 2
+    assert sess["warn_count"] == 1
+    assert sess["first_line"] == 21
+    assert sess["last_line"] == 35
+    assert sess["first_ts"].startswith("2026-11-24T10:15:01")
+    assert sess["last_ts"].startswith("2026-11-24T10:15:15")
+    assert sess["trailing_lines_after_session"] == len(lines) - 35
+    assert [e["line_number"] for e in sess["recent_errors"]] == [32, 35]
+    assert len(sess["tail_lines"]) == 15
+    # Post-session lines capture untagged FATAL + restart banner right after L35
+    assert len(sess["post_session_lines"]) == 30
+    assert sess["post_session_lines"][0]["line_number"] == 36
+    assert "Unhandled exception" in sess["post_session_lines"][0]["text"]
+    assert "auto-restarted" in sess["post_session_lines"][1]["text"]
+
+    # Indexed fast-path pagination over session lines preserves real line numbers
+    page1 = engine.read_session_lines(zst_path, idx_path, "flow-mid-42", 1, 5)
+    assert page1["total_matches"] == 15
+    assert page1["start_index"] == 1
+    assert page1["end_index"] == 5
+    assert [r["line_number"] for r in page1["lines"]] == [21, 22, 23, 24, 25]
+
+    page2 = engine.read_session_lines(zst_path, idx_path, "FLOW-MID-42", 11, 20)
+    assert page2["total_matches"] == 15
+    assert page2["start_index"] == 11
+    assert page2["end_index"] == 15
+    assert [r["line_number"] for r in page2["lines"]] == [31, 32, 33, 34, 35]
+
+    # Session-filtered search skips unrelated chunks and ignores post-restart errors
+    search_res = engine.search(
+        zst_path,
+        idx_path,
+        pattern="ERROR",
+        session_id="flow-mid-42",
+    )
+    assert [m["line_number"] for m in search_res["matches"]] == [32, 35]
+    assert search_res["scanned_chunks"] < len(res["idx_data"]["chunks"])
+
+    # Session-filtered read_around_time returns only target session lines
+    around_res = engine.read_around_time(
+        zst_path,
+        idx_path,
+        target_time="2026-11-24 10:15:15.000",
+        window_seconds=3,
+        session_id="flow-mid-42",
+    )
+    assert [r["line_number"] for r in around_res] == [32, 33, 34, 35]
+
+    # Legacy index fallback (without session_id / session_match_count) still works identically
+    legacy_idx = json.loads(idx_path.read_text(encoding="utf-8"))
+    legacy_idx.pop("session_id", None)
+    for chunk in legacy_idx["chunks"]:
+        chunk.pop("session_match_count", None)
+    legacy_idx_path = tmp_path / "legacy.idx.json"
+    legacy_idx_path.write_text(json.dumps(legacy_idx), encoding="utf-8")
+
+    fallback_page = engine.read_session_lines(zst_path, legacy_idx_path, "flow-mid-42", 1, 5)
+    assert fallback_page["total_matches"] == 15
+    assert [r["line_number"] for r in fallback_page["lines"]] == [21, 22, 23, 24, 25]
+

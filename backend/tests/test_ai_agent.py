@@ -2280,3 +2280,250 @@ async def test_structured_evidence_blank_logs_second_thread_and_ip_only_frames(
     await db_session.refresh(ip_only_crash)
     assert ip_only_crash.ai_verdict == "NEEDS_REVIEW"
     assert ip_only_crash.ai_confidence == 0.25
+
+
+async def test_ai_agent_session_midfile_restart_tools_fallback_and_trim_priority(
+    db_session: AsyncSession,
+    storage_manager: StorageManager,
+    test_settings: Settings,
+    tmp_path: Path,
+) -> None:
+    """AI agent gets mid-file session context, related crashes, fallback, and trim priority."""
+    proj = Project(
+        key=f"sess-ai-{uuid.uuid4().hex[:6]}",
+        name="Session AI Project",
+        api_key_hash=hashlib.sha256(b"key").hexdigest(),
+        settings_json={"session_id_label": "FlowID"},
+    )
+    db_session.add(proj)
+    await db_session.flush()
+
+    # Delayed manual upload: crash_time is 4 hours AFTER the actual crashing session in the log
+    delayed_upload_time = datetime(2026, 11, 24, 14, 0, 0, tzinfo=UTC)
+    stacks = {
+        "crashing_thread_index": 0,
+        "threads": [
+            {
+                "thread_index": 0,
+                "thread_id": 100,
+                "thread_name": "MainThread",
+                "frames": [
+                    {
+                        "frame_index": 0,
+                        "module": "Renderer.dll",
+                        "function": "Renderer::Present()",
+                        "module_offset": "0x200",
+                        "file": "present.cpp",
+                        "line": 88,
+                        "missing_symbols": False,
+                        "inlines": [],
+                    }
+                ],
+            }
+        ],
+        "modules": [],
+    }
+    crash = CrashReport(
+        project_id=proj.id,
+        status="TRIAGING",
+        app_version="2.1.0",
+        session_id="flow-crash-777",
+        crash_reason="EXCEPTION_ACCESS_VIOLATION_READ",
+        crash_address="0x0",
+        parsed_summary_json={"top_frames": stacks["threads"][0]["frames"]},
+        parsed_stacks_json=stacks,
+        missing_symbols_json=[],
+        crash_time=delayed_upload_time,
+    )
+    sibling = CrashReport(
+        project_id=proj.id,
+        status="ANALYZED",
+        app_version="2.1.0",
+        session_id="flow-crash-777",
+        crash_reason="EXCEPTION_ILLEGAL_INSTRUCTION",
+        crash_address="0x40",
+        crash_time=delayed_upload_time - timedelta(minutes=1),
+    )
+    db_session.add_all([crash, sibling])
+    await db_session.flush()
+
+    log_id = uuid.uuid4()
+    raw_log = tmp_path / "midfile_ai.log"
+    raw_log.write_text(
+        "\n".join(
+            [
+                "2026-11-24 09:00:01.000 INFO [old-flow-001] old boot",
+                "2026-11-24 10:00:01.000 INFO [flow-crash-777] streaming start",
+                "2026-11-24 10:00:08.000 ERROR [flow-crash-777] DXGI_ERROR_DEVICE_REMOVED",
+                "2026-11-24 10:00:08.200 FATAL Unhandled exception 0xC0000005 writing minidump",
+                "2026-11-24 10:00:12.000 INFO === Process auto-restarted ===",
+                "2026-11-24 13:55:00.000 ERROR [restarted-flow-888] unrelated network timeout",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    rel_zst = f"logs/{crash.id}/{log_id}.log.zst"
+    rel_idx = f"logs/{crash.id}/{log_id}.idx.json"
+    abs_zst = storage_manager.resolve_path(rel_zst)
+    abs_idx = storage_manager.resolve_path(rel_idx)
+    abs_zst.parent.mkdir(parents=True, exist_ok=True)
+    ingest_res = LogEngine().ingest_log(
+        raw_log,
+        abs_zst,
+        abs_idx,
+        session_id=crash.session_id,
+    )
+    db_session.add(
+        CrashLog(
+            id=log_id,
+            crash_id=crash.id,
+            filename="runtime.log",
+            zst_path=rel_zst,
+            idx_path=rel_idx,
+            raw_size=ingest_res["raw_size"],
+            compressed_size=ingest_res["compressed_size"],
+            total_lines=ingest_res["total_lines"],
+            digest_json=ingest_res["digest_json"],
+        )
+    )
+    await db_session.commit()
+
+    observed_tools: dict[str, dict[str, Any]] = {}
+
+    def handler(step: int, kwargs: dict[str, Any]) -> Any:
+        messages = kwargs["messages"]
+        if step == 1:
+            assert "session_id [FlowID]=flow-crash-777" in messages[1]["content"]
+            return _make_response(
+                tool_calls=[{"id": "c1", "name": "get_crash_overview", "arguments": {}}]
+            )
+        if step == 2:
+            observed_tools["overview"] = json.loads(messages[-1]["content"])
+            return _make_response(
+                tool_calls=[
+                    {
+                        "id": "c2",
+                        "name": "get_log_summary",
+                        "arguments": {"log_id": str(log_id)},
+                    }
+                ]
+            )
+        if step == 3:
+            observed_tools["summary"] = json.loads(messages[-1]["content"])
+            return _make_response(
+                tool_calls=[
+                    {
+                        "id": "c3",
+                        "name": "read_log_around_time",
+                        "arguments": {"log_id": str(log_id), "only_session": True},
+                    }
+                ]
+            )
+        if step == 4:
+            observed_tools["around"] = json.loads(messages[-1]["content"])
+            return _make_response(
+                tool_calls=[
+                    {
+                        "id": "c4",
+                        "name": "search_log",
+                        "arguments": {
+                            "log_id": str(log_id),
+                            "pattern": "ERROR",
+                            "only_session": True,
+                        },
+                    }
+                ]
+            )
+        if step == 5:
+            observed_tools["search"] = json.loads(messages[-1]["content"])
+            return _make_response(
+                content=json.dumps(
+                    {
+                        "verdict": "NEW_ISSUE",
+                        "matched_issue_id": None,
+                        "confidence": 0.93,
+                        "suggested_title": "DXGI device removed in Renderer::Present",
+                        "root_cause_analysis": (
+                            "Mid-file session flow-crash-777 hit DXGI_ERROR_DEVICE_REMOVED at L3 "
+                            "followed by untagged fatal crash at L4 before process restart."
+                        ),
+                        "reasoning_summary": (
+                            "Isolated flow-crash-777 from post-restart noise via session tools."
+                        ),
+                        "evidence_log_snippets": [
+                            {
+                                "log_id": str(log_id),
+                                "start_line": 2,
+                                "end_line": 4,
+                                "relevance": "Session error and untagged crash boundary",
+                            }
+                        ],
+                        "key_log_patterns": ["DXGI_ERROR_DEVICE_REMOVED"],
+                        "suggested_component": "Rendering",
+                    }
+                )
+            )
+        raise AssertionError(f"Unexpected step {step}")
+
+    agent = AITriageAgent(storage=storage_manager, settings=test_settings)
+    run = await agent.run_triage(db_session, crash, openai_client=FakeOpenAIClient(handler))
+    assert run.status == "COMPLETED"
+
+    ov = observed_tools["overview"]
+    assert ov["session_id"] == "flow-crash-777"
+    assert ov["session_id_label"] == "FlowID"
+    assert ov["related_session_crash_count"] == 1
+    assert ov["related_session_crashes"][0]["crash_id"] == str(sibling.id)
+    assert ov["logs"][0]["session_first_line"] == 2
+    assert ov["logs"][0]["session_last_line"] == 3
+    assert ov["logs"][0]["trailing_lines_after_session"] == 3
+
+    sm = observed_tools["summary"]
+    assert sm["session_id"] == "flow-crash-777"
+    assert [e["line_number"] for e in sm["session_recent_errors"]] == [3]
+    assert len(sm["post_session_lines"]) == 3
+    assert "Unhandled exception" in sm["post_session_lines"][0]["text"]
+
+    # Automatic fallback from delayed upload crash_time to session_last_ts
+    around = observed_tools["around"]
+    assert around["session_id"] == "flow-crash-777"
+    assert around["anchored_to"] == "session_last_ts"
+    assert [ln["line_number"] for ln in around["lines"]] == [2, 3]
+
+    srch = observed_tools["search"]
+    assert srch["session_id"] == "flow-crash-777"
+    assert [m["line_number"] for m in srch["matches"]] == [3]
+
+    # Tool output trimmer prioritizes session errors/tail/post-session over global noise
+    noisy_summary = {
+        "log_id": str(log_id),
+        "filename": "runtime.log",
+        "session_id": "flow-crash-777",
+        "session_recent_errors": [
+            {"line_number": 3, "text": "DXGI_ERROR_DEVICE_REMOVED [flow-crash-777]"}
+        ],
+        "session_tail_lines": [
+            {"line_number": 2, "text": "streaming start [flow-crash-777]"}
+        ],
+        "post_session_lines": [
+            {"line_number": 4, "text": "FATAL Unhandled exception writing minidump"}
+        ],
+        "recent_errors": [
+            {"line_number": 100 + i, "text": f"unrelated post-restart error {i} " + ("N" * 80)}
+            for i in range(20)
+        ],
+        "tail_lines": [
+            {"line_number": 200 + i, "text": f"unrelated post-restart tail {i} " + ("T" * 80)}
+            for i in range(20)
+        ],
+    }
+    _text, trimmed = _prepare_tool_output_for_llm(
+        "get_log_summary", json.dumps(noisy_summary), max_chars=700
+    )
+    assert trimmed is not None
+    assert len(trimmed["session_recent_errors"]) == 1
+    assert len(trimmed["session_tail_lines"]) == 1
+    assert len(trimmed["post_session_lines"]) == 1
+    assert len(trimmed["recent_errors"]) < 20
+

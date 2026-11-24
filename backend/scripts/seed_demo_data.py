@@ -232,11 +232,42 @@ async def seed_demo_data() -> None:
                     "is_pinned": True,
                     "is_verified": True,
                     "age_hours": 3,
+                    "session_id": "sess-demo-render-001",
                     "log_lines": [
-                        "2026-11-22 10:00:00.000 INFO Engine boot v1.4.2",
-                        "2026-11-22 10:00:05.120 WARN Texture cache eviction pressure high",
-                        "2026-11-22 10:00:08.450 ERROR TextureHandle invalid for slot 4",
-                        "2026-11-22 10:00:08.900 FATAL DX12_ERR_DEVICE_REMOVED during SubmitFrame",
+                        (
+                            "2026-11-22 09:55:00.000 INFO [sess-demo-prev-000] "
+                            "Previous session started"
+                        ),
+                        (
+                            "2026-11-22 09:59:50.000 INFO [sess-demo-prev-000] "
+                            "Previous session ended cleanly"
+                        ),
+                        "2026-11-22 10:00:00.000 INFO [sess-demo-render-001] Engine boot v1.4.2",
+                        (
+                            "2026-11-22 10:00:05.120 WARN [sess-demo-render-001] "
+                            "Texture cache eviction pressure high"
+                        ),
+                        (
+                            "2026-11-22 10:00:08.450 ERROR [sess-demo-render-001] "
+                            "TextureHandle invalid for slot 4"
+                        ),
+                        (
+                            "2026-11-22 10:00:08.900 FATAL [sess-demo-render-001] "
+                            "DX12_ERR_DEVICE_REMOVED during SubmitFrame"
+                        ),
+                        (
+                            "2026-11-22 10:00:08.950 FATAL Unhandled exception 0xC0000005, "
+                            "writing minidump"
+                        ),
+                        "2026-11-22 10:00:12.000 INFO === Process auto-restarted (pid=8842) ===",
+                        (
+                            "2026-11-22 10:01:00.000 INFO [sess-demo-after-002] "
+                            "New session started after restart"
+                        ),
+                        (
+                            "2026-11-22 10:05:00.000 ERROR [sess-demo-after-002] "
+                            "Unrelated post-restart transient network timeout"
+                        ),
                     ],
                 },
                 {
@@ -257,10 +288,17 @@ async def seed_demo_data() -> None:
                     "is_pinned": False,
                     "is_verified": False,
                     "age_hours": 28,
+                    "session_id": "sess-demo-render-001",
                     "log_lines": [
-                        "2026-11-21 09:10:00.000 INFO Engine boot v1.4.1",
-                        "2026-11-21 09:10:03.220 ERROR TextureHandle invalid for slot 2",
-                        "2026-11-21 09:10:03.500 FATAL DX12_ERR_DEVICE_REMOVED during SubmitFrame",
+                        "2026-11-21 09:10:00.000 INFO [sess-demo-render-001] Engine boot v1.4.1",
+                        (
+                            "2026-11-21 09:10:03.220 ERROR [sess-demo-render-001] "
+                            "TextureHandle invalid for slot 2"
+                        ),
+                        (
+                            "2026-11-21 09:10:03.500 FATAL [sess-demo-render-001] "
+                            "DX12_ERR_DEVICE_REMOVED during SubmitFrame"
+                        ),
                     ],
                 },
                 {
@@ -441,6 +479,7 @@ async def seed_demo_data() -> None:
                     app_version=spec["app_version"],
                     build_id="demo-build-42",
                     os_version="Windows 11 23H2",
+                    session_id=spec.get("session_id"),
                     dump_path=dump_rel,
                     dump_raw_size=dump_raw_sz,
                     dump_compressed_size=dump_comp_sz,
@@ -472,6 +511,7 @@ async def seed_demo_data() -> None:
                     idx_abs,
                     chunk_size_bytes=settings.LOG_CHUNK_SIZE_BYTES,
                     zstd_level=settings.LOG_ZSTD_LEVEL,
+                    session_id=spec.get("session_id"),
                 )
                 session.add(
                     CrashLog(

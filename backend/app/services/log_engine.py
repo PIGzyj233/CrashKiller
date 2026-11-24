@@ -110,6 +110,34 @@ def _split_chunk_lines(raw_text: str) -> list[str]:
     return (raw_text[:-1] if raw_text.endswith("\n") else raw_text).split("\n")
 
 
+MAX_SESSION_ID_LENGTH = 128
+POST_SESSION_CONTEXT_LINES = 30
+
+
+def normalize_session_id(raw: str | None) -> str | None:
+    """Validate and normalize an optional custom session_id."""
+    if raw is None:
+        return None
+    if any(ch in raw for ch in ("\r", "\n", "\x00")):
+        raise ValueError("session_id must not contain control characters")
+    cleaned = raw.strip()
+    if not cleaned:
+        return None
+    if len(cleaned) > MAX_SESSION_ID_LENGTH:
+        raise ValueError(f"session_id must not exceed {MAX_SESSION_ID_LENGTH} characters")
+    return cleaned
+
+
+def _session_ascii_needle(session_lower: str) -> bytes | None:
+    """Return lowercase UTF-8 bytes needle for sound C-speed chunk prefiltering when ASCII."""
+    return session_lower.encode("utf-8") if session_lower.isascii() else None
+
+
+def _index_matches_session(idx_data: dict[str, Any], session_lower: str) -> bool:
+    raw = idx_data.get("session_id")
+    return isinstance(raw, str) and raw.lower() == session_lower
+
+
 _TYPE_FLAGS = _rp.TYPE_FLAGS
 _REPEAT_OPS = frozenset({_rc.MIN_REPEAT, _rc.MAX_REPEAT, _rc.POSSESSIVE_REPEAT})
 _SPACE_CATS = frozenset({_rc.CATEGORY_SPACE, _rc.CATEGORY_UNI_SPACE})
@@ -832,8 +860,12 @@ class LogEngine:
         idx_path: Path | str,
         chunk_size_bytes: int = 262144,
         zstd_level: int = 6,
+        session_id: str | None = None,
     ) -> dict[str, Any]:
         """Stream-ingest a raw log into 256KB newline-aligned zstd frames + .idx.json."""
+        cleaned_session_id = normalize_session_id(session_id)
+        session_lower = cleaned_session_id.lower() if cleaned_session_id is not None else None
+
         zst_dest = Path(zst_path)
         idx_dest = Path(idx_path)
         zst_dest.parent.mkdir(parents=True, exist_ok=True)
@@ -846,6 +878,17 @@ class LogEngine:
         chunks_meta: list[dict[str, Any]] = []
         tail_lines: deque[dict[str, Any]] = deque(maxlen=100)
         recent_errors: deque[dict[str, Any]] = deque(maxlen=50)
+
+        session_tail_lines: deque[dict[str, Any]] = deque(maxlen=100)
+        session_recent_errors: deque[dict[str, Any]] = deque(maxlen=50)
+        post_session_lines: list[dict[str, Any]] = []
+        session_match_count = 0
+        session_error_count = 0
+        session_warn_count = 0
+        session_first_line: int | None = None
+        session_last_line: int | None = None
+        session_first_ts: str | None = None
+        session_last_ts: str | None = None
 
         raw_size = 0
         compressed_size = 0
@@ -861,12 +904,13 @@ class LogEngine:
         chunk_max_ts: str | None = None
         chunk_error_count = 0
         chunk_warn_count = 0
+        chunk_session_match_count = 0
 
         def _flush_chunk(zst_fh: BinaryIO) -> None:
             nonlocal compressed_size
             nonlocal chunk_start_line, chunk_first_ts, chunk_last_ts
             nonlocal chunk_min_dt, chunk_min_ts, chunk_max_dt, chunk_max_ts
-            nonlocal chunk_error_count, chunk_warn_count
+            nonlocal chunk_error_count, chunk_warn_count, chunk_session_match_count
             if not chunk_buf:
                 return
             frame = compressor.compress(bytes(chunk_buf))
@@ -874,22 +918,23 @@ class LogEngine:
             zst_fh.write(frame)
             frame_len = len(frame)
             compressed_size += frame_len
-            chunks_meta.append(
-                {
-                    "chunk_id": len(chunks_meta),
-                    "byte_offset": byte_offset,
-                    "compressed_size": frame_len,
-                    "uncompressed_size": len(chunk_buf),
-                    "start_line": chunk_start_line,
-                    "end_line": total_lines,
-                    "first_ts": chunk_first_ts,
-                    "last_ts": chunk_last_ts,
-                    "min_ts": chunk_min_ts,
-                    "max_ts": chunk_max_ts,
-                    "error_count": chunk_error_count,
-                    "warn_count": chunk_warn_count,
-                }
-            )
+            meta: dict[str, Any] = {
+                "chunk_id": len(chunks_meta),
+                "byte_offset": byte_offset,
+                "compressed_size": frame_len,
+                "uncompressed_size": len(chunk_buf),
+                "start_line": chunk_start_line,
+                "end_line": total_lines,
+                "first_ts": chunk_first_ts,
+                "last_ts": chunk_last_ts,
+                "min_ts": chunk_min_ts,
+                "max_ts": chunk_max_ts,
+                "error_count": chunk_error_count,
+                "warn_count": chunk_warn_count,
+            }
+            if cleaned_session_id is not None:
+                meta["session_match_count"] = chunk_session_match_count
+            chunks_meta.append(meta)
             chunk_buf.clear()
             chunk_start_line = total_lines + 1
             chunk_first_ts = None
@@ -900,11 +945,14 @@ class LogEngine:
             chunk_max_ts = None
             chunk_error_count = 0
             chunk_warn_count = 0
+            chunk_session_match_count = 0
 
         def _process_raw_line(raw_line: bytes, zst_fh: BinaryIO) -> None:
             nonlocal total_lines, chunk_first_ts, chunk_last_ts
             nonlocal chunk_min_dt, chunk_min_ts, chunk_max_dt, chunk_max_ts
-            nonlocal chunk_error_count, chunk_warn_count
+            nonlocal chunk_error_count, chunk_warn_count, chunk_session_match_count
+            nonlocal session_match_count, session_error_count, session_warn_count
+            nonlocal session_first_line, session_last_line, session_first_ts, session_last_ts
 
             if total_lines == 0 and raw_line.startswith(b"\xef\xbb\xbf"):
                 raw_line = raw_line[3:]
@@ -927,27 +975,44 @@ class LogEngine:
                         chunk_max_dt = ts_dt
                         chunk_max_ts = ts_iso
 
+            entry = {
+                "line_number": total_lines,
+                "text": text,
+                "timestamp": ts_iso,
+                "level": level,
+            }
+
             if level in ERROR_LEVELS:
                 chunk_error_count += 1
-                recent_errors.append(
-                    {
-                        "line_number": total_lines,
-                        "text": text,
-                        "timestamp": ts_iso,
-                        "level": level,
-                    }
-                )
+                recent_errors.append(entry)
             elif level in WARN_LEVELS:
                 chunk_warn_count += 1
 
-            tail_lines.append(
-                {
-                    "line_number": total_lines,
-                    "text": text,
-                    "timestamp": ts_iso,
-                    "level": level,
-                }
-            )
+            tail_lines.append(entry)
+
+            if session_lower is not None:
+                if session_lower in text.lower():
+                    chunk_session_match_count += 1
+                    session_match_count += 1
+                    if session_first_line is None:
+                        session_first_line = total_lines
+                    session_last_line = total_lines
+                    if ts_iso is not None:
+                        if session_first_ts is None:
+                            session_first_ts = ts_iso
+                        session_last_ts = ts_iso
+                    if level in ERROR_LEVELS:
+                        session_error_count += 1
+                        session_recent_errors.append(entry)
+                    elif level in WARN_LEVELS:
+                        session_warn_count += 1
+                    session_tail_lines.append(entry)
+                    post_session_lines.clear()
+                elif (
+                    session_last_line is not None
+                    and len(post_session_lines) < POST_SESSION_CONTEXT_LINES
+                ):
+                    post_session_lines.append(entry)
 
             encoded = (text + "\n").encode("utf-8")
             chunk_buf.extend(encoded)
@@ -995,14 +1060,34 @@ class LogEngine:
             if close_src:
                 src_fh.close()
 
-        digest_json = {
+        digest_json: dict[str, Any] = {
             "total_lines": total_lines,
             "error_count": sum(c["error_count"] for c in chunks_meta),
             "warn_count": sum(c["warn_count"] for c in chunks_meta),
             "tail_lines": list(tail_lines),
             "recent_errors": list(recent_errors),
         }
-        idx_data = {
+        if cleaned_session_id is not None:
+            digest_json["session"] = {
+                "session_id": cleaned_session_id,
+                "match_count": session_match_count,
+                "error_count": session_error_count,
+                "warn_count": session_warn_count,
+                "first_line": session_first_line,
+                "last_line": session_last_line,
+                "first_ts": session_first_ts,
+                "last_ts": session_last_ts,
+                "trailing_lines_after_session": (
+                    max(0, total_lines - session_last_line)
+                    if session_last_line is not None
+                    else 0
+                ),
+                "tail_lines": list(session_tail_lines),
+                "recent_errors": list(session_recent_errors),
+                "post_session_lines": post_session_lines,
+            }
+
+        idx_data: dict[str, Any] = {
             "version": 1,
             "chunk_size_bytes": chunk_size_bytes,
             "raw_size": raw_size,
@@ -1011,6 +1096,8 @@ class LogEngine:
             "chunks": chunks_meta,
             "digest": digest_json,
         }
+        if cleaned_session_id is not None:
+            idx_data["session_id"] = cleaned_session_id
 
         try:
             with open(idx_tmp, "w", encoding="utf-8") as idx_fh:
@@ -1095,6 +1182,130 @@ class LogEngine:
 
         return results
 
+    def read_session_lines(
+        self,
+        zst_path: Path | str,
+        idx_path: Path | str,
+        session_id: str,
+        start_index: int = 1,
+        end_index: int = 200,
+    ) -> dict[str, Any]:
+        """Read 1-based inclusive [start_index, end_index] of lines matching session_id."""
+        cleaned_session_id = normalize_session_id(session_id)
+        if cleaned_session_id is None:
+            raise ValueError("session_id must not be empty")
+
+        req_start = int(start_index)
+        req_end = int(end_index)
+        if req_start < 1 or req_end < 1 or req_start > req_end:
+            raise ValueError("start_index and end_index must be >= 1 and start_index <= end_index")
+
+        idx_data = self._load_idx(idx_path)
+        chunks: list[dict[str, Any]] = idx_data.get("chunks", [])
+        if not chunks:
+            return {
+                "session_id": cleaned_session_id,
+                "total_matches": 0,
+                "start_index": 0,
+                "end_index": 0,
+                "lines": [],
+            }
+
+        session_lower = cleaned_session_id.lower()
+        ascii_needle = _session_ascii_needle(session_lower)
+        decompressor = zstd.ZstdDecompressor()
+        results: list[dict[str, Any]] = []
+
+        use_indexed = _index_matches_session(idx_data, session_lower) and all(
+            "session_match_count" in c for c in chunks
+        )
+        if use_indexed:
+            cum_counts: list[int] = []
+            running_total = 0
+            for c in chunks:
+                running_total += int(c.get("session_match_count", 0))
+                cum_counts.append(running_total)
+            total_matches = running_total
+            if total_matches == 0 or req_start > total_matches:
+                return {
+                    "session_id": cleaned_session_id,
+                    "total_matches": total_matches,
+                    "start_index": 0,
+                    "end_index": 0,
+                    "lines": [],
+                }
+            clamped_end = min(total_matches, req_end)
+            chunk_idx = bisect_left(cum_counts, req_start)
+            match_cursor = cum_counts[chunk_idx - 1] if chunk_idx > 0 else 0
+
+            with open(zst_path, "rb") as zst_fh:
+                while chunk_idx < len(chunks) and match_cursor < clamped_end:
+                    chunk = chunks[chunk_idx]
+                    c_matches = int(chunk.get("session_match_count", 0))
+                    if c_matches <= 0:
+                        chunk_idx += 1
+                        continue
+                    c_start = int(chunk["start_line"])
+                    zst_fh.seek(int(chunk["byte_offset"]))
+                    comp_bytes = zst_fh.read(int(chunk["compressed_size"]))
+                    raw_text = decompressor.decompress(comp_bytes).decode("utf-8")
+                    for offset, line_text in enumerate(_split_chunk_lines(raw_text)):
+                        if session_lower in line_text.lower():
+                            match_cursor += 1
+                            if match_cursor < req_start:
+                                continue
+                            if match_cursor > clamped_end:
+                                break
+                            ts_iso, level = _extract_line_meta(line_text)
+                            results.append(
+                                {
+                                    "line_number": c_start + offset,
+                                    "text": line_text,
+                                    "timestamp": ts_iso,
+                                    "level": level,
+                                }
+                            )
+                    chunk_idx += 1
+        else:
+            total_matches = 0
+            with open(zst_path, "rb") as zst_fh:
+                for chunk in chunks:
+                    zst_fh.seek(int(chunk["byte_offset"]))
+                    comp_bytes = zst_fh.read(int(chunk["compressed_size"]))
+                    chunk_bytes = decompressor.decompress(comp_bytes)
+                    if ascii_needle is not None and ascii_needle not in chunk_bytes.lower():
+                        continue
+                    c_start = int(chunk["start_line"])
+                    raw_text = chunk_bytes.decode("utf-8")
+                    for offset, line_text in enumerate(_split_chunk_lines(raw_text)):
+                        if session_lower in line_text.lower():
+                            total_matches += 1
+                            if req_start <= total_matches <= req_end:
+                                ts_iso, level = _extract_line_meta(line_text)
+                                results.append(
+                                    {
+                                        "line_number": c_start + offset,
+                                        "text": line_text,
+                                        "timestamp": ts_iso,
+                                        "level": level,
+                                    }
+                                )
+
+        if results:
+            resp_start = req_start
+            resp_end = req_start + len(results) - 1
+        else:
+            resp_start = 0
+            resp_end = 0
+
+        return {
+            "session_id": cleaned_session_id,
+            "total_matches": total_matches,
+            "start_index": resp_start,
+            "end_index": resp_end,
+            "lines": results,
+        }
+
     def read_around_time(
         self,
         zst_path: Path | str,
@@ -1102,8 +1313,13 @@ class LogEngine:
         target_time: datetime | str,
         window_seconds: int = 10,
         max_lines: int = 500,
+        session_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Read log lines within [target_time - window_seconds, target_time + window_seconds]."""
+        cleaned_session_id = normalize_session_id(session_id)
+        session_lower = cleaned_session_id.lower() if cleaned_session_id is not None else None
+        ascii_needle = _session_ascii_needle(session_lower) if session_lower is not None else None
+
         if isinstance(target_time, str):
             target_dt = _parse_ts(target_time)
         elif target_time.tzinfo is None:
@@ -1117,6 +1333,10 @@ class LogEngine:
         chunks: list[dict[str, Any]] = idx_data.get("chunks", [])
         if not chunks:
             return []
+
+        can_skip_by_idx = (
+            session_lower is not None and _index_matches_session(idx_data, session_lower)
+        )
 
         delta = timedelta(seconds=max(0, window_seconds))
         start_dt = target_dt - delta
@@ -1191,14 +1411,23 @@ class LogEngine:
 
         with open(zst_path, "rb") as zst_fh:
             for idx in candidate_indices:
+                chunk = chunks[idx]
+                if (
+                    can_skip_by_idx
+                    and "session_match_count" in chunk
+                    and int(chunk["session_match_count"]) == 0
+                ):
+                    continue
                 if prev_idx is not None and idx != prev_idx + 1:
                     current_ts = None
                 prev_idx = idx
-                chunk = chunks[idx]
                 c_start = int(chunk["start_line"])
                 zst_fh.seek(int(chunk["byte_offset"]))
                 comp_bytes = zst_fh.read(int(chunk["compressed_size"]))
-                raw_text = decompressor.decompress(comp_bytes).decode("utf-8")
+                chunk_bytes = decompressor.decompress(comp_bytes)
+                if ascii_needle is not None and ascii_needle not in chunk_bytes.lower():
+                    continue
+                raw_text = chunk_bytes.decode("utf-8")
 
                 for offset, line_text in enumerate(_split_chunk_lines(raw_text)):
                     ts_iso, level = _extract_line_meta(line_text)
@@ -1211,6 +1440,8 @@ class LogEngine:
                     if line_dt is None:
                         continue
                     if start_dt <= line_dt <= end_dt:
+                        if session_lower is not None and session_lower not in line_text.lower():
+                            continue
                         matched.append(
                             {
                                 "line_number": c_start + offset,
@@ -1241,12 +1472,19 @@ class LogEngine:
         is_regex: bool = False,
         max_matches: int = 100,
         case_sensitive: bool = False,
+        session_id: str | None = None,
     ) -> dict[str, Any]:
         """Stream-search compressed log chunks using two-stage bytes prefiltering."""
         if not pattern:
             raise ValueError("Search pattern must not be empty")
         if max_matches <= 0:
             raise ValueError("max_matches must be positive")
+
+        cleaned_session_id = normalize_session_id(session_id)
+        session_lower = cleaned_session_id.lower() if cleaned_session_id is not None else None
+        session_ascii_needle = (
+            _session_ascii_needle(session_lower) if session_lower is not None else None
+        )
 
         t0 = time.perf_counter()
         idx_data = self._load_idx(idx_path)
@@ -1261,6 +1499,10 @@ class LogEngine:
                 "matches": [],
             }
 
+        can_skip_by_idx = (
+            session_lower is not None and _index_matches_session(idx_data, session_lower)
+        )
+
         plan = compile_search_plan(pattern, is_regex, case_sensitive)
         exact_re = plan.exact_re
         precheck_mode = plan.precheck_mode
@@ -1273,20 +1515,34 @@ class LogEngine:
 
         with open(zst_path, "rb") as zst_fh:
             for chunk in chunks:
+                if (
+                    can_skip_by_idx
+                    and "session_match_count" in chunk
+                    and int(chunk["session_match_count"]) == 0
+                ):
+                    continue
                 scanned_chunks += 1
                 zst_fh.seek(int(chunk["byte_offset"]))
                 comp_bytes = zst_fh.read(int(chunk["compressed_size"]))
                 chunk_bytes = decompressor.decompress(comp_bytes)
+
+                chunk_lower_bytes: bytes | None = None
+                if session_ascii_needle is not None:
+                    chunk_lower_bytes = chunk_bytes.lower()
+                    if session_ascii_needle not in chunk_lower_bytes:
+                        continue
 
                 # Stage 1: fast C-speed bytes prefilter
                 if precheck_mode == "literal_exact":
                     if plan.needle_bytes not in chunk_bytes:
                         continue
                 elif precheck_mode == "literal_lower":
-                    if plan.needle_bytes not in chunk_bytes.lower():
+                    if chunk_lower_bytes is None:
+                        chunk_lower_bytes = chunk_bytes.lower()
+                    if plan.needle_bytes not in chunk_lower_bytes:
                         continue
                 elif precheck_mode == "literals_dnf":
-                    low_bytes: bytes | None = None
+                    low_bytes: bytes | None = chunk_lower_bytes
                     branch_hit = False
                     for branch in plan.dnf_branches:
                         ok = True
@@ -1311,7 +1567,9 @@ class LogEngine:
                         continue
                 elif precheck_mode == "regex_bytes_lower":
                     assert plan.bytes_re is not None
-                    if not plan.bytes_re.search(chunk_bytes.lower()):
+                    if chunk_lower_bytes is None:
+                        chunk_lower_bytes = chunk_bytes.lower()
+                    if not plan.bytes_re.search(chunk_lower_bytes):
                         continue
 
                 # Stage 2: exact UTF-8 line matching on hit chunks only
@@ -1321,6 +1579,8 @@ class LogEngine:
 
                 if multiline_risk:
                     for offset, line_text in enumerate(_split_chunk_lines(text)):
+                        if session_lower is not None and session_lower not in line_text.lower():
+                            continue
                         if exact_re.search(line_text):
                             if len(matches) >= max_matches:
                                 truncated = True
@@ -1343,18 +1603,22 @@ class LogEngine:
                         ln = c_start + cur_line_offset
                         if ln > c_end or ln == last_matched_line:
                             continue
-                        last_matched_line = ln
-                        if len(matches) >= max_matches:
-                            truncated = True
-                            break
                         ls = search_text.rfind("\n", 0, m_start) + 1
                         le = search_text.find("\n", m_start)
                         if le == -1:
                             le = len(search_text)
+                        line_text = search_text[ls:le]
+                        if session_lower is not None and session_lower not in line_text.lower():
+                            last_matched_line = ln
+                            continue
+                        last_matched_line = ln
+                        if len(matches) >= max_matches:
+                            truncated = True
+                            break
                         matches.append(
                             {
                                 "line_number": ln,
-                                "text": search_text[ls:le],
+                                "text": line_text,
                             }
                         )
 
@@ -1371,4 +1635,4 @@ class LogEngine:
         }
 
 
-__all__ = ["LogEngine"]
+__all__ = ["LogEngine", "normalize_session_id"]

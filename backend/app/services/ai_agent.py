@@ -15,7 +15,7 @@ from typing import Any
 
 import anthropic
 import openai
-from sqlalchemy import case, or_, select, update
+from sqlalchemy import case, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings, get_settings
@@ -30,7 +30,7 @@ from app.db.models import (
 )
 from app.services import llm_providers, settings_service
 from app.services.clustering import ClusteringService, _compare_versions
-from app.services.log_engine import LogEngine
+from app.services.log_engine import LogEngine, normalize_session_id
 from app.services.storage import StorageError, StorageManager
 
 logger = logging.getLogger(__name__)
@@ -58,13 +58,25 @@ You investigate a crash dump and its diagnostic logs using ONLY the provided rea
 
 Investigation rules:
 1. ALWAYS start by calling get_crash_overview to inspect crashing stack frames, missing symbols,
-   candidate known issues, and attached log IDs.
+   session_id (if present), related_session_crashes, candidate known issues, and attached logs.
 2. Inspect attached logs (get_log_summary, search_log, read_log_around_time, read_log_lines),
    other threads (get_other_threads), or known issues (search_known_issues, get_issue_detail).
-3. Never invent log line numbers, file contents, or issue_id values. Cite only observed tool data.
+3. CRITICAL session & mid-file crash log rule:
+   - Processes often auto-restart after crashing, and logs may be collected manually hours later.
+     Therefore, the crashing session often lives in the MIDDLE of a log file rather than the end.
+   - When session_id is present (especially if trailing_lines_after_session > 0), DO NOT rely on
+     global tail_lines or global recent_errors from post-restart sessions at the end of the file.
+   - Prioritize session_recent_errors, session_tail_lines, and post_session_lines (untagged
+     crash-moment lines and restart boundary right after session_last_line) from get_log_summary.
+   - Use read_log_lines around session_last_line (e.g. [session_last_line - 80, +40]) to inspect
+     untagged fatal/exception lines around the crash boundary, and pass only_session=true to
+     search_log or read_log_around_time to filter out other sessions.
+   - On delayed manual uploads, crash_time may reflect upload time rather than actual crash time;
+     anchor to session_last_line / session_last_ts, and check related_session_crashes too.
+4. Never invent log line numbers, file contents, or issue_id values. Cite only observed tool data.
    Use function_preview only as a hint from a truncated function name.
    Never return an empty NEEDS_REVIEW without first calling tools to inspect the crash.
-4. Only AFTER completing your tool-based investigation, output ONLY a single valid JSON object
+5. Only AFTER completing your tool-based investigation, output ONLY a single valid JSON object
    (no surrounding prose) with non-empty analysis fields (including for NEEDS_REVIEW):
 {
   "verdict": "KNOWN_ISSUE | NEW_ISSUE | REGRESSION | NEEDS_REVIEW",
@@ -87,8 +99,9 @@ AI_TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "function": {
             "name": "get_crash_overview",
             "description": (
-                "Get crash metadata, crashing thread top frames, missing symbols, "
-                "cluster info, fuzzy-recalled candidate issues, and attached log metadata."
+                "Get crash metadata (including custom session_id if present), top frames, "
+                "missing symbols, cluster info, related crashes in the same session, recalled "
+                "candidate issues, and attached log metadata (including mid-file session spans)."
             ),
             "parameters": {
                 "type": "object",
@@ -124,7 +137,8 @@ AI_TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "function": {
             "name": "get_log_summary",
             "description": (
-                "Get precomputed log digest (error/warn counts, tail lines, recent errors)."
+                "Get precomputed log digest (error/warn counts, tail lines, recent errors, plus "
+                "session errors/tail and post_session_lines boundary context if session_id is set)."
             ),
             "parameters": {
                 "type": "object",
@@ -165,7 +179,8 @@ AI_TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "name": "read_log_around_time",
             "description": (
                 "Read log lines within a time window around a target timestamp "
-                "(defaults to crash_time)."
+                "(defaults to crash_time; when only_session=true and default crash_time misses "
+                "on delayed uploads, automatically falls back to session_last_ts)."
             ),
             "parameters": {
                 "type": "object",
@@ -190,6 +205,17 @@ AI_TOOL_DEFINITIONS: list[dict[str, Any]] = [
                         "maximum": 200,
                         "default": 200,
                     },
+                    "only_session": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": (
+                            "If true, restrict results to lines containing the crash's session_id."
+                        ),
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Optional explicit session_id filter override.",
+                    },
                 },
                 "required": ["log_id"],
                 "additionalProperties": False,
@@ -200,7 +226,10 @@ AI_TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "search_log",
-            "description": "Search an attached compressed log for a substring or regex pattern.",
+            "description": (
+                "Search an attached compressed log for a substring or regex pattern, "
+                "optionally restricted to lines belonging to the crash's session_id."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -214,6 +243,18 @@ AI_TOOL_DEFINITIONS: list[dict[str, Any]] = [
                         "default": 50,
                     },
                     "case_sensitive": {"type": "boolean", "default": False},
+                    "only_session": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": (
+                            "If true, only return matches on lines containing this crash's "
+                            "session_id."
+                        ),
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Optional explicit session_id filter override.",
+                    },
                 },
                 "required": ["log_id", "pattern"],
                 "additionalProperties": False,
@@ -394,9 +435,21 @@ def _prepare_tool_output_for_llm(
         return _truncate_tool_output(raw_out, max_chars), None
 
     list_priority: dict[str, tuple[str, ...]] = {
-        "get_crash_overview": ("top_frames", "missing_symbols", "logs", "candidate_issues"),
+        "get_crash_overview": (
+            "top_frames",
+            "missing_symbols",
+            "logs",
+            "candidate_issues",
+            "related_session_crashes",
+        ),
         "get_other_threads": ("threads",),
-        "get_log_summary": ("recent_errors", "tail_lines"),
+        "get_log_summary": (
+            "session_recent_errors",
+            "session_tail_lines",
+            "post_session_lines",
+            "recent_errors",
+            "tail_lines",
+        ),
         "read_log_lines": ("lines",),
         "read_log_around_time": ("lines",),
         "search_log": ("matches",),
@@ -427,6 +480,9 @@ def _prepare_tool_output_for_llm(
         "matches": _log_entry_has_text,
         "tail_lines": _log_entry_has_text,
         "recent_errors": _log_entry_has_text,
+        "session_tail_lines": _log_entry_has_text,
+        "session_recent_errors": _log_entry_has_text,
+        "post_session_lines": _log_entry_has_text,
     }
     for key in ordered_list_keys:
         items = parsed[key]
@@ -545,7 +601,13 @@ def _payload_has_crash_evidence(
         )
 
     if tool_name == "get_log_summary":
-        for key in ("recent_errors", "tail_lines"):
+        for key in (
+            "session_recent_errors",
+            "session_tail_lines",
+            "post_session_lines",
+            "recent_errors",
+            "tail_lines",
+        ):
             entries = delivered_payload.get(key)
             if isinstance(entries, list) and any(_log_entry_has_text(e) for e in entries):
                 return True
@@ -960,24 +1022,81 @@ class AITriageAgent:
                 select(CrashLog).where(CrashLog.crash_id == crash_report.id)
             )
         ).scalars().all()
-        logs_list = [
-            {
+        logs_list: list[dict[str, Any]] = []
+        for log in logs_rows:
+            digest = log.digest_json or {}
+            log_item: dict[str, Any] = {
                 "id": str(log.id),
                 "filename": log.filename,
                 "raw_size": log.raw_size,
                 "total_lines": log.total_lines,
-                "error_count": int((log.digest_json or {}).get("error_count", 0)),
-                "warn_count": int((log.digest_json or {}).get("warn_count", 0)),
+                "error_count": int(digest.get("error_count", 0)),
+                "warn_count": int(digest.get("warn_count", 0)),
             }
-            for log in logs_rows
-        ]
+            sess_digest = digest.get("session")
+            if isinstance(sess_digest, dict):
+                log_item["session_match_count"] = int(sess_digest.get("match_count", 0))
+                log_item["session_error_count"] = int(sess_digest.get("error_count", 0))
+                log_item["session_warn_count"] = int(sess_digest.get("warn_count", 0))
+                log_item["session_first_line"] = sess_digest.get("first_line")
+                log_item["session_last_line"] = sess_digest.get("last_line")
+                log_item["session_first_ts"] = sess_digest.get("first_ts")
+                log_item["session_last_ts"] = sess_digest.get("last_ts")
+                log_item["trailing_lines_after_session"] = int(
+                    sess_digest.get("trailing_lines_after_session", 0)
+                )
+            logs_list.append(log_item)
 
-        return {
+        session_id_label: str | None = None
+        if project and isinstance(project.settings_json, dict):
+            raw_label = project.settings_json.get("session_id_label")
+            if isinstance(raw_label, str) and raw_label.strip():
+                session_id_label = raw_label.strip()
+
+        related_session_crashes: list[dict[str, Any]] = []
+        related_session_crash_count = 0
+        if crash_report.session_id:
+            rel_filters = (
+                CrashReport.project_id == crash_report.project_id,
+                CrashReport.session_id == crash_report.session_id,
+                CrashReport.id != crash_report.id,
+            )
+            related_session_crash_count = int(
+                (
+                    await session.execute(
+                        select(func.count()).select_from(CrashReport).where(*rel_filters)
+                    )
+                ).scalar_one()
+            )
+            if related_session_crash_count > 0:
+                rel_rows = (
+                    await session.execute(
+                        select(CrashReport)
+                        .where(*rel_filters)
+                        .order_by(CrashReport.crash_time.desc(), CrashReport.created_at.desc())
+                        .limit(10)
+                    )
+                ).scalars().all()
+                related_session_crashes = [
+                    {
+                        "crash_id": str(rel.id),
+                        "status": rel.status,
+                        "app_version": rel.app_version,
+                        "crash_reason": rel.crash_reason,
+                        "crash_time": _as_utc(rel.crash_time).isoformat(),
+                        "issue_id": rel.issue_id,
+                        "ai_verdict": rel.ai_verdict,
+                    }
+                    for rel in rel_rows
+                ]
+
+        overview: dict[str, Any] = {
             "crash_id": str(crash_report.id),
             "project_id": str(crash_report.project_id),
             "app_version": crash_report.app_version,
             "build_id": crash_report.build_id,
             "os_version": crash_report.os_version,
+            "session_id": crash_report.session_id,
             "crash_reason": crash_report.crash_reason,
             "crash_address": crash_report.crash_address,
             "crash_time": _as_utc(crash_report.crash_time).isoformat(),
@@ -987,7 +1106,12 @@ class AITriageAgent:
             "cluster": cluster_info,
             "candidate_issues": candidate_issues,
             "logs": logs_list,
+            "related_session_crash_count": related_session_crash_count,
+            "related_session_crashes": related_session_crashes,
         }
+        if session_id_label:
+            overview["session_id_label"] = session_id_label
+        return overview
 
     def _tool_get_other_threads(
         self,
@@ -1054,7 +1178,7 @@ class AITriageAgent:
             return {"error": err or "Log not found"}
 
         digest = log_row.digest_json or {}
-        return {
+        summary: dict[str, Any] = {
             "log_id": str(log_row.id),
             "filename": log_row.filename,
             "total_lines": log_row.total_lines,
@@ -1065,6 +1189,27 @@ class AITriageAgent:
             "tail_lines": list(digest.get("tail_lines") or [])[-80:],
             "recent_errors": list(digest.get("recent_errors") or [])[-50:],
         }
+        sess_digest = digest.get("session")
+        if isinstance(sess_digest, dict):
+            summary["session_id"] = sess_digest.get("session_id")
+            summary["session_match_count"] = int(sess_digest.get("match_count", 0))
+            summary["session_error_count"] = int(sess_digest.get("error_count", 0))
+            summary["session_warn_count"] = int(sess_digest.get("warn_count", 0))
+            summary["session_first_line"] = sess_digest.get("first_line")
+            summary["session_last_line"] = sess_digest.get("last_line")
+            summary["session_first_ts"] = sess_digest.get("first_ts")
+            summary["session_last_ts"] = sess_digest.get("last_ts")
+            summary["trailing_lines_after_session"] = int(
+                sess_digest.get("trailing_lines_after_session", 0)
+            )
+            summary["session_recent_errors"] = list(
+                sess_digest.get("recent_errors") or []
+            )[-50:]
+            summary["session_tail_lines"] = list(sess_digest.get("tail_lines") or [])[-80:]
+            summary["post_session_lines"] = list(
+                sess_digest.get("post_session_lines") or []
+            )[:30]
+        return summary
 
     def _resolve_log_paths(self, log_row: CrashLog) -> tuple[Any, Any, str | None]:
         if not log_row.zst_path or not log_row.idx_path:
@@ -1128,6 +1273,27 @@ class AITriageAgent:
             "lines": lines,
         }
 
+    @staticmethod
+    def _resolve_tool_session_filter(
+        crash_report: CrashReport,
+        args: dict[str, Any],
+    ) -> tuple[str | None, str | None]:
+        raw_sid = args.get("session_id")
+        if raw_sid is not None:
+            if not isinstance(raw_sid, str):
+                return None, "session_id must be a string"
+            try:
+                cleaned = normalize_session_id(raw_sid)
+            except ValueError as exc:
+                return None, str(exc)
+            if cleaned is not None:
+                return cleaned, None
+        if bool(args.get("only_session", False)):
+            if crash_report.session_id:
+                return crash_report.session_id, None
+            return None, "only_session=true requested, but this crash has no session_id"
+        return None, None
+
     async def _tool_read_log_around_time(
         self,
         session: AsyncSession,
@@ -1144,7 +1310,12 @@ class AITriageAgent:
         if path_err is not None:
             return {"error": path_err}
 
-        target_ts = args.get("timestamp") or _as_utc(crash_report.crash_time)
+        session_filter, session_err = self._resolve_tool_session_filter(crash_report, args)
+        if session_err is not None:
+            return {"error": session_err}
+
+        explicit_ts = args.get("timestamp")
+        target_ts: Any = explicit_ts or _as_utc(crash_report.crash_time)
         try:
             window_sec = max(1, min(120, int(args.get("window_seconds", 10))))
             max_lines = max(1, min(200, int(args.get("max_lines", 200))))
@@ -1159,18 +1330,50 @@ class AITriageAgent:
                 target_ts,
                 window_sec,
                 max_lines,
+                session_filter,
             )
         except ValueError as exc:
             return {"error": str(exc)}
 
-        return {
+        anchored_to: str | None = None
+        if not lines and not explicit_ts and session_filter is not None:
+            sess_digest = (log_row.digest_json or {}).get("session")
+            if (
+                isinstance(sess_digest, dict)
+                and isinstance(sess_digest.get("last_ts"), str)
+                and sess_digest["last_ts"].strip()
+                and str(sess_digest.get("session_id") or "").lower() == session_filter.lower()
+            ):
+                fallback_ts = sess_digest["last_ts"].strip()
+                try:
+                    fallback_lines = await asyncio.to_thread(
+                        self.log_engine.read_around_time,
+                        abs_zst,
+                        abs_idx,
+                        fallback_ts,
+                        window_sec,
+                        max_lines,
+                        session_filter,
+                    )
+                    if fallback_lines:
+                        lines = fallback_lines
+                        target_ts = fallback_ts
+                        anchored_to = "session_last_ts"
+                except ValueError:
+                    pass
+
+        resp: dict[str, Any] = {
             "log_id": str(log_row.id),
             "target_timestamp": (
                 target_ts.isoformat() if isinstance(target_ts, datetime) else str(target_ts)
             ),
             "window_seconds": window_sec,
+            "session_id": session_filter,
             "lines": lines,
         }
+        if anchored_to is not None:
+            resp["anchored_to"] = anchored_to
+        return resp
 
     async def _tool_search_log(
         self,
@@ -1187,6 +1390,10 @@ class AITriageAgent:
         abs_zst, abs_idx, path_err = self._resolve_log_paths(log_row)
         if path_err is not None:
             return {"error": path_err}
+
+        session_filter, session_err = self._resolve_tool_session_filter(crash_report, args)
+        if session_err is not None:
+            return {"error": session_err}
 
         pattern = str(args.get("pattern") or "")
         is_regex = bool(args.get("is_regex", False))
@@ -1205,6 +1412,7 @@ class AITriageAgent:
                 is_regex,
                 max_matches,
                 case_sensitive,
+                session_filter,
             )
         except ValueError as exc:
             return {"error": str(exc)}
@@ -1212,6 +1420,7 @@ class AITriageAgent:
         return {
             "log_id": str(log_row.id),
             "pattern": pattern,
+            "session_id": session_filter,
             "total_matches": res["total_matches"],
             "truncated": res["truncated"],
             "elapsed_ms": res["elapsed_ms"],
@@ -1563,13 +1772,22 @@ class AITriageAgent:
         run_status = "FAILED"
         result_dict: dict[str, Any] | None = None
 
+        session_clause = ""
+        if crash_report.session_id:
+            label_part = ""
+            if project and isinstance(project.settings_json, dict):
+                raw_lbl = project.settings_json.get("session_id_label")
+                if isinstance(raw_lbl, str) and raw_lbl.strip():
+                    label_part = f" [{raw_lbl.strip()}]"
+            session_clause = f", session_id{label_part}={crash_report.session_id}"
+
         user_prompt = (
             f"Triage CrashReport {crash_report.id} "
             f"(app_version={crash_report.app_version}, "
-            f"crash_reason={crash_report.crash_reason or 'UNKNOWN'}). "
+            f"crash_reason={crash_report.crash_reason or 'UNKNOWN'}{session_clause}). "
             "Start by calling get_crash_overview to inspect stack traces, attached logs, "
-            "and candidate known issues. After completing your investigation, output ONLY "
-            "the final JSON verdict."
+            "session metadata, and candidate known issues. After completing your investigation, "
+            "output ONLY the final JSON verdict."
         )
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": AI_SYSTEM_PROMPT},

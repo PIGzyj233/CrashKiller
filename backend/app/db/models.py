@@ -183,6 +183,7 @@ class CrashReport(Base):
     __table_args__ = (
         Index("ix_crash_reports_project_status_created", "project_id", "status", "created_at"),
         Index("ix_crash_reports_is_pinned_created", "is_pinned", "created_at"),
+        Index("ix_crash_reports_project_session_created", "project_id", "session_id", "created_at"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUIDType, primary_key=True, default=uuid.uuid4)
@@ -208,6 +209,7 @@ class CrashReport(Base):
     app_version: Mapped[str] = mapped_column(String(128), nullable=False)
     build_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     os_version: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    session_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     dump_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     dump_raw_size: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     dump_compressed_size: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)

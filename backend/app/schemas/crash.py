@@ -44,6 +44,7 @@ class CrashSummary(BaseModel):
     app_version: str
     build_id: str | None = None
     os_version: str | None = None
+    session_id: str | None = None
     dump_raw_size: int = 0
     dump_compressed_size: int = 0
     crash_reason: str | None = None
@@ -70,6 +71,8 @@ class CrashDetailRead(CrashSummary):
     cluster: CrashClusterRead | None = None
     issue: IssueRead | None = None
     ai_runs: list[AIAnalysisRunRead] = Field(default_factory=list)
+    related_session_crashes: list[CrashSummary] = Field(default_factory=list)
+    related_session_crash_count: int = 0
 
 
 class CrashUploadResponse(BaseModel):

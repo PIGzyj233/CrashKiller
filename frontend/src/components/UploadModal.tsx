@@ -31,6 +31,7 @@ import {
 } from "../api/client";
 import type { ProjectRead } from "../api/types";
 import { i18n, useAppI18n } from "../i18n";
+import { getSessionIdLabel } from "../utils/sessionLabel";
 
 export interface UploadModalProps {
   isOpen: boolean;
@@ -116,6 +117,7 @@ export function UploadModal({
   const [logFiles, setLogFiles] = useState<File[]>([]);
   const [buildId, setBuildId] = useState("");
   const [osVersion, setOsVersion] = useState("");
+  const [sessionId, setSessionId] = useState("");
   const [crashTime, setCrashTime] = useState("");
 
   // Symbol fields
@@ -156,6 +158,7 @@ export function UploadModal({
       setLogFiles([]);
       setBuildId("");
       setOsVersion("");
+      setSessionId("");
       setCrashTime("");
       setPdbFile(null);
       setPeFile(null);
@@ -367,6 +370,7 @@ export function UploadModal({
           logFiles: logFiles.length > 0 ? logFiles : undefined,
           buildId: buildId.trim() || undefined,
           osVersion: osVersion.trim() || undefined,
+          sessionId: sessionId.trim() || undefined,
           crashTime: normalizedCrashTime,
           apiKey: trimmedKey,
           onProgress: (pct) => setProgress(pct),
@@ -829,7 +833,30 @@ export function UploadModal({
                 </div>
 
                 {/* Optional Crash Metadata */}
-                <div className="grid gap-3 sm:grid-cols-3">
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div>
+                    <label
+                      htmlFor="upload-session-id"
+                      className="mb-1 block text-xs font-medium text-slate-700"
+                    >
+                      {t("upload.sessionIdLabel", {
+                        label: getSessionIdLabel(
+                          projects.find((p) => p.key === selectedProjectKey),
+                          t("common.sessionId"),
+                        ),
+                      })}
+                    </label>
+                    <input
+                      id="upload-session-id"
+                      type="text"
+                      maxLength={128}
+                      value={sessionId}
+                      disabled={isUploading}
+                      onChange={(e) => setSessionId(e.target.value)}
+                      placeholder={t("upload.sessionIdPlaceholder")}
+                      className="h-8 w-full rounded-md border border-slate-300 bg-white px-2.5 font-mono text-xs text-slate-800 placeholder:font-sans placeholder:text-slate-400 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                    />
+                  </div>
                   <div>
                     <label
                       htmlFor="upload-build-id"

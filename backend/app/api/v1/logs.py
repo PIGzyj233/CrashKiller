@@ -11,16 +11,17 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_db, get_storage
-from app.db.models import CrashLog
+from app.db.models import CrashLog, CrashReport
 from app.schemas.log import (
     LogAroundTimeResponse,
     LogLine,
     LogLinesResponse,
     LogSearchMatch,
     LogSearchResponse,
+    LogSessionLinesResponse,
     LogSummaryResponse,
 )
-from app.services.log_engine import LogEngine, _parse_ts
+from app.services.log_engine import LogEngine, _parse_ts, normalize_session_id
 from app.services.storage import StorageError, StorageManager
 
 router = APIRouter(prefix="/logs", tags=["logs"])
@@ -59,6 +60,34 @@ async def _get_log_or_404(session: AsyncSession, log_id: uuid.UUID) -> CrashLog:
             detail="Crash log not found",
         )
     return log_row
+
+
+async def _resolve_session_filter(
+    session: AsyncSession,
+    log_row: CrashLog,
+    session_id: str | None,
+    only_session: bool,
+    *,
+    require_session: bool = False,
+) -> str | None:
+    try:
+        cleaned = normalize_session_id(session_id)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=str(exc),
+        ) from exc
+    if cleaned is not None:
+        return cleaned
+    if only_session or require_session:
+        crash = await session.get(CrashReport, log_row.crash_id)
+        if crash is not None and crash.session_id:
+            return crash.session_id
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="This crash report has no session_id to filter by",
+        )
+    return None
 
 
 @router.get("/{log_id}/summary", response_model=LogSummaryResponse)
@@ -116,12 +145,72 @@ async def get_log_lines(
     )
 
 
+@router.get("/{log_id}/session-lines", response_model=LogSessionLinesResponse)
+async def get_log_session_lines(
+    log_id: uuid.UUID,
+    session_id: str | None = Query(default=None),
+    start: int = Query(default=1, ge=1),
+    end: int = Query(default=200, ge=1),
+    session: AsyncSession = Depends(get_db),
+    storage: StorageManager = Depends(get_storage),
+) -> LogSessionLinesResponse:
+    if start > end:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="start must be less than or equal to end",
+        )
+    if end - start + 1 > 1000:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Requested session line range must not exceed 1000 lines",
+        )
+
+    log_row = await _get_log_or_404(session, log_id)
+    effective_session_id = await _resolve_session_filter(
+        session,
+        log_row,
+        session_id,
+        True,
+        require_session=True,
+    )
+    assert effective_session_id is not None
+    zst_abs, idx_abs = _resolve_log_paths(log_row, storage)
+
+    engine = LogEngine()
+    try:
+        res = await asyncio.to_thread(
+            engine.read_session_lines,
+            zst_abs,
+            idx_abs,
+            effective_session_id,
+            start,
+            end,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=str(exc),
+        ) from exc
+
+    lines = [LogLine(**item) for item in res.get("lines", [])]
+    return LogSessionLinesResponse(
+        log_id=log_row.id,
+        session_id=str(res["session_id"]),
+        total_matches=int(res["total_matches"]),
+        start_index=int(res["start_index"]),
+        end_index=int(res["end_index"]),
+        lines=lines,
+    )
+
+
 @router.get("/{log_id}/around-time", response_model=LogAroundTimeResponse)
 async def get_log_around_time(
     log_id: uuid.UUID,
     timestamp: str = Query(..., min_length=1),
     window_sec: int = Query(default=10, ge=0, le=86400),
     max_lines: int = Query(default=500, ge=1, le=5000),
+    session_id: str | None = Query(default=None),
+    only_session: bool = Query(default=False),
     session: AsyncSession = Depends(get_db),
     storage: StorageManager = Depends(get_storage),
 ) -> LogAroundTimeResponse:
@@ -134,6 +223,9 @@ async def get_log_around_time(
     center_iso = parsed_dt.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
     log_row = await _get_log_or_404(session, log_id)
+    effective_session_id = await _resolve_session_filter(
+        session, log_row, session_id, only_session
+    )
     zst_abs, idx_abs = _resolve_log_paths(log_row, storage)
 
     engine = LogEngine()
@@ -145,6 +237,7 @@ async def get_log_around_time(
             parsed_dt,
             window_sec,
             max_lines,
+            effective_session_id,
         )
     except ValueError as exc:
         raise HTTPException(
@@ -162,6 +255,7 @@ async def get_log_around_time(
         window_sec=window_sec,
         start_line=start_line,
         end_line=end_line,
+        session_id=effective_session_id,
         lines=lines,
     )
 
@@ -173,10 +267,15 @@ async def search_log(
     is_regex: bool = Query(default=False),
     max_matches: int = Query(default=100, ge=1, le=1000),
     case_sensitive: bool = Query(default=False),
+    session_id: str | None = Query(default=None),
+    only_session: bool = Query(default=False),
     session: AsyncSession = Depends(get_db),
     storage: StorageManager = Depends(get_storage),
 ) -> LogSearchResponse:
     log_row = await _get_log_or_404(session, log_id)
+    effective_session_id = await _resolve_session_filter(
+        session, log_row, session_id, only_session
+    )
     zst_abs, idx_abs = _resolve_log_paths(log_row, storage)
 
     engine = LogEngine()
@@ -189,6 +288,7 @@ async def search_log(
             is_regex,
             max_matches,
             case_sensitive,
+            effective_session_id,
         )
     except ValueError as exc:
         raise HTTPException(
@@ -203,5 +303,6 @@ async def search_log(
         total_matches=int(result["total_matches"]),
         truncated=bool(result["truncated"]),
         elapsed_ms=float(result["elapsed_ms"]),
+        session_id=effective_session_id,
         matches=matches,
     )
