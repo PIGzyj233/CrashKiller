@@ -7,7 +7,6 @@ import http.server
 import importlib
 import json
 import os
-import queue
 import re
 import shutil
 import socket
@@ -596,7 +595,7 @@ def fake_toolchain(tmp_path: Path) -> FakeToolchain:
 class MockLLMServer:
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._queue: queue.Queue[dict[str, Any]] = queue.Queue()
+        self._queue: collections.deque[dict[str, Any]] = collections.deque()
         self.requests: list[dict[str, Any]] = []
         self._handler: Any = None
         self._delay_s: float = 0.0
@@ -675,14 +674,22 @@ class MockLLMServer:
                     self._send_json(status_code, body)
                     return
 
-                try:
-                    spec = outer._queue.get_nowait()
-                except queue.Empty:
-                    if loop_tool is not None:
+                has_tool_result = any(
+                    isinstance(m, dict) and m.get("role") == "tool"
+                    for m in (req_json.get("messages") or [])
+                )
+                with outer._lock:
+                    if outer._queue:
+                        spec = outer._queue.popleft()
+                    elif loop_tool is not None:
                         t_name, t_args = loop_tool
                         spec = outer._make_tool_call_spec([(t_name, t_args)])
                     else:
                         spec = outer._make_verdict_spec()
+
+                    if spec.get("_requires_tool_context") and not has_tool_result:
+                        outer._queue.appendleft(spec)
+                        spec = outer._make_tool_call_spec([("get_crash_overview", {})])
 
                 spec_delay = float(spec.get("delay_s", 0.0))
                 if spec_delay > 0:
@@ -785,13 +792,20 @@ class MockLLMServer:
             "key_log_patterns": key_log_patterns if key_log_patterns is not None else ["FATAL"],
             "suggested_component": suggested_component,
         }
-        return {"status": 200, "content": json.dumps(payload), "finish_reason": "stop"}
+        return {
+            "status": 200,
+            "content": json.dumps(payload),
+            "finish_reason": "stop",
+            "_requires_tool_context": True,
+        }
 
     def queue_tool_call(self, tool_name: str, arguments: dict[str, Any] | None = None) -> None:
-        self._queue.put(self._make_tool_call_spec([(tool_name, arguments or {})]))
+        with self._lock:
+            self._queue.append(self._make_tool_call_spec([(tool_name, arguments or {})]))
 
     def queue_tool_calls(self, calls: list[tuple[str, dict[str, Any]]]) -> None:
-        self._queue.put(self._make_tool_call_spec(calls))
+        with self._lock:
+            self._queue.append(self._make_tool_call_spec(calls))
 
     def queue_verdict(
         self,
@@ -805,19 +819,20 @@ class MockLLMServer:
         key_log_patterns: list[str] | None = None,
         suggested_component: str = "Rendering",
     ) -> None:
-        self._queue.put(
-            self._make_verdict_spec(
-                verdict=verdict,
-                matched_issue_id=matched_issue_id,
-                confidence=confidence,
-                suggested_title=suggested_title,
-                root_cause_analysis=root_cause_analysis,
-                reasoning_summary=reasoning_summary,
-                evidence_log_snippets=evidence_log_snippets,
-                key_log_patterns=key_log_patterns,
-                suggested_component=suggested_component,
+        with self._lock:
+            self._queue.append(
+                self._make_verdict_spec(
+                    verdict=verdict,
+                    matched_issue_id=matched_issue_id,
+                    confidence=confidence,
+                    suggested_title=suggested_title,
+                    root_cause_analysis=root_cause_analysis,
+                    reasoning_summary=reasoning_summary,
+                    evidence_log_snippets=evidence_log_snippets,
+                    key_log_patterns=key_log_patterns,
+                    suggested_component=suggested_component,
+                )
             )
-        )
 
     def queue_response(
         self,
@@ -826,7 +841,8 @@ class MockLLMServer:
         content: str | None = None,
         delay_s: float = 0.0,
     ) -> None:
-        self._queue.put({"status": status, "body": body, "content": content, "delay_s": delay_s})
+        with self._lock:
+            self._queue.append({"status": status, "body": body, "content": content, "delay_s": delay_s})
 
     def set_handler(self, fn: Any) -> None:
         with self._lock:
@@ -853,11 +869,7 @@ class MockLLMServer:
             self._error_status = None
             self._error_message = "Mock LLM error"
             self._loop_forever_tool = None
-            while not self._queue.empty():
-                try:
-                    self._queue.get_nowait()
-                except queue.Empty:
-                    break
+            self._queue.clear()
 
 
 @pytest.fixture

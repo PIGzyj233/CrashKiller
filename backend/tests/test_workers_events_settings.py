@@ -565,9 +565,34 @@ async def test_parse_crash_pipeline_smart_triage_and_corrupt_dump_handling(
 
     class MockLLM:
         def __init__(self) -> None:
-            async def _create(**_kw: Any) -> Any:
+            async def _create(**kw: Any) -> Any:
                 nonlocal llm_calls
                 llm_calls += 1
+                has_tool = any(
+                    isinstance(m, dict) and m.get("role") == "tool"
+                    for m in (kw.get("messages") or [])
+                )
+                if not has_tool:
+                    return SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(
+                                message=SimpleNamespace(
+                                    content=None,
+                                    tool_calls=[
+                                        SimpleNamespace(
+                                            id="ov_1",
+                                            type="function",
+                                            function=SimpleNamespace(
+                                                name="get_crash_overview",
+                                                arguments="{}",
+                                            ),
+                                        )
+                                    ],
+                                )
+                            )
+                        ],
+                        usage=SimpleNamespace(prompt_tokens=30, completion_tokens=10),
+                    )
                 return SimpleNamespace(
                     choices=[
                         SimpleNamespace(
@@ -607,7 +632,7 @@ async def test_parse_crash_pipeline_smart_triage_and_corrupt_dump_handling(
             await sub.get(timeout=1.0),
         ]
     assert [e["status"] for e in events_1] == ["PARSING", "TRIAGING", "ANALYZED"]
-    assert llm_calls == 1
+    assert llm_calls == 2
     assert list(storage_manager.partition_path("staging").iterdir()) == []
 
     # Second identical crash skips AI in SMART_TRIAGE (0 additional LLM calls).
@@ -632,7 +657,7 @@ async def test_parse_crash_pipeline_smart_triage_and_corrupt_dump_handling(
     res2 = await parse_crash(ctx, str(c2_id))
     assert res2["queued_ai"] is False
     assert res2["status"] == "ANALYZED"
-    assert llm_calls == 1
+    assert llm_calls == 2
 
     # Corrupt .dmp.zst triggers zstd.ZstdError -> CrashReport.status == "FAILED" + SSE error.
     async with session_factory() as session:
@@ -1014,7 +1039,32 @@ async def test_tasks_expire_on_commit_true_and_resymbolicate_empty_list(
 
     class MockLLM:
         def __init__(self) -> None:
-            async def _create(**_kw: Any) -> Any:
+            async def _create(**kw: Any) -> Any:
+                has_tool = any(
+                    isinstance(m, dict) and m.get("role") == "tool"
+                    for m in (kw.get("messages") or [])
+                )
+                if not has_tool:
+                    return SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(
+                                message=SimpleNamespace(
+                                    content=None,
+                                    tool_calls=[
+                                        SimpleNamespace(
+                                            id="ov_exp",
+                                            type="function",
+                                            function=SimpleNamespace(
+                                                name="get_crash_overview",
+                                                arguments="{}",
+                                            ),
+                                        )
+                                    ],
+                                )
+                            )
+                        ],
+                        usage=SimpleNamespace(prompt_tokens=15, completion_tokens=8),
+                    )
                 return SimpleNamespace(
                     choices=[
                         SimpleNamespace(

@@ -354,7 +354,7 @@ export interface EvidenceLogSnippet {
 export interface AIAnalysisResult {
   verdict: AIVerdict;
   matched_issue_id: number | null;
-  confidence: number;
+  confidence: number | null;
   suggested_title: string;
   root_cause_analysis: string;
   reasoning_summary: string;

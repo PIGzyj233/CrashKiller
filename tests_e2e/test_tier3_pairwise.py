@@ -378,7 +378,7 @@ async def test_t3_07_fuzzy_recall_top5_and_human_verdict(
             return mock_llm_server._build_completion_payload(
                 model=req_json["model"],
                 tool_calls=mock_llm_server._make_tool_call_spec(
-                    [("search_known_issues", {"query": ""})]
+                    [("get_crash_overview", {}), ("search_known_issues", {"query": ""})]
                 )["tool_calls"],
                 finish_reason="tool_calls",
             )

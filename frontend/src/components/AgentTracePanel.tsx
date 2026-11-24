@@ -232,10 +232,11 @@ export function AgentTracePanel({
   );
 
   const result = activeRun?.result_json ?? null;
-  const effectiveVerdict: AIVerdict | null =
-    result?.verdict ?? crash.ai_verdict ?? null;
+  const effectiveVerdict: AIVerdict | null = activeRun
+    ? (result?.verdict ?? null)
+    : (crash.ai_verdict ?? null);
   const effectiveConfidence = normalizeConfidence(
-    result?.confidence ?? crash.ai_confidence,
+    activeRun ? (result?.confidence ?? null) : crash.ai_confidence,
   );
   const linkedIssueId = crash.issue_id ?? result?.matched_issue_id ?? null;
 

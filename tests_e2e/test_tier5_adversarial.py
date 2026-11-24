@@ -300,6 +300,7 @@ async def test_t5_05_ai_overflow_matched_issue_id_and_non_finite_confidence(
     dmp = fake_toolchain.make_dump()
 
     for bad_id in (10**20, 0, -5):
+        mock_llm_server.queue_tool_call("get_crash_overview")
         mock_llm_server.queue_response(
             status=200,
             body=mock_llm_server._build_completion_payload(
@@ -1250,7 +1251,7 @@ async def test_t5_19_concurrent_reprocess_triage_atomic_409(
     initial = await helpers.wait_for_crash_status(client, cid)
     assert initial["status"] == "ANALYZED"
     assert len(initial["ai_runs"]) == 1
-    assert len(mock_llm_server.requests) == 1
+    assert len(mock_llm_server.requests) == 2
     issue_id = initial["issue"]["id"]
 
     mock_llm_server.set_delay(0.35)
@@ -1272,7 +1273,7 @@ async def test_t5_19_concurrent_reprocess_triage_atomic_409(
     final_detail = await helpers.wait_for_crash_status(client, cid)
     assert final_detail["status"] == "ANALYZED"
     assert len(final_detail["ai_runs"]) == 2
-    assert len(mock_llm_server.requests) == 2
+    assert len(mock_llm_server.requests) == 4
     assert (await client.get(f"/api/v1/issues/{issue_id}")).json()["crash_count"] == 1
 
 

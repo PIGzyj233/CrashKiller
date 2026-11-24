@@ -9,6 +9,7 @@ import math
 import re
 import time
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -37,6 +38,16 @@ logger = logging.getLogger(__name__)
 VALID_VERDICTS: frozenset[str] = frozenset(
     {"KNOWN_ISSUE", "NEW_ISSUE", "REGRESSION", "NEEDS_REVIEW"}
 )
+CRASH_EVIDENCE_TOOLS: frozenset[str] = frozenset(
+    {
+        "get_crash_overview",
+        "get_other_threads",
+        "get_log_summary",
+        "read_log_lines",
+        "read_log_around_time",
+        "search_log",
+    }
+)
 TRUNCATION_MARKER = "\n...[TRUNCATED]"
 _INT32_MAX = 2_147_483_647
 
@@ -51,6 +62,7 @@ Investigation rules:
 2. Inspect attached logs (get_log_summary, search_log, read_log_around_time, read_log_lines),
    other threads (get_other_threads), or known issues (search_known_issues, get_issue_detail).
 3. Never invent log line numbers, file contents, or issue_id values. Cite only observed tool data.
+   Use function_preview only as a hint from a truncated function name.
    Never return an empty NEEDS_REVIEW without first calling tools to inspect the crash.
 4. Only AFTER completing your tool-based investigation, output ONLY a single valid JSON object
    (no surrounding prose) with non-empty analysis fields (including for NEEDS_REVIEW):
@@ -265,6 +277,291 @@ def _truncate_tool_output(text: str, max_chars: int) -> str:
     return text[: max_chars - len(TRUNCATION_MARKER)] + TRUNCATION_MARKER
 
 
+def _fit_list_prefix(
+    trimmed: dict[str, Any],
+    key: str,
+    items: list[Any],
+    budget: int,
+) -> int:
+    """Binary-search the largest prefix of items that keeps json.dumps(trimmed) <= budget."""
+    lo, hi = 0, len(items)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        trimmed[key] = items[:mid]
+        if len(json.dumps(trimmed, default=str)) <= budget:
+            lo = mid
+        else:
+            hi = mid - 1
+    trimmed[key] = items[:lo]
+    return lo
+
+
+# Identifier-like fields are delivered whole or omitted; clipping an address or module
+# name would hand the model a different value than the one in the report.
+_ATOMIC_ENTRY_FIELDS = frozenset(
+    {"line_number", "frame_index", "ip", "module", "module_offset", "offset"}
+)
+# A clipped symbol is sent as a preview so it cannot be mistaken for a full function name.
+_CLIPPED_ENTRY_FIELDS = {"text": "text", "function": "function_preview"}
+
+
+def _fit_partial_entry(
+    root: dict[str, Any],
+    container: dict[str, Any],
+    key: str,
+    entry: dict[str, Any],
+    budget: int,
+    has_evidence: Callable[[Any], bool],
+) -> bool:
+    """Append a field-trimmed copy of entry after the kept items in container[key].
+
+    Fields are restored in priority order: identifiers (line numbers, addresses, modules)
+    first, then the clippable body (text/function) which takes whatever budget is left,
+    then remaining metadata such as timestamps and levels. Identifiers are delivered whole
+    or omitted. Clipped function names are labeled as previews. The partial entry is kept
+    only if it still carries evidence. Otherwise container[key] retains the fitted prefix.
+    """
+    kept = list(container.get(key) or [])
+
+    def fits() -> bool:
+        return len(json.dumps(root, default=str)) <= budget
+
+    def encoded_len(value: Any) -> int:
+        return len(json.dumps(value, default=str))
+
+    candidate: dict[str, Any] = {}
+    container[key] = [*kept, candidate]
+    if not fits():
+        container[key] = kept
+        return False
+
+    def priority(item: tuple[str, Any]) -> tuple[int, int]:
+        name, value = item
+        if name in _ATOMIC_ENTRY_FIELDS:
+            return 0, encoded_len(value)
+        if name in _CLIPPED_ENTRY_FIELDS:
+            return 1, 0
+        return 2, encoded_len(value)
+
+    for field, value in sorted(entry.items(), key=priority):
+        candidate[field] = value
+        if fits():
+            continue
+        del candidate[field]
+        clipped_field = _CLIPPED_ENTRY_FIELDS.get(field)
+        if clipped_field is None or not isinstance(value, str) or not value:
+            continue
+        lo, hi = 0, len(value)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            candidate[clipped_field] = value[:mid]
+            if fits():
+                lo = mid
+            else:
+                hi = mid - 1
+        if value[:lo].strip():
+            candidate[clipped_field] = value[:lo]
+        else:
+            del candidate[clipped_field]
+
+    if not has_evidence(candidate):
+        container[key] = kept
+        return False
+    return True
+
+
+def _prepare_tool_output_for_llm(
+    tool_name: str,
+    raw_out: str,
+    max_chars: int,
+) -> tuple[str, dict[str, Any] | None]:
+    """Trim tool output structurally by complete entries and return (delivered_text, payload)."""
+    if max_chars <= 0:
+        return "", None
+    try:
+        parsed = json.loads(raw_out)
+    except Exception:
+        return _truncate_tool_output(raw_out, max_chars), None
+
+    if not isinstance(parsed, dict):
+        return _truncate_tool_output(raw_out, max_chars), None
+
+    if len(raw_out) <= max_chars:
+        return raw_out, parsed
+
+    budget = max_chars - len(TRUNCATION_MARKER)
+    if budget <= 0:
+        return _truncate_tool_output(raw_out, max_chars), None
+
+    list_priority: dict[str, tuple[str, ...]] = {
+        "get_crash_overview": ("top_frames", "missing_symbols", "logs", "candidate_issues"),
+        "get_other_threads": ("threads",),
+        "get_log_summary": ("recent_errors", "tail_lines"),
+        "read_log_lines": ("lines",),
+        "read_log_around_time": ("lines",),
+        "search_log": ("matches",),
+        "search_known_issues": ("issues",),
+        "get_issue_detail": ("clusters",),
+    }
+
+    trimmed: dict[str, Any] = {
+        k: ([] if isinstance(v, list) else v) for k, v in parsed.items()
+    }
+    if len(json.dumps(trimmed, default=str)) > budget:
+        # Even the empty-list skeleton does not fit; fall back to raw truncation with no
+        # structured crash-evidence payload.
+        return _truncate_tool_output(raw_out, max_chars), None
+
+    preferred = list_priority.get(tool_name, ())
+    ordered_list_keys = [
+        *[k for k in preferred if isinstance(parsed.get(k), list)],
+        *[k for k, v in parsed.items() if isinstance(v, list) and k not in preferred],
+    ]
+
+    # Lists whose first non-fitting entry is field-trimmed into the remaining budget,
+    # mapped to the check that the trimmed entry still carries usable evidence.
+    partial_evidence_checks: dict[str, Callable[[Any], bool]] = {
+        "top_frames": _frame_has_evidence,
+        "missing_symbols": _missing_symbol_has_evidence,
+        "lines": _log_entry_has_text,
+        "matches": _log_entry_has_text,
+        "tail_lines": _log_entry_has_text,
+        "recent_errors": _log_entry_has_text,
+    }
+    for key in ordered_list_keys:
+        items = parsed[key]
+        if not items:
+            continue
+        fitted = _fit_list_prefix(trimmed, key, items, budget)
+        if fitted >= len(items):
+            continue
+        next_item = items[fitted]
+        if (
+            tool_name == "get_other_threads"
+            and key == "threads"
+            and isinstance(next_item, dict)
+            and isinstance(next_item.get("frames"), list)
+        ):
+            # Fit as many frames as possible from the next thread entry, then field-trim
+            # the first frame that does not fit so its short fields (ip/module) survive.
+            next_thread = dict(next_item)
+            next_frames = list(next_thread["frames"])
+            next_thread["frames"] = []
+            trimmed[key] = [*items[:fitted], next_thread]
+            if len(json.dumps(trimmed, default=str)) <= budget:
+                lo, hi = 0, len(next_frames)
+                while lo < hi:
+                    mid = (lo + hi + 1) // 2
+                    next_thread["frames"] = next_frames[:mid]
+                    if len(json.dumps(trimmed, default=str)) <= budget:
+                        lo = mid
+                    else:
+                        hi = mid - 1
+                next_thread["frames"] = next_frames[:lo]
+                if lo < len(next_frames) and isinstance(next_frames[lo], dict):
+                    _fit_partial_entry(
+                        trimmed,
+                        next_thread,
+                        "frames",
+                        next_frames[lo],
+                        budget,
+                        _frame_has_evidence,
+                    )
+            else:
+                trimmed[key] = items[:fitted]
+        elif key in partial_evidence_checks and isinstance(next_item, dict):
+            # Keep the already-fitted prefix and field-trim the next entry (e.g. a long
+            # FATAL after a short INFO, or a frame with a huge symbol name).
+            _fit_partial_entry(
+                trimmed, trimmed, key, next_item, budget, partial_evidence_checks[key]
+            )
+
+    delivered_text = json.dumps(trimmed, default=str) + TRUNCATION_MARKER
+    return delivered_text, trimmed
+
+
+def _frame_has_evidence(frame: Any) -> bool:
+    """Return True if a delivered stack frame carries a location, symbol, or instruction pointer."""
+    if not isinstance(frame, dict):
+        return False
+    for key in ("function", "module", "file", "module_offset", "ip", "offset"):
+        val = frame.get(key)
+        if isinstance(val, str) and val.strip():
+            return True
+        if isinstance(val, int) and not isinstance(val, bool) and key in {"ip", "offset"}:
+            return True
+    return False
+
+
+def _log_entry_has_text(entry: Any) -> bool:
+    """Return True if a delivered log line entry contains non-empty log text."""
+    if isinstance(entry, dict):
+        text = entry.get("text")
+        return isinstance(text, str) and bool(text.strip())
+    if isinstance(entry, str):
+        return bool(entry.strip())
+    return False
+
+
+def _missing_symbol_has_evidence(item: Any) -> bool:
+    if not isinstance(item, dict):
+        return False
+    return any(
+        isinstance(item.get(key), str) and item[key].strip()
+        for key in ("debug_file", "code_file", "filename", "module")
+    )
+
+
+def _payload_has_crash_evidence(
+    tool_name: str,
+    delivered_payload: dict[str, Any] | None,
+) -> bool:
+    """Check whether the actual structured payload delivered to the LLM contains crash evidence."""
+    if tool_name not in CRASH_EVIDENCE_TOOLS or not isinstance(delivered_payload, dict):
+        return False
+    if delivered_payload.get("error"):
+        return False
+
+    if tool_name == "get_crash_overview":
+        top_frames = delivered_payload.get("top_frames")
+        if isinstance(top_frames, list) and any(_frame_has_evidence(f) for f in top_frames):
+            return True
+        missing_syms = delivered_payload.get("missing_symbols")
+        if isinstance(missing_syms, list) and any(
+            _missing_symbol_has_evidence(m) for m in missing_syms
+        ):
+            return True
+        return False
+
+    if tool_name == "get_other_threads":
+        threads = delivered_payload.get("threads")
+        if not isinstance(threads, list):
+            return False
+        return any(
+            isinstance(thread, dict)
+            and isinstance(thread.get("frames"), list)
+            and any(_frame_has_evidence(f) for f in thread["frames"])
+            for thread in threads
+        )
+
+    if tool_name == "get_log_summary":
+        for key in ("recent_errors", "tail_lines"):
+            entries = delivered_payload.get(key)
+            if isinstance(entries, list) and any(_log_entry_has_text(e) for e in entries):
+                return True
+        return False
+
+    if tool_name in {"read_log_lines", "read_log_around_time"}:
+        lines = delivered_payload.get("lines")
+        return isinstance(lines, list) and any(_log_entry_has_text(e) for e in lines)
+
+    if tool_name == "search_log":
+        matches = delivered_payload.get("matches")
+        return isinstance(matches, list) and any(_log_entry_has_text(e) for e in matches)
+
+    return False
+
+
 def _build_needs_review_result(reason: str) -> dict[str, Any]:
     return {
         "verdict": "NEEDS_REVIEW",
@@ -303,17 +600,39 @@ _PLACEHOLDER_ANALYSIS_TEXTS: frozenset[str] = frozenset(
 
 
 def _has_substantive_text(value: Any) -> bool:
-    text = str(value or "").strip()
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
     return bool(text) and text.lower() not in _PLACEHOLDER_ANALYSIS_TEXTS
+
+
+def _parse_optional_str_field(
+    data: dict[str, Any],
+    field_name: str,
+    *,
+    max_len: int | None = None,
+) -> str:
+    raw = data.get(field_name)
+    if raw is None:
+        return ""
+    if not isinstance(raw, str):
+        raise ValueError(f"{field_name} must be a string")
+    cleaned = raw.strip()
+    return cleaned[:max_len] if max_len is not None else cleaned
 
 
 def _validate_verdict_substance(
     verdict_data: dict[str, Any],
     *,
-    tool_calls_executed: int,
+    crash_evidence_reads: int,
 ) -> str | None:
-    """Validate that a parsed verdict has real analysis content and did not skip investigation."""
-    verdict = str(verdict_data.get("verdict") or "").strip().upper()
+    """Validate that a parsed verdict is backed by current-crash tool evidence and real analysis."""
+    if crash_evidence_reads <= 0:
+        return (
+            "AI returned a verdict without successfully reading crash evidence "
+            "(overview, stack/threads, or logs) via tools"
+        )
+
     has_root_cause = _has_substantive_text(verdict_data.get("root_cause_analysis"))
     has_reasoning = _has_substantive_text(verdict_data.get("reasoning_summary"))
 
@@ -322,9 +641,6 @@ def _validate_verdict_substance(
             "Empty AI report: both root_cause_analysis and reasoning_summary are missing "
             "substantive content"
         )
-
-    if verdict == "NEEDS_REVIEW" and tool_calls_executed == 0:
-        return "AI returned NEEDS_REVIEW without invoking any investigation tools"
 
     return None
 
@@ -339,9 +655,12 @@ def _parse_verdict_json(raw_content: str | None) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError("LLM verdict output must be a JSON object")
 
-    verdict = str(data.get("verdict") or "").strip().upper()
+    raw_verdict = data.get("verdict")
+    if not isinstance(raw_verdict, str):
+        raise ValueError(f"Invalid verdict: {raw_verdict!r}")
+    verdict = raw_verdict.strip().upper()
     if verdict not in VALID_VERDICTS:
-        raise ValueError(f"Invalid verdict: {data.get('verdict')!r}")
+        raise ValueError(f"Invalid verdict: {raw_verdict!r}")
 
     raw_matched_id = data.get("matched_issue_id")
     matched_issue_id: int | None
@@ -367,6 +686,10 @@ def _parse_verdict_json(raw_content: str | None) -> dict[str, Any]:
         if not math.isfinite(parsed_conf):
             parsed_conf = 0.0
         confidence = round(max(0.0, min(1.0, parsed_conf)), 4)
+
+    suggested_title = _parse_optional_str_field(data, "suggested_title", max_len=512)
+    root_cause_analysis = _parse_optional_str_field(data, "root_cause_analysis")
+    reasoning_summary = _parse_optional_str_field(data, "reasoning_summary")
 
     raw_snippets = data.get("evidence_log_snippets") or []
     snippets: list[dict[str, Any]] = []
@@ -394,17 +717,17 @@ def _parse_verdict_json(raw_content: str | None) -> dict[str, Any]:
         patterns = [str(p).strip() for p in raw_patterns if p is not None and str(p).strip()]
 
     comp = data.get("suggested_component")
-    suggested_component = (
-        str(comp).strip()[:128] if comp is not None and str(comp).strip() else None
-    )
+    if comp is not None and not isinstance(comp, str):
+        raise ValueError("suggested_component must be a string or null")
+    suggested_component = comp.strip()[:128] if isinstance(comp, str) and comp.strip() else None
 
     return {
         "verdict": verdict,
         "matched_issue_id": matched_issue_id,
         "confidence": confidence,
-        "suggested_title": str(data.get("suggested_title") or "").strip()[:512],
-        "root_cause_analysis": str(data.get("root_cause_analysis") or "").strip(),
-        "reasoning_summary": str(data.get("reasoning_summary") or "").strip(),
+        "suggested_title": suggested_title,
+        "root_cause_analysis": root_cause_analysis,
+        "reasoning_summary": reasoning_summary,
         "evidence_log_snippets": snippets,
         "key_log_patterns": list(dict.fromkeys(patterns)),
         "suggested_component": suggested_component,
@@ -1257,7 +1580,7 @@ class AITriageAgent:
 
         async def _run_loop() -> None:
             nonlocal prompt_tokens, completion_tokens, run_status, result_dict
-            tool_calls_executed = 0
+            crash_evidence_reads = 0
             investigation_nudged = False
             json_finalization_requested = False
 
@@ -1374,9 +1697,14 @@ class AITriageAgent:
                                 args=parsed_args,
                             )
 
-                        tool_calls_executed += 1
                         tool_duration_ms = max(0, int((time.monotonic() - t0) * 1000))
-                        truncated_out = _truncate_tool_output(raw_out, tool_max_chars)
+                        truncated_out, delivered_payload = _prepare_tool_output_for_llm(
+                            tool_name, raw_out, tool_max_chars
+                        )
+                        if tool_err is None and _payload_has_crash_evidence(
+                            tool_name, delivered_payload
+                        ):
+                            crash_evidence_reads += 1
                         messages.append(
                             {
                                 "role": "tool",
@@ -1407,7 +1735,7 @@ class AITriageAgent:
                 else:
                     failure_reason = _validate_verdict_substance(
                         parsed_verdict,
-                        tool_calls_executed=tool_calls_executed,
+                        crash_evidence_reads=crash_evidence_reads,
                     )
 
                 if parsed_verdict is not None and failure_reason is None:
@@ -1417,9 +1745,9 @@ class AITriageAgent:
 
                 assert failure_reason is not None
 
-                # Recovery 1: Model skipped tools and produced an invalid/empty/NEEDS_REVIEW reply.
+                # Recovery 1: Current crash evidence has not been read yet; nudge once to inspect.
                 if (
-                    tool_calls_executed == 0
+                    crash_evidence_reads == 0
                     and not investigation_nudged
                     and _step_idx < max_steps
                 ):
@@ -1429,8 +1757,9 @@ class AITriageAgent:
                             "step": len(trace) + 1,
                             "role": "system",
                             "message": (
-                                "Model responded without calling investigation tools; prompting "
-                                "it to call get_crash_overview first."
+                                "Model responded before successfully reading current crash "
+                                "overview/stack/logs via tools; prompting it to call "
+                                "get_crash_overview first."
                             ),
                             "output_preview": str(msg_content or "")[:1000],
                         }
@@ -1440,18 +1769,18 @@ class AITriageAgent:
                             "role": "user",
                             "content": (
                                 f"Your previous response was not accepted ({failure_reason}). "
-                                "You have not called any investigation tools yet and have not "
-                                "inspected the crash stack trace or logs. Call get_crash_overview "
-                                "first (and inspect attached logs/known issues as needed) before "
+                                "You have not successfully read the current crash overview, "
+                                "stack trace, or logs yet. Call get_crash_overview first (and "
+                                "inspect attached logs or other threads as needed) before "
                                 "producing your final JSON verdict."
                             ),
                         }
                     )
                     continue
 
-                # Recovery 2: Investigation already ran, but output was prose or incomplete JSON.
+                # Recovery 2: Crash evidence was read, but output was prose or incomplete JSON.
                 # Transition to Phase 2: disable tools and enable strict JSON output format.
-                if tool_calls_executed > 0 and not json_finalization_requested:
+                if crash_evidence_reads > 0 and not json_finalization_requested:
                     json_finalization_requested = True
                     trace.append(
                         {
@@ -1476,7 +1805,8 @@ class AITriageAgent:
                                 "matched_issue_id (integer or null), confidence (number 0.0-1.0), "
                                 "suggested_title, root_cause_analysis, reasoning_summary, "
                                 "evidence_log_snippets, key_log_patterns, and suggested_component. "
-                                "Do not leave root_cause_analysis or reasoning_summary empty."
+                                "All text fields must be strings, and root_cause_analysis or "
+                                "reasoning_summary must not be empty."
                             ),
                         }
                     )
@@ -1503,7 +1833,7 @@ class AITriageAgent:
                     else:
                         final_err = _validate_verdict_substance(
                             final_verdict,
-                            tool_calls_executed=tool_calls_executed,
+                            crash_evidence_reads=crash_evidence_reads,
                         )
                         if final_err is None:
                             result_dict = final_verdict
@@ -1524,16 +1854,73 @@ class AITriageAgent:
                 run_status = "FAILED"
                 return
 
-            # Exhausted max_steps without a final verdict.
-            limit_reason = f"Exceeded AI_MAX_STEPS ({max_steps}) without final verdict"
-            trace.append(
-                {
-                    "step": len(trace) + 1,
-                    "role": "system",
-                    "error": limit_reason,
-                }
+            # Exhausted max_steps while calling tools. If current-crash evidence was already
+            # retrieved, grant one tools-disabled JSON summary turn within the remaining timeout
+            # budget so configurations like AI_MAX_STEPS=1 can still produce a final verdict.
+            post_budget_preview: str | None = None
+            post_budget_error: str | None = None
+            if crash_evidence_reads > 0:
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            f"You have reached the investigation step limit ({max_steps}). "
+                            "No further tool calls are available. Based strictly on the crash "
+                            "evidence already gathered above, output ONLY a single valid JSON "
+                            "object with all required verdict fields (verdict, matched_issue_id, "
+                            "confidence, suggested_title, root_cause_analysis, reasoning_summary, "
+                            "evidence_log_snippets, key_log_patterns, suggested_component). "
+                            "All text fields must be strings, and root_cause_analysis or "
+                            "reasoning_summary must not be empty."
+                        ),
+                    }
+                )
+                final_content, final_reasoning, _final_tc, final_msg = await _invoke_llm(
+                    allow_tools=False,
+                    force_json=True,
+                )
+                messages.append(final_msg)
+                if final_reasoning:
+                    trace.append(
+                        {
+                            "step": len(trace) + 1,
+                            "role": "reasoning",
+                            "output_preview": final_reasoning[:1500],
+                        }
+                    )
+                if final_content and str(final_content).strip():
+                    post_budget_preview = str(final_content)[:1000]
+                try:
+                    final_verdict = _parse_verdict_json(final_content)
+                except Exception as exc:
+                    if post_budget_preview is not None:
+                        post_budget_error = f"Malformed LLM JSON verdict: {exc}"
+                else:
+                    final_err = _validate_verdict_substance(
+                        final_verdict,
+                        crash_evidence_reads=crash_evidence_reads,
+                    )
+                    if final_err is None:
+                        result_dict = final_verdict
+                        run_status = "COMPLETED"
+                        return
+                    post_budget_error = final_err
+
+            # Exhausted max_steps without a valid final verdict.
+            failure_reason = (
+                post_budget_error
+                if post_budget_error is not None
+                else f"Exceeded AI_MAX_STEPS ({max_steps}) without final verdict"
             )
-            result_dict = _build_needs_review_result(limit_reason)
+            limit_entry: dict[str, Any] = {
+                "step": len(trace) + 1,
+                "role": "system",
+                "error": failure_reason,
+            }
+            if post_budget_preview:
+                limit_entry["output_preview"] = post_budget_preview
+            trace.append(limit_entry)
+            result_dict = _build_needs_review_result(failure_reason)
             run_status = "FAILED"
 
         try:
