@@ -471,7 +471,7 @@ const zhCN = {
     analysisFailedTitle: "AI 分析失败",
     analysisFailedFallback: "AI 分诊未能输出结构化判定结果。",
     needsReviewTitle: "需要人工复核",
-    needsReviewDesc: "Agent 触及步数/超时护栏或置信度不足，请查看下方证据后人工确认或关联问题。",
+    needsReviewDesc: "AI 判定当前证据不足以自动归因，请结合下方分析与证据人工复核或关联问题。",
     skippedBanner: "本次崩溃已跳过 AI 分诊（智能分诊命中精确聚类或处于手动模式）。",
     runManually: "手动运行 AI 分析 →",
     suggestedTitle: "建议问题标题",

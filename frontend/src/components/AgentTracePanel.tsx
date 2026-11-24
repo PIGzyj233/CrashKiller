@@ -244,10 +244,21 @@ export function AgentTracePanel({
     activeRun?.status === "RUNNING" ||
     crash.status === "TRIAGING";
 
-  const firstTraceError = useMemo(
-    () => traceParse.steps.find((s) => Boolean(s.error))?.error ?? null,
-    [traceParse.steps],
-  );
+  const primaryTraceError = useMemo(() => {
+    for (let i = traceParse.steps.length - 1; i >= 0; i -= 1) {
+      const step = traceParse.steps[i];
+      if (step.role === "system" && step.error) {
+        return step.error;
+      }
+    }
+    for (let i = traceParse.steps.length - 1; i >= 0; i -= 1) {
+      const step = traceParse.steps[i];
+      if (step.error) {
+        return step.error;
+      }
+    }
+    return null;
+  }, [traceParse.steps]);
 
   const verdictMeta = effectiveVerdict ? VERDICT_META[effectiveVerdict] : null;
   const VerdictIcon = verdictMeta?.icon ?? Bot;
@@ -429,9 +440,9 @@ export function AgentTracePanel({
             <XCircle className="mt-0.5 h-4 w-4 shrink-0 text-rose-600" />
             <div className="min-w-0 flex-1">
               <p className="font-semibold">{t("agent.analysisFailedTitle")}</p>
-              {firstTraceError ? (
+              {primaryTraceError ? (
                 <p className="mt-1 break-words font-mono text-[11px] text-rose-800">
-                  {firstTraceError}
+                  {primaryTraceError}
                 </p>
               ) : (
                 <p className="mt-1 text-rose-700">
@@ -442,17 +453,18 @@ export function AgentTracePanel({
           </div>
         )}
 
-        {effectiveVerdict === "NEEDS_REVIEW" && (
-          <div className="flex items-start gap-2.5 rounded-lg border border-amber-200 bg-amber-50 px-3.5 py-3 text-xs text-amber-900">
-            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
-            <div>
-              <p className="font-semibold">{t("agent.needsReviewTitle")}</p>
-              <p className="mt-0.5 text-amber-800">
-                {t("agent.needsReviewDesc")}
-              </p>
+        {effectiveVerdict === "NEEDS_REVIEW" &&
+          activeRun?.status !== "FAILED" && (
+            <div className="flex items-start gap-2.5 rounded-lg border border-amber-200 bg-amber-50 px-3.5 py-3 text-xs text-amber-900">
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
+              <div>
+                <p className="font-semibold">{t("agent.needsReviewTitle")}</p>
+                <p className="mt-0.5 text-amber-800">
+                  {t("agent.needsReviewDesc")}
+                </p>
+              </div>
             </div>
-          </div>
-        )}
+          )}
 
         {!activeRun && crash.status === "ANALYZED" && (
           <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3.5 py-3 text-xs text-slate-700">

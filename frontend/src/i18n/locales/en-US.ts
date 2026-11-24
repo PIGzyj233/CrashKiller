@@ -503,7 +503,7 @@ const enUS: DeepStringify<typeof zhCN> = {
       "The AI triage run did not complete with a structured verdict.",
     needsReviewTitle: "Needs Human Review",
     needsReviewDesc:
-      "The agent reached step/timeout guardrails or lacked sufficient confidence. Inspect the evidence below and confirm or assign an issue.",
+      "The agent could not make a high-confidence automatic attribution. Inspect the analysis and evidence below to confirm or assign an issue.",
     skippedBanner:
       "AI triage was skipped for this crash (Smart Triage exact cluster match or Manual mode).",
     runManually: "Run AI analysis manually →",

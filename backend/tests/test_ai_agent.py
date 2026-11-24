@@ -603,6 +603,7 @@ async def test_dynamic_db_settings_override_and_cross_project_isolation(
                     "verdict": "KNOWN_ISSUE",
                     "matched_issue_id": foreign_issue.id,
                     "confidence": 0.9,
+                    "root_cause_analysis": "Attempted match against foreign project issue.",
                 }
             )
         )
@@ -815,7 +816,10 @@ async def test_verdict_non_finite_confidence_guarded(
     )
     nan_client = FakeOpenAIClient(
         lambda _s, _k: _make_response(
-            content='{"verdict": "NEW_ISSUE", "confidence": NaN, "suggested_title": "NaN Conf"}'
+            content=(
+                '{"verdict": "NEW_ISSUE", "confidence": NaN, "suggested_title": "NaN Conf", '
+                '"root_cause_analysis": "Null dereference in SubmitDraw."}'
+            )
         )
     )
     agent = AITriageAgent(storage=storage_manager, settings=test_settings)
@@ -1096,7 +1100,36 @@ async def test_llm_provider_thinking_level_mapping_and_fallback(
         == "https://api.anthropic.com"
     )
 
-    # Verify multi-step BadRequestError fallback drops response_format then thinking params.
+    assert "response_format" not in oa_high
+    assert "tools" in oa_high
+
+    # Even if include_response_format=True is passed with tools, response_format must be omitted.
+    zhipu_tools = llm_providers.build_openai_completion_kwargs(
+        provider_id="zhipu",
+        model_name="glm-5.3-flash",
+        thinking_level="auto",
+        messages=[],
+        tools=AI_TOOL_DEFINITIONS,
+        include_response_format=True,
+    )
+    assert "tools" in zhipu_tools
+    assert "response_format" not in zhipu_tools
+
+    # Without tools (Phase 2 JSON finalization), response_format is enabled and tools are omitted.
+    zhipu_json = llm_providers.build_openai_completion_kwargs(
+        provider_id="zhipu",
+        model_name="glm-5.3-flash",
+        thinking_level="auto",
+        messages=[],
+        tools=None,
+        include_response_format=True,
+    )
+    assert "tools" not in zhipu_json
+    assert "tool_choice" not in zhipu_json
+    assert zhipu_json["response_format"] == {"type": "json_object"}
+
+    # Verify multi-step BadRequestError fallback drops thinking params during investigation
+    # and drops response_format then thinking params during Phase 2 JSON finalization.
     _project, crash, _log = await _seed_crash_with_log(
         db_session, storage_manager, tmp_path
     )
@@ -1107,12 +1140,23 @@ async def test_llm_provider_thinking_level_mapping_and_fallback(
         resp = httpx.Response(400, request=req, json={"error": {"message": "unsupported param"}})
         return openai.BadRequestError("unsupported param", response=resp, body=None)
 
+    phase2_started = False
+
     def _handler(step: int, kwargs: dict[str, Any]) -> Any:
+        nonlocal phase2_started
         captured_kwargs.append(dict(kwargs))
         if "response_format" in kwargs:
+            phase2_started = True
             raise _make_bad_request()
         if "reasoning_effort" in kwargs:
             raise _make_bad_request()
+        if not phase2_started:
+            # First investigation turn calls a tool; second returns prose to trigger Phase 2.
+            if not any(m.get("role") == "tool" for m in kwargs.get("messages", [])):
+                return _make_response(
+                    tool_calls=[{"id": "fb1", "name": "get_crash_overview", "arguments": {}}]
+                )
+            return _make_response(content="Null dereference observed in Renderer::SubmitDraw.")
         return _make_response(
             content=json.dumps(
                 {
@@ -1142,13 +1186,19 @@ async def test_llm_provider_thinking_level_mapping_and_fallback(
         openai_client=fake_client,
     )
     assert run.status == "COMPLETED"
-    assert len(captured_kwargs) == 3
-    assert "response_format" in captured_kwargs[0]
-    assert captured_kwargs[0]["reasoning_effort"] == "medium"
-    assert "response_format" not in captured_kwargs[1]
-    assert captured_kwargs[1]["reasoning_effort"] == "medium"
-    assert "response_format" not in captured_kwargs[2]
-    assert "reasoning_effort" not in captured_kwargs[2]
+    # Investigation turns never send response_format.
+    investigation_calls = [k for k in captured_kwargs if "tools" in k]
+    assert investigation_calls
+    assert all("response_format" not in k for k in investigation_calls)
+    # Finalization turns omit tools and fall back: response_format+reasoning -> reasoning -> safe.
+    finalization_calls = [k for k in captured_kwargs if "tools" not in k]
+    assert len(finalization_calls) == 3
+    assert finalization_calls[0]["response_format"] == {"type": "json_object"}
+    assert finalization_calls[0]["reasoning_effort"] == "medium"
+    assert "response_format" not in finalization_calls[1]
+    assert finalization_calls[1]["reasoning_effort"] == "medium"
+    assert "response_format" not in finalization_calls[2]
+    assert "reasoning_effort" not in finalization_calls[2]
 
 
 async def test_anthropic_native_protocol_tool_loop_and_thinking_blocks(
@@ -1302,3 +1352,185 @@ async def test_ollama_provider_allows_empty_api_key(
     assert len(created_clients) == 1
     assert created_clients[0]["base_url"] == "http://localhost:11434/v1"
     assert created_clients[0]["api_key"] == "not-required"
+
+
+async def test_two_phase_investigation_without_json_mode_then_structured_finalization(
+    db_session: AsyncSession,
+    storage_manager: StorageManager,
+    test_settings: Settings,
+    tmp_path: Path,
+) -> None:
+    """Investigation turns omit response_format so tool calling works on GLM-like gateways,
+    and prose conclusions transition cleanly to a tools-off JSON-mode finalization turn.
+    """
+    _proj, crash, log_row = await _seed_crash_with_log(
+        db_session, storage_manager, tmp_path, log_lines_count=20
+    )
+    assert log_row is not None
+    seen_kwargs: list[dict[str, Any]] = []
+
+    def handler(step: int, kwargs: dict[str, Any]) -> Any:
+        seen_kwargs.append(dict(kwargs))
+        if step == 1:
+            assert "tools" in kwargs
+            assert "response_format" not in kwargs
+            return _make_response(
+                tool_calls=[{"id": "c1", "name": "get_crash_overview", "arguments": {}}]
+            )
+        if step == 2:
+            assert "tools" in kwargs
+            assert "response_format" not in kwargs
+            # Model writes natural-language findings after finishing tool investigation.
+            return _make_response(
+                content=(
+                    "After inspecting get_crash_overview, Renderer::SubmitDraw crashed reading "
+                    "0x0 due to a null texture pointer."
+                )
+            )
+        # Step 3 must be Phase 2 JSON finalization: tools omitted, response_format=json_object.
+        assert "tools" not in kwargs
+        assert "tool_choice" not in kwargs
+        assert kwargs.get("response_format") == {"type": "json_object"}
+        return _make_response(
+            content=json.dumps(
+                {
+                    "verdict": "NEW_ISSUE",
+                    "matched_issue_id": None,
+                    "confidence": 0.92,
+                    "suggested_title": "Null pointer dereference in Renderer::SubmitDraw",
+                    "root_cause_analysis": (
+                        "Renderer::SubmitDraw dereferences a null texture pointer at 0x0."
+                    ),
+                    "reasoning_summary": (
+                        "Inspected crashing frame via get_crash_overview and confirmed AV at 0x0."
+                    ),
+                    "evidence_log_snippets": [],
+                    "key_log_patterns": ["null texture pointer"],
+                    "suggested_component": "Renderer",
+                }
+            )
+        )
+
+    agent = AITriageAgent(storage=storage_manager, settings=test_settings)
+    run = await agent.run_triage(
+        db_session,
+        crash,
+        settings_override={"llm_provider": "zhipu", "llm_model": "glm-5.3-flash"},
+        openai_client=FakeOpenAIClient(handler),
+    )
+    assert run.status == "COMPLETED"
+    assert len(seen_kwargs) == 3
+    assert run.result_json is not None
+    assert run.result_json["verdict"] == "NEW_ISSUE"
+    assert run.result_json["confidence"] == 0.92
+    tool_steps = [s for s in run.trace_json if s.get("role") == "tool"]
+    assert len(tool_steps) == 1
+    assert tool_steps[0]["tool_name"] == "get_crash_overview"
+
+
+async def test_empty_or_uninvestigated_needs_review_rejected_and_confidence_not_fabricated(
+    db_session: AsyncSession,
+    storage_manager: StorageManager,
+    test_settings: Settings,
+    tmp_path: Path,
+) -> None:
+    """Backend must not default omitted confidence to 0.5, must reject empty or uninvestigated
+    NEEDS_REVIEW reports as FAILED, and must preserve raw output previews in trace_json.
+    """
+    # 1. Omitted confidence parses as None rather than fabricated 0.5.
+    parsed_no_conf = _parse_verdict_json('{"verdict": "NEEDS_REVIEW"}')
+    assert parsed_no_conf["confidence"] is None
+
+    _proj, crash, _log = await _seed_crash_with_log(
+        db_session, storage_manager, tmp_path, log_lines_count=20
+    )
+    agent = AITriageAgent(storage=storage_manager, settings=test_settings)
+
+    # 2. Exact incident reproduction: 0 tool calls + hollow {"verdict": "NEEDS_REVIEW"} ->
+    # nudged once, still refuses tools -> FAILED with raw preview in trace and 0.0 confidence.
+    hollow_client = FakeOpenAIClient(
+        lambda _s, _k: _make_response(content='{"verdict": "NEEDS_REVIEW"}')
+    )
+    run_hollow = await agent.run_triage(db_session, crash, openai_client=hollow_client)
+    assert run_hollow.status == "FAILED"
+    assert len(hollow_client.calls) == 2
+    assert run_hollow.result_json is not None
+    assert run_hollow.result_json["verdict"] == "NEEDS_REVIEW"
+    assert run_hollow.result_json["confidence"] == 0.0
+    assert any(
+        '{"verdict": "NEEDS_REVIEW"}' in str(step.get("output_preview") or "")
+        for step in run_hollow.trace_json
+    )
+    assert any(step.get("error") for step in run_hollow.trace_json)
+
+    # 3. NEEDS_REVIEW with prose excuse but 0 tool calls -> nudged, still 0 tools -> FAILED.
+    uninvestigated_client = FakeOpenAIClient(
+        lambda _s, _k: _make_response(
+            content=json.dumps(
+                {
+                    "verdict": "NEEDS_REVIEW",
+                    "root_cause_analysis": "Insufficient context in prompt.",
+                    "reasoning_summary": "Did not inspect crash details.",
+                }
+            )
+        )
+    )
+    run_uninv = await agent.run_triage(db_session, crash, openai_client=uninvestigated_client)
+    assert run_uninv.status == "FAILED"
+    assert len(uninvestigated_client.calls) == 2
+    assert any(
+        "without invoking any investigation tools" in str(s.get("error") or "")
+        for s in run_uninv.trace_json
+    )
+
+    # 4. Empty NEEDS_REVIEW even after tool calls -> triggers Phase 2 -> still empty -> FAILED.
+    def post_tool_empty_handler(step: int, kwargs: dict[str, Any]) -> Any:
+        if step == 1:
+            return _make_response(
+                tool_calls=[{"id": "e1", "name": "get_crash_overview", "arguments": {}}]
+            )
+        if step == 3:
+            assert "tools" not in kwargs
+            assert kwargs.get("response_format") == {"type": "json_object"}
+        return _make_response(content='{"verdict": "NEEDS_REVIEW"}')
+
+    run_post_empty = await agent.run_triage(
+        db_session, crash, openai_client=FakeOpenAIClient(post_tool_empty_handler)
+    )
+    assert run_post_empty.status == "FAILED"
+    assert any("Empty AI report" in str(s.get("error") or "") for s in run_post_empty.trace_json)
+
+    # 5. Recovery after nudge + legitimate substantive NEEDS_REVIEW with omitted confidence ->
+    # COMPLETED with confidence=None (not 0.5).
+    def recover_handler(step: int, _k: dict[str, Any]) -> Any:
+        if step == 1:
+            return _make_response(content='{"verdict": "NEEDS_REVIEW"}')
+        if step == 2:
+            return _make_response(
+                tool_calls=[{"id": "r1", "name": "get_crash_overview", "arguments": {}}]
+            )
+        return _make_response(
+            content=json.dumps(
+                {
+                    "verdict": "NEEDS_REVIEW",
+                    "suggested_title": "Missing symbols in third-party module",
+                    "root_cause_analysis": (
+                        "Top frames lack symbols and attached logs contain no fatal error."
+                    ),
+                    "reasoning_summary": (
+                        "Called get_crash_overview; unable to determine root cause without PDBs."
+                    ),
+                }
+            )
+        )
+
+    run_recovered = await agent.run_triage(
+        db_session, crash, openai_client=FakeOpenAIClient(recover_handler)
+    )
+    assert run_recovered.status == "COMPLETED"
+    assert run_recovered.result_json is not None
+    assert run_recovered.result_json["verdict"] == "NEEDS_REVIEW"
+    assert run_recovered.result_json["confidence"] is None
+    await db_session.refresh(crash)
+    assert crash.ai_verdict == "NEEDS_REVIEW"
+    assert crash.ai_confidence is None

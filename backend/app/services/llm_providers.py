@@ -271,12 +271,17 @@ def build_openai_completion_kwargs(
     model_name: str,
     thinking_level: str,
     messages: list[dict[str, Any]],
-    tools: list[dict[str, Any]],
-    include_response_format: bool = True,
+    tools: list[dict[str, Any]] | None = None,
+    include_response_format: bool = False,
     include_thinking: bool = True,
     include_temperature: bool = True,
 ) -> dict[str, Any]:
-    """Build kwargs for client.chat.completions.create() with provider-aware thinking params."""
+    """Build kwargs for client.chat.completions.create() with provider-aware thinking params.
+
+    Note: ``response_format={"type": "json_object"}`` is never combined with ``tools`` because
+    many OpenAI-compatible gateways (e.g., GLM/Zhipu, vLLM, Qwen, Ollama) suppress tool calling
+    when JSON mode is active while still returning HTTP 200.
+    """
     preset = get_provider_preset(provider_id)
     level = (
         str(thinking_level or "auto").strip().lower()
@@ -284,13 +289,15 @@ def build_openai_completion_kwargs(
         else "auto"
     )
 
+    has_tools = bool(tools)
     kwargs: dict[str, Any] = {
         "model": model_name,
         "messages": messages,
-        "tools": tools,
-        "tool_choice": "auto",
     }
-    if include_response_format:
+    if has_tools:
+        kwargs["tools"] = tools
+        kwargs["tool_choice"] = "auto"
+    elif include_response_format:
         kwargs["response_format"] = {"type": "json_object"}
 
     extra_body: dict[str, Any] = {}
@@ -441,7 +448,7 @@ def build_anthropic_messages_kwargs(
     model_name: str,
     thinking_level: str,
     messages: list[dict[str, Any]],
-    tools: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None = None,
     include_thinking: bool = True,
 ) -> dict[str, Any]:
     """Build kwargs for AsyncAnthropic.messages.create()."""
@@ -451,7 +458,7 @@ def build_anthropic_messages_kwargs(
         else "auto"
     )
     system_prompt, anthropic_msgs = convert_messages_to_anthropic(messages)
-    anthropic_tools = convert_tools_to_anthropic(tools)
+    anthropic_tools = convert_tools_to_anthropic(tools or [])
 
     kwargs: dict[str, Any] = {
         "model": model_name,

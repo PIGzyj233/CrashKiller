@@ -46,12 +46,14 @@ AI_SYSTEM_PROMPT = """You are a senior C++ Windows/Native Crash Triage Engineer 
 You investigate a crash dump and its diagnostic logs using ONLY the provided read-only tools.
 
 Investigation rules:
-1. Start by calling get_crash_overview to inspect crashing stack frames, missing symbols,
+1. ALWAYS start by calling get_crash_overview to inspect crashing stack frames, missing symbols,
    candidate known issues, and attached log IDs.
 2. Inspect attached logs (get_log_summary, search_log, read_log_around_time, read_log_lines),
    other threads (get_other_threads), or known issues (search_known_issues, get_issue_detail).
 3. Never invent log line numbers, file contents, or issue_id values. Cite only observed tool data.
-4. When finished, output ONLY a single valid JSON object (no surrounding prose):
+   Never return an empty NEEDS_REVIEW without first calling tools to inspect the crash.
+4. Only AFTER completing your tool-based investigation, output ONLY a single valid JSON object
+   (no surrounding prose) with non-empty analysis fields (including for NEEDS_REVIEW):
 {
   "verdict": "KNOWN_ISSUE | NEW_ISSUE | REGRESSION | NEEDS_REVIEW",
   "matched_issue_id": 42,
@@ -284,6 +286,49 @@ def _strip_markdown_fences(content: str) -> str:
     return (content or "").strip()
 
 
+_PLACEHOLDER_ANALYSIS_TEXTS: frozenset[str] = frozenset(
+    {
+        "needs_review",
+        "needs review",
+        "needs manual review",
+        "需人工复核",
+        "需要人工复核",
+        "unknown",
+        "n/a",
+        "none",
+        "null",
+        "-",
+    }
+)
+
+
+def _has_substantive_text(value: Any) -> bool:
+    text = str(value or "").strip()
+    return bool(text) and text.lower() not in _PLACEHOLDER_ANALYSIS_TEXTS
+
+
+def _validate_verdict_substance(
+    verdict_data: dict[str, Any],
+    *,
+    tool_calls_executed: int,
+) -> str | None:
+    """Validate that a parsed verdict has real analysis content and did not skip investigation."""
+    verdict = str(verdict_data.get("verdict") or "").strip().upper()
+    has_root_cause = _has_substantive_text(verdict_data.get("root_cause_analysis"))
+    has_reasoning = _has_substantive_text(verdict_data.get("reasoning_summary"))
+
+    if not has_root_cause and not has_reasoning:
+        return (
+            "Empty AI report: both root_cause_analysis and reasoning_summary are missing "
+            "substantive content"
+        )
+
+    if verdict == "NEEDS_REVIEW" and tool_calls_executed == 0:
+        return "AI returned NEEDS_REVIEW without invoking any investigation tools"
+
+    return None
+
+
 def _parse_verdict_json(raw_content: str | None) -> dict[str, Any]:
     """Parse and validate strict JSON verdict output from the LLM."""
     if not raw_content or not str(raw_content).strip():
@@ -308,16 +353,20 @@ def _parse_verdict_json(raw_content: str | None) -> dict[str, Any]:
         parsed_id = int(raw_matched_id)
         matched_issue_id = parsed_id if 1 <= parsed_id <= _INT32_MAX else None
 
-    raw_conf = data.get("confidence", 0.5)
-    if isinstance(raw_conf, bool):
+    raw_conf = data.get("confidence")
+    confidence: float | None
+    if raw_conf is None or raw_conf == "":
+        confidence = None
+    elif isinstance(raw_conf, bool):
         raise ValueError("confidence cannot be boolean")
-    try:
-        confidence = float(raw_conf)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"Invalid confidence value: {raw_conf!r}") from exc
-    if not math.isfinite(confidence):
-        confidence = 0.0
-    confidence = max(0.0, min(1.0, confidence))
+    else:
+        try:
+            parsed_conf = float(raw_conf)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid confidence value: {raw_conf!r}") from exc
+        if not math.isfinite(parsed_conf):
+            parsed_conf = 0.0
+        confidence = round(max(0.0, min(1.0, parsed_conf)), 4)
 
     raw_snippets = data.get("evidence_log_snippets") or []
     snippets: list[dict[str, Any]] = []
@@ -352,7 +401,7 @@ def _parse_verdict_json(raw_content: str | None) -> dict[str, Any]:
     return {
         "verdict": verdict,
         "matched_issue_id": matched_issue_id,
-        "confidence": round(confidence, 4),
+        "confidence": confidence,
         "suggested_title": str(data.get("suggested_title") or "").strip()[:512],
         "root_cause_analysis": str(data.get("root_cause_analysis") or "").strip(),
         "reasoning_summary": str(data.get("reasoning_summary") or "").strip(),
@@ -1009,14 +1058,17 @@ class AITriageAgent:
         *,
         provider_id: str = "openai",
         thinking_level: str = "auto",
+        tools: list[dict[str, Any]] | None = AI_TOOL_DEFINITIONS,
+        include_response_format: bool = False,
     ) -> Any:
+        use_response_format = bool(include_response_format and not tools)
         primary_kwargs = llm_providers.build_openai_completion_kwargs(
             provider_id=provider_id,
             model_name=model_name,
             thinking_level=thinking_level,
             messages=messages,
-            tools=AI_TOOL_DEFINITIONS,
-            include_response_format=True,
+            tools=tools,
+            include_response_format=use_response_format,
             include_thinking=True,
             include_temperature=True,
         )
@@ -1026,40 +1078,45 @@ class AITriageAgent:
                 timeout=timeout_budget,
             )
         except openai.BadRequestError:
-            # Fallback 1: drop response_format for endpoints disallowing json_object with tools.
-            no_rf_kwargs = llm_providers.build_openai_completion_kwargs(
-                provider_id=provider_id,
-                model_name=model_name,
-                thinking_level=thinking_level,
-                messages=messages,
-                tools=AI_TOOL_DEFINITIONS,
-                include_response_format=False,
-                include_thinking=True,
-                include_temperature=True,
-            )
-            try:
-                return await asyncio.wait_for(
-                    client.chat.completions.create(**no_rf_kwargs),
-                    timeout=timeout_budget,
-                )
-            except openai.BadRequestError:
-                # Fallback 2: drop thinking/reasoning params & custom temperature for older models.
-                if thinking_level == "auto" and "temperature" not in no_rf_kwargs:
-                    raise
-                safe_kwargs = llm_providers.build_openai_completion_kwargs(
+            last_kwargs = primary_kwargs
+            if use_response_format:
+                # Fallback 1: drop response_format for endpoints disallowing json_object.
+                no_rf_kwargs = llm_providers.build_openai_completion_kwargs(
                     provider_id=provider_id,
                     model_name=model_name,
-                    thinking_level="auto",
+                    thinking_level=thinking_level,
                     messages=messages,
-                    tools=AI_TOOL_DEFINITIONS,
+                    tools=tools,
                     include_response_format=False,
-                    include_thinking=False,
-                    include_temperature=False,
+                    include_thinking=True,
+                    include_temperature=True,
                 )
-                return await asyncio.wait_for(
-                    client.chat.completions.create(**safe_kwargs),
-                    timeout=timeout_budget,
-                )
+                last_kwargs = no_rf_kwargs
+                try:
+                    return await asyncio.wait_for(
+                        client.chat.completions.create(**no_rf_kwargs),
+                        timeout=timeout_budget,
+                    )
+                except openai.BadRequestError:
+                    pass
+
+            # Fallback 2: drop thinking/reasoning params & custom temperature for older models.
+            if thinking_level == "auto" and "temperature" not in last_kwargs:
+                raise
+            safe_kwargs = llm_providers.build_openai_completion_kwargs(
+                provider_id=provider_id,
+                model_name=model_name,
+                thinking_level="auto",
+                messages=messages,
+                tools=tools,
+                include_response_format=False,
+                include_thinking=False,
+                include_temperature=False,
+            )
+            return await asyncio.wait_for(
+                client.chat.completions.create(**safe_kwargs),
+                timeout=timeout_budget,
+            )
 
     async def _call_anthropic_completion(
         self,
@@ -1069,12 +1126,13 @@ class AITriageAgent:
         timeout_budget: float,
         *,
         thinking_level: str = "auto",
+        tools: list[dict[str, Any]] | None = AI_TOOL_DEFINITIONS,
     ) -> Any:
         primary_kwargs = llm_providers.build_anthropic_messages_kwargs(
             model_name=model_name,
             thinking_level=thinking_level,
             messages=messages,
-            tools=AI_TOOL_DEFINITIONS,
+            tools=tools,
             include_thinking=True,
         )
         try:
@@ -1089,7 +1147,7 @@ class AITriageAgent:
                 model_name=model_name,
                 thinking_level="auto",
                 messages=messages,
-                tools=AI_TOOL_DEFINITIONS,
+                tools=tools,
                 include_thinking=False,
             )
             return await asyncio.wait_for(
@@ -1186,8 +1244,9 @@ class AITriageAgent:
             f"Triage CrashReport {crash_report.id} "
             f"(app_version={crash_report.app_version}, "
             f"crash_reason={crash_report.crash_reason or 'UNKNOWN'}). "
-            "Use your tools to investigate stack traces, logs, and known issues, "
-            "then respond with ONLY the final JSON verdict."
+            "Start by calling get_crash_overview to inspect stack traces, attached logs, "
+            "and candidate known issues. After completing your investigation, output ONLY "
+            "the final JSON verdict."
         )
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": AI_SYSTEM_PROMPT},
@@ -1198,11 +1257,21 @@ class AITriageAgent:
 
         async def _run_loop() -> None:
             nonlocal prompt_tokens, completion_tokens, run_status, result_dict
-            for _step_idx in range(1, max_steps + 1):
+            tool_calls_executed = 0
+            investigation_nudged = False
+            json_finalization_requested = False
+
+            async def _invoke_llm(
+                *,
+                allow_tools: bool,
+                force_json: bool,
+            ) -> tuple[str | None, str | None, Any, dict[str, Any]]:
+                nonlocal prompt_tokens, completion_tokens
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError("AI triage exceeded AI_TIMEOUT_SECONDS budget")
 
+                step_tools = AI_TOOL_DEFINITIONS if allow_tools else None
                 reasoning_content: str | None = None
                 if use_anthropic:
                     resp = await self._call_anthropic_completion(
@@ -1211,6 +1280,7 @@ class AITriageAgent:
                         messages,
                         remaining,
                         thinking_level=thinking_level,
+                        tools=step_tools,
                     )
                     parsed = llm_providers.parse_anthropic_response(resp)
                     prompt_tokens += int(parsed["prompt_tokens"])
@@ -1233,6 +1303,8 @@ class AITriageAgent:
                         remaining,
                         provider_id=provider_id,
                         thinking_level=thinking_level,
+                        tools=step_tools,
+                        include_response_format=force_json and not allow_tools,
                     )
                     usage = getattr(resp, "usage", None)
                     if usage is not None:
@@ -1260,6 +1332,16 @@ class AITriageAgent:
                     if tool_calls:
                         assistant_msg["tool_calls"] = _serialize_tool_calls_for_message(tool_calls)
 
+                return msg_content, reasoning_content, tool_calls, assistant_msg
+
+            for _step_idx in range(1, max_steps + 1):
+                allow_tools = not json_finalization_requested
+                force_json = json_finalization_requested
+                msg_content, reasoning_content, tool_calls, assistant_msg = await _invoke_llm(
+                    allow_tools=allow_tools,
+                    force_json=force_json,
+                )
+
                 messages.append(assistant_msg)
                 if reasoning_content:
                     trace.append(
@@ -1270,7 +1352,7 @@ class AITriageAgent:
                         }
                     )
 
-                if tool_calls:
+                if allow_tools and tool_calls:
                     for tc in tool_calls:
                         tc_id, tool_name, args_str = _extract_tool_call_fields(tc)
                         t0 = time.monotonic()
@@ -1292,6 +1374,7 @@ class AITriageAgent:
                                 args=parsed_args,
                             )
 
+                        tool_calls_executed += 1
                         tool_duration_ms = max(0, int((time.monotonic() - t0) * 1000))
                         truncated_out = _truncate_tool_output(raw_out, tool_max_chars)
                         messages.append(
@@ -1314,25 +1397,131 @@ class AITriageAgent:
                         )
                     continue
 
-                # Final non-tool message: parse strict JSON verdict.
+                # Non-tool message (or JSON finalization response): parse and validate verdict.
+                parsed_verdict: dict[str, Any] | None = None
+                failure_reason: str | None = None
                 try:
                     parsed_verdict = _parse_verdict_json(msg_content)
                 except Exception as exc:
-                    err_reason = f"Malformed LLM JSON verdict: {exc}"
+                    failure_reason = f"Malformed LLM JSON verdict: {exc}"
+                else:
+                    failure_reason = _validate_verdict_substance(
+                        parsed_verdict,
+                        tool_calls_executed=tool_calls_executed,
+                    )
+
+                if parsed_verdict is not None and failure_reason is None:
+                    result_dict = parsed_verdict
+                    run_status = "COMPLETED"
+                    return
+
+                assert failure_reason is not None
+
+                # Recovery 1: Model skipped tools and produced an invalid/empty/NEEDS_REVIEW reply.
+                if (
+                    tool_calls_executed == 0
+                    and not investigation_nudged
+                    and _step_idx < max_steps
+                ):
+                    investigation_nudged = True
                     trace.append(
                         {
                             "step": len(trace) + 1,
                             "role": "system",
-                            "error": err_reason,
-                            "output_preview": str(msg_content or "")[:500],
+                            "message": (
+                                "Model responded without calling investigation tools; prompting "
+                                "it to call get_crash_overview first."
+                            ),
+                            "output_preview": str(msg_content or "")[:1000],
                         }
                     )
-                    result_dict = _build_needs_review_result(err_reason)
-                    run_status = "FAILED"
-                    return
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                f"Your previous response was not accepted ({failure_reason}). "
+                                "You have not called any investigation tools yet and have not "
+                                "inspected the crash stack trace or logs. Call get_crash_overview "
+                                "first (and inspect attached logs/known issues as needed) before "
+                                "producing your final JSON verdict."
+                            ),
+                        }
+                    )
+                    continue
 
-                result_dict = parsed_verdict
-                run_status = "COMPLETED"
+                # Recovery 2: Investigation already ran, but output was prose or incomplete JSON.
+                # Transition to Phase 2: disable tools and enable strict JSON output format.
+                if tool_calls_executed > 0 and not json_finalization_requested:
+                    json_finalization_requested = True
+                    trace.append(
+                        {
+                            "step": len(trace) + 1,
+                            "role": "system",
+                            "message": (
+                                "Investigation completed; requesting structured JSON verdict "
+                                "without tools."
+                            ),
+                            "output_preview": str(msg_content or "")[:1000],
+                        }
+                    )
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                f"Your investigation is complete, but your last message could not "
+                                f"be accepted as the final structured verdict ({failure_reason}). "
+                                "Now output ONLY a single valid JSON object grounded strictly in "
+                                "the tool results above. Include all fields: verdict "
+                                "(KNOWN_ISSUE | NEW_ISSUE | REGRESSION | NEEDS_REVIEW), "
+                                "matched_issue_id (integer or null), confidence (number 0.0-1.0), "
+                                "suggested_title, root_cause_analysis, reasoning_summary, "
+                                "evidence_log_snippets, key_log_patterns, and suggested_component. "
+                                "Do not leave root_cause_analysis or reasoning_summary empty."
+                            ),
+                        }
+                    )
+                    if _step_idx < max_steps:
+                        continue
+                    final_content, final_reasoning, _final_tc, final_msg = await _invoke_llm(
+                        allow_tools=False,
+                        force_json=True,
+                    )
+                    messages.append(final_msg)
+                    if final_reasoning:
+                        trace.append(
+                            {
+                                "step": len(trace) + 1,
+                                "role": "reasoning",
+                                "output_preview": final_reasoning[:1500],
+                            }
+                        )
+                    try:
+                        final_verdict = _parse_verdict_json(final_content)
+                    except Exception as exc:
+                        failure_reason = f"Malformed LLM JSON verdict: {exc}"
+                        msg_content = final_content
+                    else:
+                        final_err = _validate_verdict_substance(
+                            final_verdict,
+                            tool_calls_executed=tool_calls_executed,
+                        )
+                        if final_err is None:
+                            result_dict = final_verdict
+                            run_status = "COMPLETED"
+                            return
+                        failure_reason = final_err
+                        msg_content = final_content
+
+                trace.append(
+                    {
+                        "step": len(trace) + 1,
+                        "role": "system",
+                        "error": failure_reason,
+                        "output_preview": str(msg_content or "")[:1000],
+                    }
+                )
+                result_dict = _build_needs_review_result(failure_reason)
+                run_status = "FAILED"
                 return
 
             # Exhausted max_steps without a final verdict.
@@ -1418,7 +1607,8 @@ class AITriageAgent:
         await session.refresh(crash_report, with_for_update=True)
 
         verdict = str(result_dict.get("verdict") or "NEEDS_REVIEW")
-        confidence = float(result_dict.get("confidence") or 0.0)
+        raw_confidence = result_dict.get("confidence")
+        confidence: float | None = float(raw_confidence) if raw_confidence is not None else None
         matched_issue_id = result_dict.get("matched_issue_id")
         key_patterns = list(result_dict.get("key_log_patterns") or [])
 
