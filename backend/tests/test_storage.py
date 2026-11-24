@@ -565,3 +565,65 @@ async def test_gc_symbols_raw_lru_respects_cross_project_refcount(
     assert s_pe_old.raw_archive_path is None and s_pe_old.raw_size == 0
     assert s_c.raw_archive_path is None and s_c.raw_size == 0
     assert s_b.raw_archive_path == shared_pdb
+
+
+async def test_gc_public_cache_evicts_miss_and_msdl_before_manual_uploads(
+    db_session: AsyncSession,
+    tmp_data_dir: Path,
+) -> None:
+    """Step 3a public_cache GC evicts _msdl_miss & auto-synced before manual public uploads."""
+    quota_600b = 600.0 / (1024**3)
+    settings = Settings(
+        DATABASE_URL="sqlite+aiosqlite:///:memory:",
+        DATA_DIR=str(tmp_data_dir),
+        SYMBOLS_PUBLIC_CACHE_QUOTA_GB=quota_600b,
+        GC_THRESHOLD_PERCENT=50.0,  # target = 300 bytes
+        HOST_SAFETY_FLOOR_GB=1.0,
+    )
+    mgr = StorageManager(
+        data_dir=tmp_data_dir,
+        settings=settings,
+        disk_usage_fn=make_disk_usage_fn(free_gb=200.0),
+    )
+
+    miss_rel = "symbols/public_cache/_msdl_miss/deadbeef.json"
+    msdl_rel = "symbols/public_cache/msdl.pdb/1111/msdl.sym"
+    manual_rel = "symbols/public_cache/manual.pdb/2222/manual.sym"
+    mgr.atomic_write_bytes(miss_rel, b"M" * 200)
+    mgr.atomic_write_bytes(msdl_rel, b"A" * 250)
+    mgr.atomic_write_bytes(manual_rel, b"U" * 250)
+
+    now = datetime.now(UTC)
+    s_msdl = Symbol(
+        project_id=None,
+        app_version=None,
+        source="msdl",
+        module_name="msdl",
+        debug_file="msdl.pdb",
+        debug_id="1111",
+        sym_path=msdl_rel,
+        sym_size=250,
+        last_used_at=now,
+    )
+    s_manual = Symbol(
+        project_id=None,
+        app_version=None,
+        source="upload",
+        module_name="manual",
+        debug_file="manual.pdb",
+        debug_id="2222",
+        sym_path=manual_rel,
+        sym_size=250,
+        last_used_at=now - timedelta(days=30),
+    )
+    db_session.add_all([s_msdl, s_manual])
+    await db_session.commit()
+
+    await mgr.run_gc(db_session, force_emergency=False)
+
+    assert not mgr.resolve_path(miss_rel).exists()
+    assert not mgr.resolve_path(msdl_rel).exists()
+    assert mgr.resolve_path(manual_rel).exists()
+    assert await db_session.get(Symbol, s_msdl.id) is None
+    assert await db_session.get(Symbol, s_manual.id) is not None
+

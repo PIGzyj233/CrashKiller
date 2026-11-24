@@ -596,13 +596,18 @@ async def fetch_ms_symbols(
         eff_storage,
         effective_app,
         project_id=pid,
+        session_factory=session_factory,
         exec_fn=ctx.get("exec_fn"),
         cab_exec_fn=ctx.get("cab_exec_fn"),
         http_transport=ctx.get("http_transport"),
     )
 
     resym_job_id: uuid.UUID | None = None
-    if summary.imported > 0 and auto_resymbolicate and effective_app.MS_SYMBOL_AUTO_RESYMBOLICATE:
+    if (
+        (summary.imported > 0 or summary.upgraded > 0)
+        and auto_resymbolicate
+        and effective_app.MS_SYMBOL_AUTO_RESYMBOLICATE
+    ):
         try:
             async with eff_storage.shared_lock("capacity"):
                 async with session_factory() as session:

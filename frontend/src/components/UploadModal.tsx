@@ -27,11 +27,18 @@ import {
   removeStoredProjectApiKey,
   setStoredProjectApiKey,
   uploadCrash,
+  uploadPublicSymbol,
   uploadSymbol,
 } from "../api/client";
-import type { ProjectRead } from "../api/types";
+import type { ProjectRead, SymbolScope } from "../api/types";
 import { i18n, useAppI18n } from "../i18n";
 import { getSessionIdLabel } from "../utils/sessionLabel";
+
+export interface UploadSymbolTargetHint {
+  module_name?: string;
+  debug_file?: string;
+  debug_id?: string;
+}
 
 export interface UploadModalProps {
   isOpen: boolean;
@@ -39,10 +46,12 @@ export interface UploadModalProps {
   mode: "crash" | "symbol";
   projects: ProjectRead[];
   defaultProjectKey?: string;
+  defaultSymbolScope?: SymbolScope;
+  symbolTargetHint?: UploadSymbolTargetHint | null;
   onSuccess?: (
     result:
       | { mode: "crash"; crashId: string }
-      | { mode: "symbol"; symbolId: string },
+      | { mode: "symbol"; symbolId: string; scope?: SymbolScope },
   ) => void;
 }
 
@@ -99,10 +108,15 @@ export function UploadModal({
   mode,
   projects,
   defaultProjectKey,
+  defaultSymbolScope = "project",
+  symbolTargetHint = null,
   onSuccess,
 }: UploadModalProps) {
   const { t } = useAppI18n();
   const [activeMode, setActiveMode] = useState<"crash" | "symbol">(mode);
+  const [symbolScope, setSymbolScope] =
+    useState<SymbolScope>(defaultSymbolScope);
+  const [autoResymbolicate, setAutoResymbolicate] = useState(true);
   const [selectedProjectKey, setSelectedProjectKey] = useState<string>(() =>
     resolveInitialProjectKey(projects, defaultProjectKey),
   );
@@ -148,6 +162,8 @@ export function UploadModal({
       const initialKey = resolveInitialProjectKey(projects, defaultProjectKey);
       const storedKey = getStoredProjectApiKey(initialKey);
       setActiveMode(mode);
+      setSymbolScope(defaultSymbolScope);
+      setAutoResymbolicate(true);
       setSelectedProjectKey(initialKey);
       setApiKey(storedKey ?? "");
       setIsApiKeyPrefilled(Boolean(storedKey));
@@ -172,7 +188,7 @@ export function UploadModal({
       }
     }
     wasOpenRef.current = isOpen;
-  }, [isOpen, mode, projects, defaultProjectKey]);
+  }, [isOpen, mode, projects, defaultProjectKey, defaultSymbolScope]);
 
   // If projects arrive asynchronously while open and none is selected yet
   useEffect(() => {
@@ -290,12 +306,27 @@ export function UploadModal({
     }
   };
 
+  const isPublicSymbolMode =
+    activeMode === "symbol" && symbolScope === "public";
+  const isDirectSymSelected = Boolean(
+    pdbFile && pdbFile.name.toLowerCase().endsWith(".sym"),
+  );
+
   const handlePdbFileSelected = (files: FileList | null) => {
     if (!files || files.length === 0) {
       return;
     }
     const file = files[0];
-    if (!file.name.toLowerCase().endsWith(".pdb")) {
+    const lower = file.name.toLowerCase();
+    if (isPublicSymbolMode) {
+      if (!lower.endsWith(".pdb") && !lower.endsWith(".sym")) {
+        setErrorMessage(t("upload.errNeedPublicSymExt"));
+        return;
+      }
+      if (lower.endsWith(".sym")) {
+        setPeFile(null);
+      }
+    } else if (!lower.endsWith(".pdb")) {
       setErrorMessage(t("upload.errNeedPdbExt"));
       return;
     }
@@ -305,6 +336,10 @@ export function UploadModal({
 
   const handlePeFileSelected = (files: FileList | null) => {
     if (!files || files.length === 0) {
+      return;
+    }
+    if (isDirectSymSelected) {
+      setErrorMessage(t("upload.errSymWithPeUnsupported"));
       return;
     }
     const file = files[0];
@@ -322,17 +357,19 @@ export function UploadModal({
       return;
     }
 
-    if (!selectedProjectKey) {
-      setErrorMessage(t("upload.errSelectProject"));
-      return;
-    }
-    if (!apiKey.trim()) {
-      setErrorMessage(t("upload.errNeedApiKey"));
-      return;
-    }
-    if (!appVersion.trim()) {
-      setErrorMessage(t("upload.errNeedAppVersion"));
-      return;
+    if (!isPublicSymbolMode) {
+      if (!selectedProjectKey) {
+        setErrorMessage(t("upload.errSelectProject"));
+        return;
+      }
+      if (!apiKey.trim()) {
+        setErrorMessage(t("upload.errNeedApiKey"));
+        return;
+      }
+      if (!appVersion.trim()) {
+        setErrorMessage(t("upload.errNeedAppVersion"));
+        return;
+      }
     }
 
     if (activeMode === "crash" && !dumpFile) {
@@ -340,7 +377,15 @@ export function UploadModal({
       return;
     }
     if (activeMode === "symbol" && !pdbFile) {
-      setErrorMessage(t("upload.errAttachPdb"));
+      setErrorMessage(
+        isPublicSymbolMode
+          ? t("upload.errAttachPublicSymbol")
+          : t("upload.errAttachPdb"),
+      );
+      return;
+    }
+    if (isPublicSymbolMode && isDirectSymSelected && peFile) {
+      setErrorMessage(t("upload.errSymWithPeUnsupported"));
       return;
     }
 
@@ -361,8 +406,8 @@ export function UploadModal({
     setErrorMessage(null);
 
     try {
-      const trimmedKey = apiKey.trim();
       if (activeMode === "crash") {
+        const trimmedKey = apiKey.trim();
         const res = await uploadCrash({
           projectKey: selectedProjectKey,
           appVersion: appVersion.trim(),
@@ -385,7 +430,19 @@ export function UploadModal({
 
         onSuccess?.({ mode: "crash", crashId: res.crash_id });
         onClose();
+      } else if (isPublicSymbolMode) {
+        const res = await uploadPublicSymbol({
+          pdbFile: pdbFile!,
+          peFile: isDirectSymSelected ? undefined : (peFile ?? undefined),
+          autoResymbolicate,
+          onProgress: (pct) => setProgress(pct),
+          signal: controller.signal,
+        });
+
+        onSuccess?.({ mode: "symbol", symbolId: res.id, scope: "public" });
+        onClose();
       } else {
+        const trimmedKey = apiKey.trim();
         const res = await uploadSymbol({
           projectKey: selectedProjectKey,
           appVersion: appVersion.trim(),
@@ -402,7 +459,7 @@ export function UploadModal({
           removeStoredProjectApiKey(selectedProjectKey);
         }
 
-        onSuccess?.({ mode: "symbol", symbolId: res.id });
+        onSuccess?.({ mode: "symbol", symbolId: res.id, scope: "project" });
         onClose();
       }
     } catch (err) {
@@ -523,117 +580,179 @@ export function UploadModal({
               </div>
             )}
 
-            {/* Project + App Version */}
-            <div className="grid gap-3 sm:grid-cols-2">
-              <div>
-                <label
-                  htmlFor="upload-project-select"
-                  className="mb-1 block text-xs font-medium text-slate-700"
-                >
-                  {t("upload.projectLabel")}{" "}
-                  <span className="text-rose-500">*</span>
+            {activeMode === "symbol" && (
+              <div className="space-y-2.5">
+                <label className="block text-xs font-medium text-slate-700">
+                  {t("upload.symbolScopeLabel")}
                 </label>
-                <select
-                  id="upload-project-select"
-                  value={selectedProjectKey}
-                  disabled={isUploading || projects.length === 0}
-                  onChange={(e) => setSelectedProjectKey(e.target.value)}
-                  className="h-9 w-full rounded-md border border-slate-300 bg-white px-2.5 text-xs text-slate-800 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 disabled:bg-slate-100"
-                >
-                  {projects.length === 0 ? (
-                    <option value="">{t("upload.noProjects")}</option>
-                  ) : (
-                    projects.map((p) => (
-                      <option key={p.id} value={p.key}>
-                        {p.name} ({p.key})
-                      </option>
-                    ))
-                  )}
-                </select>
-              </div>
+                <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                  <button
+                    type="button"
+                    disabled={isUploading}
+                    onClick={() => {
+                      setSymbolScope("public");
+                      setErrorMessage(null);
+                    }}
+                    className={`rounded-lg border px-3 py-2 text-left text-xs font-medium transition-colors ${
+                      symbolScope === "public"
+                        ? "border-indigo-500 bg-indigo-50 text-indigo-800 ring-1 ring-indigo-500"
+                        : "border-slate-200 bg-white text-slate-700 hover:bg-slate-50"
+                    }`}
+                  >
+                    {t("upload.symbolScopePublic")}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={isUploading}
+                    onClick={() => {
+                      setSymbolScope("project");
+                      if (pdbFile?.name.toLowerCase().endsWith(".sym")) {
+                        setPdbFile(null);
+                      }
+                      setErrorMessage(null);
+                    }}
+                    className={`rounded-lg border px-3 py-2 text-left text-xs font-medium transition-colors ${
+                      symbolScope === "project"
+                        ? "border-indigo-500 bg-indigo-50 text-indigo-800 ring-1 ring-indigo-500"
+                        : "border-slate-200 bg-white text-slate-700 hover:bg-slate-50"
+                    }`}
+                  >
+                    {t("upload.symbolScopeProject")}
+                  </button>
+                </div>
 
-              <div>
-                <label
-                  htmlFor="upload-app-version"
-                  className="mb-1 block text-xs font-medium text-slate-700"
-                >
-                  {t("upload.appVersionLabel")}{" "}
-                  <span className="text-rose-500">*</span>
-                </label>
-                <input
-                  id="upload-app-version"
-                  type="text"
-                  value={appVersion}
-                  disabled={isUploading}
-                  onChange={(e) => setAppVersion(e.target.value)}
-                  placeholder={t("upload.appVersionPlaceholder")}
-                  className="h-9 w-full rounded-md border border-slate-300 bg-white px-2.5 font-mono text-xs text-slate-800 placeholder:font-sans placeholder:text-slate-400 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 disabled:bg-slate-100"
-                />
-              </div>
-            </div>
+                {symbolTargetHint?.debug_file && symbolTargetHint?.debug_id && (
+                  <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 font-mono text-[11px] text-slate-700">
+                    {t("upload.publicTargetHint", {
+                      file: symbolTargetHint.debug_file,
+                      debugId: symbolTargetHint.debug_id,
+                    })}
+                  </div>
+                )}
 
-            {/* Project API Key */}
-            <div>
-              <div className="mb-1 flex items-center justify-between">
-                <label
-                  htmlFor="upload-api-key"
-                  className="flex items-center gap-1.5 text-xs font-medium text-slate-700"
-                >
-                  <KeyRound className="h-3.5 w-3.5 text-slate-400" />
-                  <span>
-                    {t("upload.apiKeyLabel")}{" "}
-                    <span className="text-rose-500">*</span>
-                  </span>
-                </label>
-                {isApiKeyPrefilled && (
-                  <span className="rounded bg-emerald-50 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700">
-                    {t("upload.apiKeyPrefilled")}
-                  </span>
+                {isPublicSymbolMode && (
+                  <div className="rounded-lg border border-indigo-200 bg-indigo-50/70 px-3.5 py-2 text-xs text-indigo-900">
+                    {t("upload.publicScopeHint")}
+                  </div>
                 )}
               </div>
+            )}
 
-              <div className="relative">
-                <input
-                  id="upload-api-key"
-                  type={showApiKey ? "text" : "password"}
-                  value={apiKey}
-                  disabled={isUploading}
-                  onChange={(e) => {
-                    setApiKey(e.target.value);
-                    setIsApiKeyPrefilled(false);
-                  }}
-                  placeholder={t("upload.apiKeyPlaceholder")}
-                  className="h-9 w-full rounded-md border border-slate-300 bg-white pl-2.5 pr-9 font-mono text-xs text-slate-800 placeholder:font-sans placeholder:text-slate-400 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 disabled:bg-slate-100"
-                />
-                <button
-                  type="button"
-                  onClick={() => setShowApiKey((prev) => !prev)}
-                  aria-label={
-                    showApiKey
-                      ? t("upload.hideApiKey")
-                      : t("upload.showApiKey")
-                  }
-                  className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600"
-                >
-                  {showApiKey ? (
-                    <EyeOff className="h-4 w-4" />
-                  ) : (
-                    <Eye className="h-4 w-4" />
-                  )}
-                </button>
-              </div>
+            {!isPublicSymbolMode && (
+              <>
+                {/* Project + App Version */}
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div>
+                    <label
+                      htmlFor="upload-project-select"
+                      className="mb-1 block text-xs font-medium text-slate-700"
+                    >
+                      {t("upload.projectLabel")}{" "}
+                      <span className="text-rose-500">*</span>
+                    </label>
+                    <select
+                      id="upload-project-select"
+                      value={selectedProjectKey}
+                      disabled={isUploading || projects.length === 0}
+                      onChange={(e) => setSelectedProjectKey(e.target.value)}
+                      className="h-9 w-full rounded-md border border-slate-300 bg-white px-2.5 text-xs text-slate-800 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 disabled:bg-slate-100"
+                    >
+                      {projects.length === 0 ? (
+                        <option value="">{t("upload.noProjects")}</option>
+                      ) : (
+                        projects.map((p) => (
+                          <option key={p.id} value={p.key}>
+                            {p.name} ({p.key})
+                          </option>
+                        ))
+                      )}
+                    </select>
+                  </div>
 
-              <label className="mt-1.5 inline-flex cursor-pointer items-center gap-1.5 text-xs text-slate-600">
-                <input
-                  type="checkbox"
-                  checked={rememberApiKey}
-                  disabled={isUploading}
-                  onChange={(e) => setRememberApiKey(e.target.checked)}
-                  className="h-3.5 w-3.5 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
-                />
-                <span>{t("upload.rememberApiKey")}</span>
-              </label>
-            </div>
+                  <div>
+                    <label
+                      htmlFor="upload-app-version"
+                      className="mb-1 block text-xs font-medium text-slate-700"
+                    >
+                      {t("upload.appVersionLabel")}{" "}
+                      <span className="text-rose-500">*</span>
+                    </label>
+                    <input
+                      id="upload-app-version"
+                      type="text"
+                      value={appVersion}
+                      disabled={isUploading}
+                      onChange={(e) => setAppVersion(e.target.value)}
+                      placeholder={t("upload.appVersionPlaceholder")}
+                      className="h-9 w-full rounded-md border border-slate-300 bg-white px-2.5 font-mono text-xs text-slate-800 placeholder:font-sans placeholder:text-slate-400 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 disabled:bg-slate-100"
+                    />
+                  </div>
+                </div>
+
+                {/* Project API Key */}
+                <div>
+                  <div className="mb-1 flex items-center justify-between">
+                    <label
+                      htmlFor="upload-api-key"
+                      className="flex items-center gap-1.5 text-xs font-medium text-slate-700"
+                    >
+                      <KeyRound className="h-3.5 w-3.5 text-slate-400" />
+                      <span>
+                        {t("upload.apiKeyLabel")}{" "}
+                        <span className="text-rose-500">*</span>
+                      </span>
+                    </label>
+                    {isApiKeyPrefilled && (
+                      <span className="rounded bg-emerald-50 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700">
+                        {t("upload.apiKeyPrefilled")}
+                      </span>
+                    )}
+                  </div>
+
+                  <div className="relative">
+                    <input
+                      id="upload-api-key"
+                      type={showApiKey ? "text" : "password"}
+                      value={apiKey}
+                      disabled={isUploading}
+                      onChange={(e) => {
+                        setApiKey(e.target.value);
+                        setIsApiKeyPrefilled(false);
+                      }}
+                      placeholder={t("upload.apiKeyPlaceholder")}
+                      className="h-9 w-full rounded-md border border-slate-300 bg-white pl-2.5 pr-9 font-mono text-xs text-slate-800 placeholder:font-sans placeholder:text-slate-400 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 disabled:bg-slate-100"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowApiKey((prev) => !prev)}
+                      aria-label={
+                        showApiKey
+                          ? t("upload.hideApiKey")
+                          : t("upload.showApiKey")
+                      }
+                      className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600"
+                    >
+                      {showApiKey ? (
+                        <EyeOff className="h-4 w-4" />
+                      ) : (
+                        <Eye className="h-4 w-4" />
+                      )}
+                    </button>
+                  </div>
+
+                  <label className="mt-1.5 inline-flex cursor-pointer items-center gap-1.5 text-xs text-slate-600">
+                    <input
+                      type="checkbox"
+                      checked={rememberApiKey}
+                      disabled={isUploading}
+                      onChange={(e) => setRememberApiKey(e.target.checked)}
+                      className="h-3.5 w-3.5 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+                    />
+                    <span>{t("upload.rememberApiKey")}</span>
+                  </label>
+                </div>
+              </>
+            )}
 
             {activeMode === "crash" ? (
               <>
@@ -911,16 +1030,18 @@ export function UploadModal({
               </>
             ) : (
               <>
-                {/* .pdb Dropzone */}
+                {/* .pdb (or .sym for public) Dropzone */}
                 <div>
                   <label className="mb-1 block text-xs font-medium text-slate-700">
-                    {t("upload.pdbFileLabel")}{" "}
+                    {isPublicSymbolMode
+                      ? t("upload.publicPdbOrSymLabel")
+                      : t("upload.pdbFileLabel")}{" "}
                     <span className="text-rose-500">*</span>
                   </label>
                   <input
                     ref={pdbInputRef}
                     type="file"
-                    accept=".pdb"
+                    accept={isPublicSymbolMode ? ".pdb,.sym" : ".pdb"}
                     className="hidden"
                     onChange={(e: ChangeEvent<HTMLInputElement>) => {
                       handlePdbFileSelected(e.target.files);
@@ -989,9 +1110,19 @@ export function UploadModal({
                       <>
                         <FileCode2 className="h-6 w-6 text-slate-400" />
                         <p className="mt-1.5 text-xs font-medium text-slate-700">
-                          {t("upload.dropPdbTextBefore")}
-                          <span className="font-mono">.pdb</span>
-                          {t("upload.dropPdbTextAfter")}
+                          {isPublicSymbolMode ? (
+                            <>
+                              {t("upload.dropPublicPdbTextBefore")}
+                              <span className="font-mono">.pdb / .sym</span>
+                              {t("upload.dropPublicPdbTextAfter")}
+                            </>
+                          ) : (
+                            <>
+                              {t("upload.dropPdbTextBefore")}
+                              <span className="font-mono">.pdb</span>
+                              {t("upload.dropPdbTextAfter")}
+                            </>
+                          )}
                         </p>
                       </>
                     )}
@@ -999,112 +1130,131 @@ export function UploadModal({
                 </div>
 
                 {/* Optional PE Companion (.exe / .dll) */}
-                <div>
-                  <label className="mb-1 block text-xs font-medium text-slate-700">
-                    {t("upload.peFileLabel")}
-                  </label>
-                  <input
-                    ref={peInputRef}
-                    type="file"
-                    accept=".exe,.dll"
-                    className="hidden"
-                    onChange={(e: ChangeEvent<HTMLInputElement>) => {
-                      handlePeFileSelected(e.target.files);
-                      e.target.value = "";
-                    }}
-                  />
-                  <div
-                    role="button"
-                    tabIndex={0}
-                    onClick={() => {
-                      if (!isUploading) peInputRef.current?.click();
-                    }}
-                    onKeyDown={(e) => {
-                      if ((e.key === "Enter" || e.key === " ") && !isUploading) {
+                {!isDirectSymSelected && (
+                  <div>
+                    <label className="mb-1 block text-xs font-medium text-slate-700">
+                      {t("upload.peFileLabel")}
+                    </label>
+                    <input
+                      ref={peInputRef}
+                      type="file"
+                      accept=".exe,.dll"
+                      className="hidden"
+                      onChange={(e: ChangeEvent<HTMLInputElement>) => {
+                        handlePeFileSelected(e.target.files);
+                        e.target.value = "";
+                      }}
+                    />
+                    <div
+                      role="button"
+                      tabIndex={0}
+                      onClick={() => {
+                        if (!isUploading) peInputRef.current?.click();
+                      }}
+                      onKeyDown={(e) => {
+                        if (
+                          (e.key === "Enter" || e.key === " ") &&
+                          !isUploading
+                        ) {
+                          e.preventDefault();
+                          peInputRef.current?.click();
+                        }
+                      }}
+                      onDragOver={(e: DragEvent<HTMLDivElement>) => {
                         e.preventDefault();
-                        peInputRef.current?.click();
-                      }
-                    }}
-                    onDragOver={(e: DragEvent<HTMLDivElement>) => {
-                      e.preventDefault();
-                      if (!isUploading) setIsPeDragOver(true);
-                    }}
-                    onDragLeave={() => setIsPeDragOver(false)}
-                    onDrop={(e: DragEvent<HTMLDivElement>) => {
-                      e.preventDefault();
-                      setIsPeDragOver(false);
-                      if (!isUploading) {
-                        handlePeFileSelected(e.dataTransfer.files);
-                      }
-                    }}
-                    className={`flex cursor-pointer flex-col items-center justify-center rounded-lg border-2 border-dashed px-4 py-4 text-center transition-colors ${
-                      isPeDragOver
-                        ? "border-indigo-500 bg-indigo-50/70"
-                        : peFile
-                          ? "border-emerald-300 bg-emerald-50/40"
-                          : "border-slate-300 bg-slate-50/60 hover:border-indigo-400 hover:bg-slate-50"
-                    }`}
-                  >
-                    {peFile ? (
-                      <div className="flex w-full items-center justify-between gap-3">
-                        <div className="flex min-w-0 items-center gap-2.5 text-left">
-                          <CheckCircle2 className="h-5 w-5 shrink-0 text-emerald-600" />
-                          <div className="min-w-0">
-                            <p className="truncate font-mono text-xs font-semibold text-slate-900">
-                              {peFile.name}
-                            </p>
-                            <p className="font-mono text-[11px] text-slate-500">
-                              {formatFileSize(peFile.size)}
-                            </p>
+                        if (!isUploading) setIsPeDragOver(true);
+                      }}
+                      onDragLeave={() => setIsPeDragOver(false)}
+                      onDrop={(e: DragEvent<HTMLDivElement>) => {
+                        e.preventDefault();
+                        setIsPeDragOver(false);
+                        if (!isUploading) {
+                          handlePeFileSelected(e.dataTransfer.files);
+                        }
+                      }}
+                      className={`flex cursor-pointer flex-col items-center justify-center rounded-lg border-2 border-dashed px-4 py-4 text-center transition-colors ${
+                        isPeDragOver
+                          ? "border-indigo-500 bg-indigo-50/70"
+                          : peFile
+                            ? "border-emerald-300 bg-emerald-50/40"
+                            : "border-slate-300 bg-slate-50/60 hover:border-indigo-400 hover:bg-slate-50"
+                      }`}
+                    >
+                      {peFile ? (
+                        <div className="flex w-full items-center justify-between gap-3">
+                          <div className="flex min-w-0 items-center gap-2.5 text-left">
+                            <CheckCircle2 className="h-5 w-5 shrink-0 text-emerald-600" />
+                            <div className="min-w-0">
+                              <p className="truncate font-mono text-xs font-semibold text-slate-900">
+                                {peFile.name}
+                              </p>
+                              <p className="font-mono text-[11px] text-slate-500">
+                                {formatFileSize(peFile.size)}
+                              </p>
+                            </div>
                           </div>
+                          <button
+                            type="button"
+                            disabled={isUploading}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setPeFile(null);
+                            }}
+                            className="rounded p-1 text-slate-400 hover:bg-slate-200 hover:text-slate-700"
+                            aria-label={t("upload.removePeAria")}
+                          >
+                            <Trash2 className="h-4 w-4" />
+                          </button>
                         </div>
-                        <button
-                          type="button"
-                          disabled={isUploading}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            setPeFile(null);
-                          }}
-                          className="rounded p-1 text-slate-400 hover:bg-slate-200 hover:text-slate-700"
-                          aria-label={t("upload.removePeAria")}
-                        >
-                          <Trash2 className="h-4 w-4" />
-                        </button>
-                      </div>
-                    ) : (
-                      <p className="text-xs text-slate-600">
-                        {t("upload.dropPeTextBefore")}
-                        <span className="font-mono">.exe</span>
-                        {t("upload.dropPeTextMid")}
-                        <span className="font-mono">.dll</span>
-                        {t("upload.dropPeTextAfter")}
-                      </p>
-                    )}
-                  </div>
-                </div>
-
-                {/* Mandatory PE Unwind Warning or Confirmation */}
-                {!peFile ? (
-                  <div
-                    role="alert"
-                    data-testid="pe-unwind-warning"
-                    className="flex items-start gap-2.5 rounded-lg border border-amber-200 bg-amber-50 px-3.5 py-2.5 text-xs text-amber-900"
-                  >
-                    <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
-                    <div>
-                      <p className="font-semibold">
-                        {t("upload.peWarningTitle")}
-                      </p>
-                      <p className="mt-0.5 text-amber-800">
-                        {t("upload.peWarningDesc")}
-                      </p>
+                      ) : (
+                        <p className="text-xs text-slate-600">
+                          {t("upload.dropPeTextBefore")}
+                          <span className="font-mono">.exe</span>
+                          {t("upload.dropPeTextMid")}
+                          <span className="font-mono">.dll</span>
+                          {t("upload.dropPeTextAfter")}
+                        </p>
+                      )}
                     </div>
                   </div>
-                ) : (
-                  <div className="flex items-center gap-2 rounded-lg border border-emerald-200 bg-emerald-50 px-3.5 py-2 text-xs text-emerald-800">
-                    <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" />
-                    <span>{t("upload.peAttachedOk")}</span>
-                  </div>
+                )}
+
+                {/* Mandatory PE Unwind Warning or Confirmation */}
+                {!isDirectSymSelected &&
+                  (!peFile ? (
+                    <div
+                      role="alert"
+                      data-testid="pe-unwind-warning"
+                      className="flex items-start gap-2.5 rounded-lg border border-amber-200 bg-amber-50 px-3.5 py-2.5 text-xs text-amber-900"
+                    >
+                      <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
+                      <div>
+                        <p className="font-semibold">
+                          {t("upload.peWarningTitle")}
+                        </p>
+                        <p className="mt-0.5 text-amber-800">
+                          {t("upload.peWarningDesc")}
+                        </p>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="flex items-center gap-2 rounded-lg border border-emerald-200 bg-emerald-50 px-3.5 py-2 text-xs text-emerald-800">
+                      <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" />
+                      <span>{t("upload.peAttachedOk")}</span>
+                    </div>
+                  ))}
+
+                {isPublicSymbolMode && (
+                  <label className="flex cursor-pointer items-start gap-2 text-xs text-slate-700">
+                    <input
+                      type="checkbox"
+                      checked={autoResymbolicate}
+                      disabled={isUploading}
+                      onChange={(e) => setAutoResymbolicate(e.target.checked)}
+                      className="mt-0.5 h-3.5 w-3.5 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+                    />
+                    <span>{t("upload.autoResymAfterUpload")}</span>
+                  </label>
                 )}
               </>
             )}
@@ -1165,7 +1315,9 @@ export function UploadModal({
                   <span>
                     {activeMode === "crash"
                       ? t("upload.uploadCrashBtn")
-                      : t("upload.uploadSymbolsBtn")}
+                      : isPublicSymbolMode
+                        ? t("upload.uploadPublicSymbolsBtn")
+                        : t("upload.uploadSymbolsBtn")}
                   </span>
                 </>
               )}

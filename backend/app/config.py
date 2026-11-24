@@ -105,6 +105,7 @@ class Settings(BaseSettings):
     MS_SYMBOL_MAX_PE_MB: int = 32
     MS_SYMBOL_NEGATIVE_CACHE_HOURS: int = 24
     MS_SYMBOL_AUTO_RESYMBOLICATE: bool = True
+    MS_SYMBOL_ENABLE_WINBINDEX_FALLBACK: bool = True
 
     # --- Chunked Zstd Compression ---
     LOG_CHUNK_SIZE_BYTES: int = 262144

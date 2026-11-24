@@ -36,9 +36,12 @@ import type {
   ProjectRead,
   ProjectRotateKeyResponse,
   ProjectUpdate,
+  PublicSymbolSyncRequest,
+  PublicSymbolSyncResponse,
   ResymbolicateRequest,
   ResymbolicateResponse,
   SymbolListResponse,
+  SymbolScope,
   SymbolUploadResponse,
   SystemSettingsRead,
   SystemSettingsUpdate,
@@ -334,6 +337,8 @@ export async function syncProjectApiKey(
 
 export interface ListSymbolsParams {
   project_id?: string;
+  scope?: SymbolScope | "all";
+  source?: string;
   app_version?: string;
   q?: string;
   has_pe_unwind?: boolean;
@@ -354,6 +359,14 @@ export interface UploadSymbolParams {
   pdbFile: File;
   peFile?: File | null;
   apiKey?: string;
+  onProgress?: (percent: number) => void;
+  signal?: AbortSignal;
+}
+
+export interface UploadPublicSymbolParams {
+  pdbFile: File;
+  peFile?: File | null;
+  autoResymbolicate?: boolean;
   onProgress?: (percent: number) => void;
   signal?: AbortSignal;
 }
@@ -379,6 +392,18 @@ export function resymbolicate(
 ): Promise<ResymbolicateResponse> {
   return requestJson<ResymbolicateResponse>(
     `${API_BASE}/symbols/resymbolicate`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+  );
+}
+
+export function syncPublicSymbols(
+  payload: PublicSymbolSyncRequest,
+): Promise<PublicSymbolSyncResponse> {
+  return requestJson<PublicSymbolSyncResponse>(
+    `${API_BASE}/symbols/public/sync`,
     {
       method: "POST",
       body: JSON.stringify(payload),
@@ -419,6 +444,27 @@ export function uploadSymbol(
     url: `${API_BASE}/symbols/upload`,
     formData,
     apiKey: trimmedKey,
+    onProgress: params.onProgress,
+    signal: params.signal,
+  });
+}
+
+export function uploadPublicSymbol(
+  params: UploadPublicSymbolParams,
+): Promise<SymbolUploadResponse> {
+  const formData = new FormData();
+  formData.append("pdb_file", params.pdbFile);
+  if (params.peFile) {
+    formData.append("pe_file", params.peFile);
+  }
+  formData.append(
+    "auto_resymbolicate",
+    params.autoResymbolicate ? "true" : "false",
+  );
+
+  return sendMultipartXhr<SymbolUploadResponse>({
+    url: `${API_BASE}/symbols/public/upload`,
+    formData,
     onProgress: params.onProgress,
     signal: params.signal,
   });

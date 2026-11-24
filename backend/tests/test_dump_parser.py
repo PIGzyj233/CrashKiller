@@ -181,7 +181,7 @@ async def test_parse_dump_zst_normalization_and_cleanup(
     assert "--symbols-cache" not in calls_msdl_only[0]
     assert calls_msdl_only[0][-1] == pub_cache_str
 
-    # Verify ENABLE_PUBLIC_SYMBOLS=False omits --symbols-url, --symbols-cache, and public_cache
+    # Verify ENABLE_PUBLIC_SYMBOLS=False omits remote flags while keeping local public store dir
     no_pub_settings = test_settings.model_copy(update={"ENABLE_PUBLIC_SYMBOLS": False})
     calls_no_pub: list[tuple[str, ...]] = []
     await parse_dump(
@@ -196,7 +196,7 @@ async def test_parse_dump_zst_normalization_and_cleanup(
     )
     assert "--symbols-url" not in calls_no_pub[0]
     assert "--symbols-cache" not in calls_no_pub[0]
-    assert pub_cache_str not in calls_no_pub[0]
+    assert calls_no_pub[0][-1] == pub_cache_str
 
 
 async def test_normalize_stackwalk_null_fields_and_errors(

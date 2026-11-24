@@ -620,12 +620,41 @@ class StorageManager:
         # ------------------------------------------------------------------
         # Step 3: Bounded single-pass quota / emergency LRU eviction
         # ------------------------------------------------------------------
-        # 3a. symbols/public_cache (LRU by filesystem access/mod time)
+        # 3a. symbols/public_cache (evict miss cache -> untracked/auto-synced -> manual uploads)
         pub_root = self.partition_path("symbols/public_cache")
         pub_used, _ = self.partition_used_bytes("symbols/public_cache")
         pub_target = int(self.get_partition_quota_bytes("symbols/public_cache") * threshold_ratio)
         if pub_used > pub_target or needs_emergency_reclaim():
-            for _, path, size in self._iter_files_sorted_by_age(pub_root):
+            pub_syms_stmt = select(Symbol).where(Symbol.project_id.is_(None))
+            pub_syms = (await session.execute(pub_syms_stmt)).scalars().all()
+            pub_by_path: dict[str, Symbol] = {s.sym_path: s for s in pub_syms if s.sym_path}
+            data_root = self.data_dir.resolve()
+
+            eviction_entries: list[tuple[int, float, Path, int, Symbol | None]] = []
+            for mtime, path, size in self._iter_files_sorted_by_age(pub_root):
+                if path.name == "_msdl_circuit.json":
+                    continue
+                try:
+                    rel_path = path.resolve().relative_to(data_root).as_posix()
+                except (OSError, ValueError):
+                    rel_path = ""
+                sym_row = pub_by_path.get(rel_path)
+                if "/_msdl_miss/" in f"/{rel_path}":
+                    tier = 0
+                    sort_ts = mtime
+                elif sym_row is None:
+                    tier = 1
+                    sort_ts = mtime
+                elif sym_row.source != "upload":
+                    tier = 2
+                    sort_ts = _as_utc(sym_row.last_used_at).timestamp()
+                else:
+                    tier = 3
+                    sort_ts = _as_utc(sym_row.last_used_at).timestamp()
+                eviction_entries.append((tier, sort_ts, path, size, sym_row))
+
+            eviction_entries.sort(key=lambda item: (item[0], item[1]))
+            for _, _, path, size, sym_row in eviction_entries:
                 if pub_used <= pub_target and not needs_emergency_reclaim():
                     break
                 removed = self._safe_unlink(path)
@@ -634,6 +663,8 @@ class StorageManager:
                     deleted_files_count += 1
                     pub_used = max(0, pub_used - size)
                     self._prune_empty_dirs(path.parent, pub_root)
+                if sym_row is not None:
+                    await session.delete(sym_row)
 
         # 3b. symbols/raw (LRU by Symbol.last_used_at, preserving .sym)
         raw_root = self.partition_path("symbols/raw")
@@ -826,7 +857,11 @@ class StorageManager:
         sym_target = int(self.get_partition_quota_bytes("symbols/sym") * threshold_ratio)
         fs_used = _fs_used()
         if sym_used > sym_target or fs_used > total_target:
-            syms_lru_stmt = select(Symbol).order_by(Symbol.last_used_at.asc())
+            syms_lru_stmt = (
+                select(Symbol)
+                .where(Symbol.project_id.is_not(None))
+                .order_by(Symbol.last_used_at.asc())
+            )
             all_syms = (await session.execute(syms_lru_stmt)).scalars().all()
             path_counts: dict[str, int] = {}
             raw_counts: dict[str, int] = {}

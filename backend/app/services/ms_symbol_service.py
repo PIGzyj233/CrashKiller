@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import hashlib
 import json
 import logging
+import ntpath
+import os
 import re
 import shutil
+import struct
 import time
 import uuid
 from collections.abc import Iterable
@@ -17,16 +21,19 @@ from typing import Any
 from urllib.parse import quote, urlparse
 
 import httpx
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
 from app.services.settings_service import DEFAULT_NOISE_MODULES
 from app.services.storage import StorageError, StorageManager
 from app.services.symbol_service import (
     SymbolConversionError,
+    _parse_sym_records,
     _resolve_in_partition,
     _validate_path_segment,
     parse_sym_header,
     run_dump_syms,
+    store_public_symbol,
 )
 
 logger = logging.getLogger(__name__)
@@ -39,25 +46,37 @@ CIRCUIT_COOLDOWN_SECONDS = 600
 TRANSIENT_MISS_TTL_SECONDS = 3600
 MAX_MS_FETCH_CONCURRENCY = 2
 DOWNLOAD_CHUNK_BYTES = 65536
+MAX_WINBINDEX_PE_PROBES = 8
+PORTABLE_AGE = 0xFFFFFFFF
 
 MISS_CACHE_DIR_REL = "symbols/public_cache/_msdl_miss"
 CIRCUIT_STATE_REL = "symbols/public_cache/_msdl_circuit.json"
 
+MSF7_MAGIC = b"Microsoft C/C++ MSF 7.00\r\n\x1aDS\0\0\0"
 PDB_MAGICS: tuple[bytes, ...] = (
     b"Microsoft C/C++ MSF 7.00\r\n\x1aDS",
     b"Microsoft C/C++ program database 2.00\r\n\x1aJG",
+    b"BSJB",
 )
 PE_MAGIC = b"MZ"
 CAB_MAGIC = b"MSCF"
 
+WINBINDEX_BASE_URL = "https://winbindex.m417z.com/data/by_filename_compressed"
+
 _DEBUG_ID_RE = re.compile(r"^[0-9A-Fa-f]{33,40}$")
 _CODE_ID_RE = re.compile(r"^[0-9A-Fa-f]{8,24}$")
 _ALL_ZERO_RE = re.compile(r"^0+$")
+_DASHED_GUID_RE = r"[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}"
+_MANUAL_GUID_RE = re.compile(
+    rf"^({_DASHED_GUID_RE}|\{{{_DASHED_GUID_RE}\}}|[0-9A-Fa-f]{{32}})([0-9A-Fa-f]{{0,8}})$"
+)
+_INVALID_MANUAL_NAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 _WINDOWS_SYSTEM_PATH_RE = re.compile(
-    r"^[a-z]:/windows/"
+    r"^(?:[a-z]:/windows/"
     r"(?:system32|syswow64|winsxs|systemapps|microsoft\.net|"
-    r"servicing|immersivecontrolpanel|systemresources|assembly)/",
+    r"servicing|immersivecontrolpanel|systemresources|assembly)/|"
+    r"[a-z]:/program files/windowsapps/microsoft\.)",
     re.IGNORECASE,
 )
 
@@ -81,6 +100,19 @@ KNOWN_WINDOWS_SYSTEM_MODULES: frozenset[str] = frozenset(
         "imm32.dll",
         "uxtheme.dll",
         "dwmapi.dll",
+        "dwmcore.dll",
+        "dcomp.dll",
+        "graphicscapture.dll",
+        "coremessaging.dll",
+        "coreuicomponents.dll",
+        "twinapi.dll",
+        "twinapi.appcore.dll",
+        "rometadata.dll",
+        "winsta.dll",
+        "textinputframework.dll",
+        "inputhost.dll",
+        "directmanipulation.dll",
+        "directxdatabasehelper.dll",
         "msctf.dll",
         "powrprof.dll",
         "setupapi.dll",
@@ -106,7 +138,9 @@ KNOWN_WINDOWS_SYSTEM_MODULES: frozenset[str] = frozenset(
         "d3d9.dll",
         "d3d10.dll",
         "d3d10_1.dll",
+        "d3d10warp.dll",
         "d3d11.dll",
+        "d3d11on12.dll",
         "d3d12.dll",
         "d3d12core.dll",
         "d3dcompiler_47.dll",
@@ -116,6 +150,10 @@ KNOWN_WINDOWS_SYSTEM_MODULES: frozenset[str] = frozenset(
         "dwrite.dll",
         "dxil.dll",
         "dxcompiler.dll",
+        "mfplat.dll",
+        "mfcore.dll",
+        "mfreadwrite.dll",
+        "evr.dll",
         "xinput1_4.dll",
         "xinput1_3.dll",
         "xaudio2_9.dll",
@@ -143,6 +181,8 @@ KNOWN_WINDOWS_MODULE_PREFIXES: tuple[str, ...] = (
     "api-ms-win-",
     "ext-ms-win-",
     "windows.",
+    "microsoft.ui.",
+    "microsoft.internal.",
     "onecore",
     "vcruntime140",
     "msvcp140",
@@ -197,30 +237,73 @@ class WindowsSymbolCandidate:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class MSFetchItemResult:
+    """Per-target outcome for an MSDL symbol import attempt."""
+
+    module_name: str
+    debug_file: str
+    debug_id: str
+    status: str
+    detail: str | None = None
+    has_pe_unwind: bool = False
+    symbol_id: uuid.UUID | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "module_name": self.module_name,
+            "debug_file": self.debug_file,
+            "debug_id": self.debug_id,
+            "status": self.status,
+            "detail": self.detail,
+            "has_pe_unwind": self.has_pe_unwind,
+            "symbol_id": str(self.symbol_id) if self.symbol_id is not None else None,
+        }
+
+
 @dataclass(slots=True)
 class MSFetchSummary:
     """Outcome counters for a batch of MSDL symbol import attempts."""
 
     attempted: int = 0
     imported: int = 0
+    upgraded: int = 0
     cached_hit: int = 0
     not_found: int = 0
     skipped: int = 0
     failed: int = 0
     circuit_open: bool = False
     imported_keys: list[str] = field(default_factory=list)
+    items: list[MSFetchItemResult] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "attempted": self.attempted,
             "imported": self.imported,
+            "upgraded": self.upgraded,
             "cached_hit": self.cached_hit,
             "not_found": self.not_found,
             "skipped": self.skipped,
             "failed": self.failed,
             "circuit_open": self.circuit_open,
             "imported_keys": list(self.imported_keys),
+            "items": [item.to_dict() for item in self.items],
         }
+
+
+@dataclass(frozen=True, slots=True)
+class _PdbMetadata:
+    guid: uuid.UUID
+    age: int
+    signature: int
+    portable: bool = False
+    machine: int = 0
+    image_size: int = 0
+
+    @property
+    def key(self) -> str:
+        age = PORTABLE_AGE if self.portable else self.age
+        return f"{self.guid.hex.upper()}{age:X}"
 
 
 def _basename(path_str: str) -> str:
@@ -360,13 +443,140 @@ def _public_cache_sym_rel(debug_file: str, debug_id: str) -> str:
     return f"symbols/public_cache/{safe_df}/{safe_did}/{stem}.sym"
 
 
-def _has_local_sym_in_root(root: Path, debug_file: str, debug_id: str) -> bool:
+def _is_microsoft_symsrv_url(raw_url: str) -> bool:
+    parsed = urlparse(raw_url.strip())
+    host = (parsed.hostname or "").lower()
+    return host == "msdl.microsoft.com" or host.endswith(".microsoft.com")
+
+
+def _normalize_pe_code_ids(code_id: str) -> list[str]:
+    """Return SymSrv PE key candidates ordered by MSDL canonical format first.
+
+    Microsoft's SymSrv expects `{timestamp:08X}{image_size:x}` (8 uppercase hex chars
+    for timestamp + lowercase hex image_size without leading zeros).
+    """
+    cid = code_id.strip()
+    if not cid:
+        return []
+    upper = cid.upper()
+    if re.fullmatch(r"[0-9A-Fa-f]{9,16}", cid):
+        size_val = int(cid[8:], 16)
+        if size_val > 0:
+            canonical = f"{cid[:8].upper()}{size_val:x}"
+            if canonical != upper:
+                return [canonical, upper]
+            return [canonical]
+    return [upper]
+
+
+def _parse_age_value(age: str | int) -> int:
+    if isinstance(age, bool):
+        raise ValueError("Invalid PDB age")
+    if isinstance(age, int):
+        val = age
+    else:
+        cleaned = str(age).strip()
+        if not cleaned:
+            raise ValueError("PDB age must not be empty")
+        val = int(cleaned, 16 if cleaned.lower().startswith("0x") else 10)
+    if not 0 <= val <= PORTABLE_AGE:
+        raise ValueError("PDB age out of range")
+    return val
+
+
+def parse_manual_ms_target(
+    module_or_pdb: str,
+    debug_id_or_guid: str,
+    *,
+    age: str | int | None = None,
+    code_file: str | None = None,
+    code_id: str | None = None,
+) -> WindowsSymbolCandidate:
+    """Parse a user-supplied module/PDB name and Debug ID / GUID into a sync candidate.
+
+    Accepts inputs like `GraphicsCapture.dll` + `90D28435EAAB109449C47402C53C42D31`
+    or `GraphicsCapture.pdb` + dashed GUID + optional age.
+    """
+    raw_name = _basename(module_or_pdb.strip())
+    if not raw_name or _INVALID_MANUAL_NAME_RE.search(raw_name):
+        raise ValueError("Invalid module or PDB filename")
+
+    low_name = raw_name.lower()
+    if low_name.endswith(".pdb"):
+        stem = raw_name[:-4]
+        debug_file = raw_name
+        derived_code_file = f"{stem}.dll" if stem else None
+        module_name = derived_code_file or raw_name
+    elif low_name.endswith((".dll", ".exe")):
+        stem = raw_name[:-4]
+        debug_file = f"{stem}.pdb"
+        derived_code_file = raw_name
+        module_name = raw_name
+    else:
+        stem = raw_name
+        debug_file = f"{stem}.pdb"
+        derived_code_file = f"{stem}.dll"
+        module_name = derived_code_file
+
+    if not stem or not _is_safe_segment(debug_file):
+        raise ValueError("Invalid module or PDB filename")
+
+    match = _MANUAL_GUID_RE.fullmatch(debug_id_or_guid.strip())
+    if not match:
+        raise ValueError(
+            "debug_id must be a 32-hex/dashed GUID optionally followed by a hex age"
+        )
+    parsed_guid = uuid.UUID(match.group(1))
+    if parsed_guid.int == 0:
+        raise ValueError("GUID must not be all zeros")
+
+    inline_age_hex = match.group(2)
+    inline_age = int(inline_age_hex, 16) if inline_age_hex else None
+    explicit_age = _parse_age_value(age) if age is not None and str(age).strip() != "" else None
+    if inline_age is not None and explicit_age is not None and inline_age != explicit_age:
+        raise ValueError("Provided age conflicts with the age suffix in debug_id")
+    final_age = (
+        inline_age
+        if inline_age is not None
+        else (explicit_age if explicit_age is not None else 1)
+    )
+    debug_id = f"{parsed_guid.hex.upper()}{final_age:X}"
+
+    resolved_code_file = (
+        _basename(code_file.strip())
+        if code_file and code_file.strip()
+        else derived_code_file
+    )
+    if resolved_code_file and (
+        _INVALID_MANUAL_NAME_RE.search(resolved_code_file)
+        or not _is_safe_segment(resolved_code_file)
+    ):
+        raise ValueError("Invalid code_file name")
+
+    resolved_code_id: str | None = None
+    if code_id is not None and code_id.strip():
+        cid = code_id.strip()
+        if not _CODE_ID_RE.match(cid) or _ALL_ZERO_RE.match(cid):
+            raise ValueError("Invalid code_id (expected hex timestamp + image size)")
+        resolved_code_id = cid
+
+    return WindowsSymbolCandidate(
+        module_name=module_name,
+        debug_file=debug_file,
+        debug_id=debug_id,
+        code_file=resolved_code_file,
+        code_id=resolved_code_id,
+        filename=resolved_code_file,
+    )
+
+
+def _find_local_sym_in_root(root: Path, debug_file: str, debug_id: str) -> Path | None:
     if not root.exists():
-        return False
+        return None
     stem = Path(debug_file).stem or debug_file
     exact = root / debug_file / debug_id.upper() / f"{stem}.sym"
     if exact.is_file():
-        return True
+        return exact
     # Case-insensitive fallback for Linux hosts storing Windows PDB names
     df_low = debug_file.lower()
     did_low = debug_id.lower()
@@ -380,10 +590,47 @@ def _has_local_sym_in_root(root: Path, debug_file: str, debug_id: str) -> bool:
                     continue
                 for file_entry in id_entry.iterdir():
                     if file_entry.is_file() and file_entry.name.lower() == sym_low:
-                        return True
+                        return file_entry
     except OSError:
+        return None
+    return None
+
+
+def _has_local_sym_in_root(root: Path, debug_file: str, debug_id: str) -> bool:
+    return _find_local_sym_in_root(root, debug_file, debug_id) is not None
+
+
+def _sym_file_has_unwind(path: Path) -> bool:
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            return _parse_sym_records(fh).has_unwind_records
+    except (OSError, SymbolConversionError):
         return False
-    return False
+
+
+def has_cached_symbol_detail(
+    storage: StorageManager,
+    debug_file: str,
+    debug_id: str,
+    project_id: uuid.UUID | str | None = None,
+) -> tuple[bool, str | None, Path | None]:
+    """Return (exists, scope, path) for a Breakpad .sym in project symbols or public_cache."""
+    if project_id is not None:
+        proj_seg = str(project_id).strip()
+        if _is_safe_segment(proj_seg):
+            try:
+                proj_root = storage.resolve_path(f"symbols/sym/{proj_seg}")
+            except StorageError:
+                proj_root = None
+            if proj_root is not None:
+                found_proj = _find_local_sym_in_root(proj_root, debug_file, debug_id)
+                if found_proj is not None:
+                    return True, "project", found_proj
+    pub_root = storage.partition_path("symbols/public_cache")
+    found_pub = _find_local_sym_in_root(pub_root, debug_file, debug_id)
+    if found_pub is not None:
+        return True, "public", found_pub
+    return False, None, None
 
 
 def has_cached_symbol(
@@ -393,17 +640,8 @@ def has_cached_symbol(
     project_id: uuid.UUID | str | None = None,
 ) -> bool:
     """Return True if a Breakpad .sym already exists in project symbols or public_cache."""
-    if project_id is not None:
-        proj_seg = str(project_id).strip()
-        if _is_safe_segment(proj_seg):
-            try:
-                proj_root = storage.resolve_path(f"symbols/sym/{proj_seg}")
-            except StorageError:
-                proj_root = None
-            if proj_root is not None and _has_local_sym_in_root(proj_root, debug_file, debug_id):
-                return True
-    pub_root = storage.partition_path("symbols/public_cache")
-    return _has_local_sym_in_root(pub_root, debug_file, debug_id)
+    found, _, _ = has_cached_symbol_detail(storage, debug_file, debug_id, project_id=project_id)
+    return found
 
 
 def _miss_cache_rel(debug_file: str, debug_id: str) -> str:
@@ -411,27 +649,75 @@ def _miss_cache_rel(debug_file: str, debug_id: str) -> str:
     return f"{MISS_CACHE_DIR_REL}/{digest}.json"
 
 
-def is_negative_cached(storage: StorageManager, debug_file: str, debug_id: str) -> bool:
-    """Return True when (debug_file, debug_id) has an unexpired negative-cache entry."""
+def get_negative_cache_info(
+    storage: StorageManager, debug_file: str, debug_id: str
+) -> dict[str, Any] | None:
+    """Return active negative-cache payload if present and unexpired, else None."""
     rel = _miss_cache_rel(debug_file, debug_id)
     try:
         path = storage.resolve_path(rel)
     except StorageError:
-        return False
+        return None
     if not path.is_file():
-        return False
+        return None
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
         expires_at = float(payload.get("expires_at", 0.0))
     except (OSError, ValueError, TypeError):
-        return False
+        return None
     if time.time() < expires_at:
-        return True
+        return payload if isinstance(payload, dict) else {"reason": "unknown"}
     try:
         path.unlink(missing_ok=True)
     except OSError:
         pass
-    return False
+    return None
+
+
+def is_negative_cached(storage: StorageManager, debug_file: str, debug_id: str) -> bool:
+    """Return True when (debug_file, debug_id) has an unexpired negative-cache entry."""
+    return get_negative_cache_info(storage, debug_file, debug_id) is not None
+
+
+def clear_negative_cache(
+    storage: StorageManager,
+    debug_file: str | None = None,
+    debug_id: str | None = None,
+) -> int:
+    """Clear either one (debug_file, debug_id) negative-cache entry or the entire miss cache."""
+    if debug_file and debug_id:
+        rel = _miss_cache_rel(debug_file, debug_id)
+        try:
+            path = storage.resolve_path(rel)
+            if path.is_file():
+                path.unlink(missing_ok=True)
+                return 1
+        except (StorageError, OSError):
+            pass
+        return 0
+    try:
+        miss_dir = storage.resolve_path(MISS_CACHE_DIR_REL)
+    except StorageError:
+        return 0
+    if not miss_dir.is_dir():
+        return 0
+    removed = 0
+    try:
+        for item in miss_dir.iterdir():
+            if item.is_file():
+                try:
+                    item.unlink(missing_ok=True)
+                    removed += 1
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return removed
+
+
+def reset_circuit_breaker(storage: StorageManager) -> None:
+    """Reset any open MSDL circuit breaker state."""
+    _record_circuit_success(storage)
 
 
 def _write_negative_cache(
@@ -744,6 +1030,251 @@ async def _stream_download_to_file(
         return "network_error", str(exc) or type(exc).__name__
 
 
+def _read_native_pdb_metadata(data: bytes) -> _PdbMetadata | None:
+    if len(data) < 56:
+        return None
+    block_size, _, block_count, directory_size, _, block_map = struct.unpack_from("<6I", data, 32)
+    if not block_size or block_size > 1024 * 1024 or len(data) != block_size * block_count:
+        return None
+
+    def block_list(buffer: bytes, offset: int, size: int) -> tuple[int, ...]:
+        count = (size + block_size - 1) // block_size
+        if offset < 0 or offset + count * 4 > len(buffer):
+            raise ValueError("block list out of bounds")
+        return struct.unpack_from(f"<{count}I", buffer, offset)
+
+    def read_blocks(blocks: tuple[int, ...], size: int) -> bytes:
+        chunks: list[bytes] = []
+        for idx in blocks:
+            start = idx * block_size
+            end = start + block_size
+            if end > len(data):
+                raise ValueError("block out of bounds")
+            chunks.append(data[start:end])
+        return b"".join(chunks)[:size]
+
+    directory_blocks = block_list(data, block_map * block_size, directory_size)
+    directory = read_blocks(directory_blocks, directory_size)
+    if len(directory) < 4:
+        return None
+    (count,) = struct.unpack_from("<I", directory)
+    if count == 0 or 4 + count * 4 > len(directory):
+        return None
+    sizes = struct.unpack_from(f"<{count}I", directory, 4)
+    stream_blocks: list[tuple[int, ...]] = []
+    offset = 4 + count * 4
+    for size in sizes:
+        blocks = () if size == 0xFFFFFFFF else block_list(directory, offset, size)
+        stream_blocks.append(blocks)
+        offset += len(blocks) * 4
+
+    def stream(index: int) -> bytes:
+        if index >= count or sizes[index] == 0xFFFFFFFF:
+            return b""
+        return read_blocks(stream_blocks[index], sizes[index])
+
+    s1 = stream(1)
+    if len(s1) < 28:
+        return None
+    signature, age, guid_bytes = struct.unpack_from("<II16s", s1, 4)
+    guid = uuid.UUID(bytes_le=guid_bytes)
+    dbi = stream(3)
+    if len(dbi) < 64:
+        return _PdbMetadata(guid, age, signature)
+
+    (age,) = struct.unpack_from("<I", dbi, 8)
+    (machine,) = struct.unpack_from("<H", dbi, 58)
+    mod, contrib, section_map, source, types, _, debug_size, ec = struct.unpack_from("<8I", dbi, 24)
+    image_size = 0
+    if debug_size >= 12:
+        debug_start = 64 + mod + contrib + section_map + source + types + ec
+        if debug_start + 12 <= len(dbi):
+            (section_stream,) = struct.unpack_from("<H", dbi, debug_start + 10)
+            sections = stream(section_stream)
+            end_rva = 0
+            for sec_off in range(0, len(sections) - 39, 40):
+                virtual_size, rva, raw_size = struct.unpack_from("<III", sections, sec_off + 8)
+                end_rva = max(end_rva, rva + (virtual_size or raw_size))
+            if end_rva > 0:
+                image_size = (end_rva + 0xFFF) & ~0xFFF
+    return _PdbMetadata(guid, age, signature, machine=machine, image_size=image_size)
+
+
+def _read_pdb_metadata(path: Path) -> _PdbMetadata | None:
+    """Extract GUID/age/signature/image_size from MSF 7.00 or Portable PDB files."""
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    try:
+        if data.startswith(MSF7_MAGIC):
+            return _read_native_pdb_metadata(data)
+        if data.startswith(b"BSJB") and len(data) >= 24:
+            (version_size,) = struct.unpack_from("<I", data, 12)
+            offset = (16 + version_size + 3) & ~3
+            _, count = struct.unpack_from("<HH", data, offset)
+            offset += 4
+            for _ in range(count):
+                start, size = struct.unpack_from("<II", data, offset)
+                end = data.index(b"\0", offset + 8)
+                if data[offset + 8 : end] == b"#Pdb" and size >= 20 and start + 20 <= len(data):
+                    guid_bytes, stamp = struct.unpack_from("<16sI", data, start)
+                    return _PdbMetadata(uuid.UUID(bytes_le=guid_bytes), 1, stamp, portable=True)
+                offset = (end + 4) & ~3
+    except (ValueError, struct.error, IndexError):
+        return None
+    return None
+
+
+def _pe_matches_pdb(
+    pe_path: Path,
+    pdb_name: str,
+    pdb_meta: _PdbMetadata,
+    expected_key: str | None = None,
+) -> bool:
+    """Verify a downloaded PE binary's CodeView RSDS record matches the downloaded PDB."""
+    try:
+        data = pe_path.read_bytes()
+    except OSError:
+        return False
+    if len(data) < 0x40 or data[:2] != b"MZ":
+        return False
+    try:
+        (pe,) = struct.unpack_from("<I", data, 0x3C)
+        if pe + 24 > len(data) or data[pe : pe + 4] != b"PE\0\0":
+            return False
+        _, sections, stamp, _, _, optional_size, _ = struct.unpack_from("<HHIIIHH", data, pe + 4)
+        optional = pe + 24
+        if optional + optional_size > len(data) or optional_size < 64:
+            return False
+        (magic,) = struct.unpack_from("<H", data, optional)
+        directory_start = {0x10B: 96, 0x20B: 112}.get(magic)
+        if directory_start is None or optional_size < directory_start + 56:
+            return False
+        image_size, headers_size = struct.unpack_from("<II", data, optional + 56)
+        if expected_key and f"{stamp:08X}{image_size:x}".lower() != expected_key.lower():
+            return False
+        (directory_count,) = struct.unpack_from("<I", data, optional + directory_start - 4)
+        if directory_count < 7:
+            return False
+        debug_rva, debug_size = struct.unpack_from("<II", data, optional + directory_start + 48)
+        if not debug_rva or debug_size < 28:
+            return False
+
+        debug_offset = debug_rva if debug_rva + debug_size <= headers_size else None
+        section_start = optional + optional_size
+        for index in range(sections):
+            sec_off = section_start + index * 40
+            if sec_off + 40 > len(data):
+                break
+            _, rva, raw_size, raw_offset = struct.unpack_from("<4I", data, sec_off + 8)
+            if rva <= debug_rva and debug_rva + debug_size <= rva + raw_size:
+                debug_offset = raw_offset + debug_rva - rva
+                break
+        if debug_offset is None or debug_offset + debug_size > len(data):
+            return False
+
+        for entry in range(debug_offset, debug_offset + debug_size - 27, 28):
+            _, debug_stamp, _, minor, kind, size, _, pointer = struct.unpack_from(
+                "<IIHHIIII", data, entry
+            )
+            if kind != 2 or size < 25 or not pointer or pointer + size > len(data):
+                continue
+            record = data[pointer : pointer + size]
+            if record[:4] != b"RSDS" or record[4:20] != pdb_meta.guid.bytes_le:
+                continue
+            (age,) = struct.unpack_from("<I", record, 20)
+            name = ntpath.basename(record[24:].split(b"\0", 1)[0].decode("utf-8", "replace"))
+            if name.casefold() != pdb_name.casefold() or age != pdb_meta.age:
+                continue
+            if not pdb_meta.portable or (minor == 0x504D and debug_stamp == pdb_meta.signature):
+                return True
+    except (struct.error, ValueError):
+        return False
+    return False
+
+
+async def _fetch_winbindex_pe_keys(
+    client: httpx.AsyncClient,
+    pe_name: str,
+    pdb_meta: _PdbMetadata,
+    timeout_seconds: float,
+) -> list[str]:
+    """Best-effort query of Winbindex compressed indexes to discover PE timestamp+size keys."""
+    name = pe_name.lower()
+    encoded = quote(name, safe="")
+    name_hash = 5381
+    for ch in name:
+        name_hash = (name_hash * 33 + ord(ch)) & 0xFF
+    urls = (
+        f"{WINBINDEX_BASE_URL}/{encoded}.json.gz",
+        f"https://m417z.com/winbindex-data-arm64/by_filename_compressed/{encoded}.json.gz",
+        f"https://m417z.com/winbindex-data-insider/by_filename_compressed/{name_hash:02x}/{encoded}.json.gz",
+    )
+    req_timeout = httpx.Timeout(
+        connect=min(4.0, timeout_seconds),
+        read=min(8.0, timeout_seconds),
+        write=4.0,
+        pool=4.0,
+    )
+    candidates: dict[str, tuple[bool, bool, bool]] = {}
+    for url in urls:
+        try:
+            async with asyncio.timeout(min(8.0, timeout_seconds)):
+                resp = await client.get(
+                    url,
+                    headers={"User-Agent": SYMSRV_USER_AGENT},
+                    timeout=req_timeout,
+                )
+            if resp.status_code != 200 or not resp.content:
+                continue
+            payload = json.loads(gzip.decompress(resp.content))
+            if not isinstance(payload, dict):
+                continue
+        except Exception:
+            continue
+
+        for item in payload.values():
+            if not isinstance(item, dict):
+                continue
+            info = item.get("fileInfo")
+            if not isinstance(info, dict):
+                continue
+            timestamp = info.get("timestamp")
+            if not isinstance(timestamp, int):
+                continue
+            size = info.get("virtualSize")
+            sizes: Iterable[int]
+            if isinstance(size, int) and size > 0:
+                sizes = (size,)
+            elif (
+                isinstance(info.get("lastSectionVirtualAddress"), int)
+                and isinstance(info.get("lastSectionPointerToRawData"), int)
+                and isinstance(info.get("size"), int)
+            ):
+                last_rva = info["lastSectionVirtualAddress"]
+                last_size = info["size"] - info["lastSectionPointerToRawData"]
+                first = (last_rva + last_size + 0xFFF) & ~0xFFF
+                sizes = range(first, max(last_rva, first - 0x4000), -0x1000)
+            else:
+                sizes = (pdb_meta.image_size,) if pdb_meta.image_size else ()
+
+            for sz in sizes:
+                if sz <= 0:
+                    continue
+                key = f"{timestamp:08X}{sz:x}"
+                rank = (
+                    not pdb_meta.portable and timestamp == pdb_meta.signature,
+                    sz == pdb_meta.image_size,
+                    info.get("machineType") == pdb_meta.machine,
+                )
+                if key not in candidates or rank > candidates[key]:
+                    candidates[key] = rank
+
+    ranked = sorted(candidates, key=lambda k: candidates[k], reverse=True)
+    return ranked[:MAX_WINBINDEX_PE_PROBES]
+
+
 async def _extract_cab_file(
     cab_path: Path,
     out_dir: Path,
@@ -759,11 +1290,25 @@ async def _extract_cab_file(
     except OSError:
         return None
 
+    use_windows_expand = False
     if exec_fn is None and shutil.which(settings.CABEXTRACT_BIN) is None:
-        return None
+        if os.name == "nt":
+            sys_root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
+            expand_exe = sys_root / "System32" / "expand.exe"
+            if expand_exe.is_file():
+                use_windows_expand = True
+            else:
+                return None
+        else:
+            return None
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    cmd = [settings.CABEXTRACT_BIN, "-q", "-d", str(out_dir), str(cab_path)]
+    if use_windows_expand:
+        sys_root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
+        expand_exe = sys_root / "System32" / "expand.exe"
+        cmd = [str(expand_exe), str(cab_path), str(out_dir / expected_name)]
+    else:
+        cmd = [settings.CABEXTRACT_BIN, "-q", "-d", str(out_dir), str(cab_path)]
     exec_callable = exec_fn or asyncio.create_subprocess_exec
     try:
         proc = await exec_callable(
@@ -811,6 +1356,15 @@ async def _extract_cab_file(
     return fallback_file
 
 
+def _can_extract_cab(settings: Settings, exec_fn: Any) -> bool:
+    if exec_fn is not None or shutil.which(settings.CABEXTRACT_BIN):
+        return True
+    if os.name == "nt":
+        expand_exe = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "expand.exe"
+        return expand_exe.is_file()
+    return False
+
+
 async def _download_symsrv_artifact(
     *,
     client: httpx.AsyncClient,
@@ -829,59 +1383,67 @@ async def _download_symsrv_artifact(
     Returns (local_path, outcome, detail) where outcome is one of:
     'ok', 'not_found', 'too_large', 'invalid', 'network_error'.
     """
-    compressed = _compressed_symsrv_name(filename)
     saw_network_error = False
     last_error = ""
+    cab_supported = _can_extract_cab(settings, exec_fn)
 
     for base_url in symsrv_urls:
-        raw_dest = staging_dir / filename
-        raw_url = _build_symsrv_url(base_url, filename, symbol_id, filename)
-        status, detail = await _stream_download_to_file(
-            client, raw_url, raw_dest, max_bytes, timeout_seconds
+        name_variants = (
+            [filename.lower(), filename]
+            if _is_microsoft_symsrv_url(base_url) and filename.lower() != filename
+            else [filename]
         )
-        if status == "ok":
-            if _check_file_magic(raw_dest, expected_magics):
-                return raw_dest, "ok", ""
-            raw_dest.unlink(missing_ok=True)
-            last_error = "invalid file magic"
-            continue
-        if status == "too_large":
-            return None, "too_large", detail
-        if status == "network_error":
-            saw_network_error = True
-            last_error = detail
-            continue
 
-        # Raw file returned 404: try CAB-compressed variant (.pd_ / .dl_ / .ex_)
-        if compressed and (exec_fn is not None or shutil.which(settings.CABEXTRACT_BIN)):
-            cab_dest = staging_dir / compressed
-            cab_url = _build_symsrv_url(base_url, filename, symbol_id, compressed)
-            cab_status, cab_detail = await _stream_download_to_file(
-                client, cab_url, cab_dest, max_bytes, timeout_seconds
+        for req_name in name_variants:
+            raw_dest = staging_dir / filename
+            raw_url = _build_symsrv_url(base_url, req_name, symbol_id, req_name)
+            status, detail = await _stream_download_to_file(
+                client, raw_url, raw_dest, max_bytes, timeout_seconds
             )
-            if cab_status == "ok":
-                extracted = await _extract_cab_file(
-                    cab_dest,
-                    staging_dir / f"cab_{Path(filename).stem}",
-                    filename,
-                    settings,
-                    exec_fn=exec_fn,
-                )
-                cab_dest.unlink(missing_ok=True)
-                if extracted is not None and _check_file_magic(extracted, expected_magics):
-                    if extracted.stat().st_size > max_bytes:
-                        extracted.unlink(missing_ok=True)
-                        return None, "too_large", f"Extracted size exceeds {max_bytes} bytes"
-                    target = staging_dir / filename
-                    if extracted != target:
-                        shutil.move(str(extracted), str(target))
-                    return target, "ok", ""
-                last_error = "invalid cab payload"
-            elif cab_status == "too_large":
-                return None, "too_large", cab_detail
-            elif cab_status == "network_error":
+            if status == "ok":
+                if _check_file_magic(raw_dest, expected_magics):
+                    return raw_dest, "ok", ""
+                raw_dest.unlink(missing_ok=True)
+                last_error = "invalid file magic"
+                continue
+            if status == "too_large":
+                return None, "too_large", detail
+            if status == "network_error":
                 saw_network_error = True
-                last_error = cab_detail
+                last_error = detail
+                continue
+
+            # Raw file returned 404: try CAB-compressed variant (.pd_ / .dl_ / .ex_)
+            compressed = _compressed_symsrv_name(req_name)
+            if compressed and cab_supported:
+                cab_dest = staging_dir / compressed
+                cab_url = _build_symsrv_url(base_url, req_name, symbol_id, compressed)
+                cab_status, cab_detail = await _stream_download_to_file(
+                    client, cab_url, cab_dest, max_bytes, timeout_seconds
+                )
+                if cab_status == "ok":
+                    extracted = await _extract_cab_file(
+                        cab_dest,
+                        staging_dir / f"cab_{Path(filename).stem}",
+                        filename,
+                        settings,
+                        exec_fn=exec_fn,
+                    )
+                    cab_dest.unlink(missing_ok=True)
+                    if extracted is not None and _check_file_magic(extracted, expected_magics):
+                        if extracted.stat().st_size > max_bytes:
+                            extracted.unlink(missing_ok=True)
+                            return None, "too_large", f"Extracted size exceeds {max_bytes} bytes"
+                        target = staging_dir / filename
+                        if extracted != target:
+                            shutil.move(str(extracted), str(target))
+                        return target, "ok", ""
+                    last_error = "invalid cab payload"
+                elif cab_status == "too_large":
+                    return None, "too_large", cab_detail
+                elif cab_status == "network_error":
+                    saw_network_error = True
+                    last_error = cab_detail
 
     if saw_network_error:
         return None, "network_error", last_error
@@ -900,6 +1462,180 @@ def _public_cache_has_room(storage: StorageManager, additional_bytes: int = 0) -
     return (used + max(0, additional_bytes)) <= quota
 
 
+async def _download_matching_pe(
+    *,
+    candidate: WindowsSymbolCandidate,
+    pdb_path: Path,
+    symsrv_urls: list[str],
+    client: httpx.AsyncClient,
+    staging_dir: Path,
+    max_pe_bytes: int,
+    timeout_budget: float,
+    settings: Settings,
+    cab_exec_fn: Any,
+    allow_winbindex: bool,
+) -> Path | None:
+    """Best-effort download of a matching PE binary (.dll/.exe) for CFI unwind records."""
+    pe_dir = staging_dir / "pe"
+    pe_dir.mkdir(exist_ok=True)
+
+    pe_name: str | None = None
+    pe_id = _is_valid_pe_identity(candidate.code_file, candidate.code_id)
+    tried_keys: set[str] = set()
+
+    if pe_id is not None:
+        pe_name, raw_code_id = pe_id
+        for key in _normalize_pe_code_ids(raw_code_id):
+            tried_keys.add(key.lower())
+            pe_candidate, pe_outcome, _ = await _download_symsrv_artifact(
+                client=client,
+                symsrv_urls=symsrv_urls,
+                filename=pe_name,
+                symbol_id=key,
+                staging_dir=pe_dir,
+                max_bytes=max_pe_bytes,
+                expected_magics=(PE_MAGIC,),
+                timeout_seconds=min(10.0, timeout_budget),
+                settings=settings,
+                exec_fn=cab_exec_fn,
+            )
+            if pe_outcome == "ok" and pe_candidate is not None:
+                return pe_candidate
+
+    if pe_name is None:
+        for raw_name in (candidate.code_file, candidate.filename, candidate.module_name):
+            if not raw_name:
+                continue
+            base = _basename(raw_name).strip()
+            if base.lower().endswith((".dll", ".exe")) and _is_safe_segment(base):
+                pe_name = base
+                break
+        if pe_name is None and candidate.debug_file.lower().endswith(".pdb"):
+            stem = Path(candidate.debug_file).stem
+            if stem and _is_safe_segment(f"{stem}.dll"):
+                pe_name = f"{stem}.dll"
+
+    if pe_name is None:
+        return None
+
+    pdb_meta = await asyncio.to_thread(_read_pdb_metadata, pdb_path)
+    if pdb_meta is None:
+        return None
+
+    derived_keys: list[str] = []
+    if not pdb_meta.portable and pdb_meta.image_size > 0:
+        derived_key = f"{pdb_meta.signature:08X}{pdb_meta.image_size:x}"
+        if derived_key.lower() not in tried_keys:
+            derived_keys.append(derived_key)
+
+    for key in derived_keys:
+        tried_keys.add(key.lower())
+        pe_candidate, pe_outcome, _ = await _download_symsrv_artifact(
+            client=client,
+            symsrv_urls=symsrv_urls,
+            filename=pe_name,
+            symbol_id=key,
+            staging_dir=pe_dir,
+            max_bytes=max_pe_bytes,
+            expected_magics=(PE_MAGIC,),
+            timeout_seconds=min(10.0, timeout_budget),
+            settings=settings,
+            exec_fn=cab_exec_fn,
+        )
+        if pe_outcome == "ok" and pe_candidate is not None:
+            if await asyncio.to_thread(
+                _pe_matches_pdb, pe_candidate, candidate.debug_file, pdb_meta, key
+            ):
+                return pe_candidate
+            pe_candidate.unlink(missing_ok=True)
+
+    if allow_winbindex and settings.MS_SYMBOL_ENABLE_WINBINDEX_FALLBACK:
+        wb_keys = await _fetch_winbindex_pe_keys(client, pe_name, pdb_meta, timeout_budget)
+        for key in wb_keys:
+            if key.lower() in tried_keys:
+                continue
+            tried_keys.add(key.lower())
+            pe_candidate, pe_outcome, _ = await _download_symsrv_artifact(
+                client=client,
+                symsrv_urls=symsrv_urls,
+                filename=pe_name,
+                symbol_id=key,
+                staging_dir=pe_dir,
+                max_bytes=max_pe_bytes,
+                expected_magics=(PE_MAGIC,),
+                timeout_seconds=min(8.0, timeout_budget),
+                settings=settings,
+                exec_fn=cab_exec_fn,
+            )
+            if pe_outcome == "ok" and pe_candidate is not None:
+                if await asyncio.to_thread(
+                    _pe_matches_pdb, pe_candidate, candidate.debug_file, pdb_meta, key
+                ):
+                    return pe_candidate
+                pe_candidate.unlink(missing_ok=True)
+
+    return None
+
+
+async def _persist_public_msdl_symbol(
+    *,
+    session: AsyncSession | None,
+    session_factory: Any,
+    db_lock: asyncio.Lock | None,
+    storage: StorageManager,
+    settings: Settings,
+    sym_bytes: bytes,
+    header: Any,
+    staged_pdb: Path | None,
+    staged_pe: Path | None,
+) -> tuple[uuid.UUID | None, bool]:
+    """Persist converted MSDL .sym into DB (when session/factory available) and disk."""
+    if session is not None:
+        if db_lock is not None:
+            async with db_lock:
+                res = await store_public_symbol(
+                    session,
+                    storage,
+                    settings,
+                    sym_bytes=sym_bytes,
+                    header=header,
+                    source="msdl",
+                    staged_pdb=staged_pdb,
+                    staged_pe=staged_pe,
+                )
+        else:
+            res = await store_public_symbol(
+                session,
+                storage,
+                settings,
+                sym_bytes=sym_bytes,
+                header=header,
+                source="msdl",
+                staged_pdb=staged_pdb,
+                staged_pe=staged_pe,
+            )
+        return res.symbol.id, res.upgraded
+
+    if session_factory is not None:
+        async with session_factory() as own_session:
+            res = await store_public_symbol(
+                own_session,
+                storage,
+                settings,
+                sym_bytes=sym_bytes,
+                header=header,
+                source="msdl",
+                staged_pdb=staged_pdb,
+                staged_pe=staged_pe,
+            )
+            return res.symbol.id, res.upgraded
+
+    rel_sym_path = _public_cache_sym_rel(header.debug_file, header.debug_id)
+    _resolve_in_partition(storage, "symbols/public_cache", rel_sym_path)
+    await asyncio.to_thread(storage.atomic_write_bytes, rel_sym_path, sym_bytes)
+    return None, False
+
+
 async def _import_single_candidate(
     *,
     candidate: WindowsSymbolCandidate,
@@ -910,45 +1646,103 @@ async def _import_single_candidate(
     project_id: uuid.UUID | str | None,
     exec_fn: Any,
     cab_exec_fn: Any,
-) -> str:
-    """Import one Windows system symbol into symbols/public_cache.
+    session: AsyncSession | None = None,
+    session_factory: Any = None,
+    db_lock: asyncio.Lock | None = None,
+    explicit_targets: bool = False,
+    force: bool = False,
+    allow_winbindex: bool = False,
+) -> MSFetchItemResult:
+    """Import one Windows/public symbol into symbols/public_cache (and DB if provided)."""
 
-    Returns one of: 'imported', 'cached_hit', 'not_found', 'skipped', 'network_error', 'failed'.
-    """
+    def _result(
+        status: str,
+        detail: str | None = None,
+        *,
+        has_pe_unwind: bool = False,
+        symbol_id: uuid.UUID | None = None,
+    ) -> MSFetchItemResult:
+        return MSFetchItemResult(
+            module_name=candidate.module_name,
+            debug_file=candidate.debug_file,
+            debug_id=candidate.debug_id,
+            status=status,
+            detail=detail,
+            has_pe_unwind=has_pe_unwind,
+            symbol_id=symbol_id,
+        )
+
     if not _is_valid_pdb_identity(candidate.debug_file, candidate.debug_id):
-        return "skipped"
-    if not is_windows_system_module(
+        return _result("skipped", "Invalid PDB filename or debug_id")
+    if not explicit_targets and not is_windows_system_module(
         filename=candidate.filename,
         code_file=candidate.code_file,
         module_name=candidate.module_name,
         debug_file=candidate.debug_file,
     ):
-        return "skipped"
+        return _result("skipped", "Not recognized as a Windows system module")
 
-    if has_cached_symbol(storage, candidate.debug_file, candidate.debug_id, project_id=project_id):
-        return "cached_hit"
-    if is_negative_cached(storage, candidate.debug_file, candidate.debug_id):
-        return "skipped"
-    if is_circuit_open(storage):
-        return "skipped"
+    if force:
+        clear_negative_cache(storage, candidate.debug_file, candidate.debug_id)
+
+    cached, cached_scope, cached_path = has_cached_symbol_detail(
+        storage, candidate.debug_file, candidate.debug_id, project_id=project_id
+    )
+    existing_has_unwind = (
+        await asyncio.to_thread(_sym_file_has_unwind, cached_path)
+        if cached and cached_path is not None
+        else False
+    )
+    if cached and (
+        not force
+        or cached_scope == "project"
+        or existing_has_unwind
+        or not settings.MS_SYMBOL_FETCH_PE_UNWIND
+    ):
+        return _result(
+            "cached_hit",
+            "Already cached locally",
+            has_pe_unwind=existing_has_unwind,
+        )
+
+    if not force and is_negative_cached(storage, candidate.debug_file, candidate.debug_id):
+        return _result("skipped", "Negative-cached from recent miss")
+    if not force and is_circuit_open(storage):
+        return _result("skipped", "MSDL circuit breaker is open")
     if not _public_cache_has_room(storage):
         logger.warning(
             "Skipping MSDL import for %s: public_cache quota or host floor reached",
             candidate.debug_file,
         )
-        return "skipped"
+        return _result("skipped", "Public symbol cache quota or host disk floor reached")
 
+    was_upgrade = cached and cached_scope == "public" and not existing_has_unwind
     lock_name = f"msdl-{candidate.debug_id.lower()[:40]}"
     async with storage.shared_lock(lock_name):
         # Re-check after acquiring per-symbol lock so concurrent workers dedupe cleanly.
-        if has_cached_symbol(
+        cached, cached_scope, cached_path = has_cached_symbol_detail(
             storage, candidate.debug_file, candidate.debug_id, project_id=project_id
+        )
+        existing_has_unwind = (
+            await asyncio.to_thread(_sym_file_has_unwind, cached_path)
+            if cached and cached_path is not None
+            else False
+        )
+        if cached and (
+            not force
+            or cached_scope == "project"
+            or existing_has_unwind
+            or not settings.MS_SYMBOL_FETCH_PE_UNWIND
         ):
-            return "cached_hit"
-        if is_negative_cached(storage, candidate.debug_file, candidate.debug_id):
-            return "skipped"
-        if is_circuit_open(storage) or not _public_cache_has_room(storage):
-            return "skipped"
+            return _result(
+                "cached_hit",
+                "Already cached locally",
+                has_pe_unwind=existing_has_unwind,
+            )
+        if not force and is_negative_cached(storage, candidate.debug_file, candidate.debug_id):
+            return _result("skipped", "Negative-cached from recent miss")
+        if (not force and is_circuit_open(storage)) or not _public_cache_has_room(storage):
+            return _result("skipped", "Skipped due to circuit breaker or storage quota")
 
         timeout_budget = max(5.0, float(settings.MS_SYMBOL_FETCH_TIMEOUT_SECONDS))
         max_pdb_bytes = max(1, int(settings.MS_SYMBOL_MAX_PDB_MB)) * 1024 * 1024
@@ -978,14 +1772,14 @@ async def _import_single_candidate(
                     pdb_detail,
                     tripped,
                 )
-                return "network_error"
+                return _result("network_error", pdb_detail or "MSDL network error")
 
             if pdb_outcome == "not_found":
                 _record_circuit_success(storage)
                 _write_negative_cache(
                     storage, candidate.debug_file, candidate.debug_id, "not_found", neg_ttl
                 )
-                return "not_found"
+                return _result("not_found", pdb_detail or "Not found on Microsoft Symbol Server")
 
             if pdb_outcome != "ok" or pdb_path is None:
                 _record_circuit_success(storage)
@@ -996,42 +1790,36 @@ async def _import_single_candidate(
                     pdb_outcome,
                     min(neg_ttl, TRANSIENT_MISS_TTL_SECONDS) if neg_ttl else 0,
                 )
-                return "failed"
+                return _result("failed", pdb_detail or pdb_outcome)
 
             _record_circuit_success(storage)
 
             # Best-effort PE download for x64/arm64 CFI unwind rules (never blocks PDB import).
             pe_path: Path | None = None
             if settings.MS_SYMBOL_FETCH_PE_UNWIND:
-                pe_id = _is_valid_pe_identity(candidate.code_file, candidate.code_id)
-                if pe_id is not None:
-                    pe_name, code_id = pe_id
-                    pe_dir = staging_dir / "pe"
-                    pe_dir.mkdir(exist_ok=True)
-                    pe_candidate, pe_outcome, _ = await _download_symsrv_artifact(
-                        client=client,
-                        symsrv_urls=symsrv_urls,
-                        filename=pe_name,
-                        symbol_id=code_id,
-                        staging_dir=pe_dir,
-                        max_bytes=max_pe_bytes,
-                        expected_magics=(PE_MAGIC,),
-                        timeout_seconds=min(10.0, timeout_budget),
-                        settings=settings,
-                        exec_fn=cab_exec_fn,
-                    )
-                    if pe_outcome == "ok" and pe_candidate is not None:
-                        pe_path = pe_candidate
+                pe_path = await _download_matching_pe(
+                    candidate=candidate,
+                    pdb_path=pdb_path,
+                    symsrv_urls=symsrv_urls,
+                    client=client,
+                    staging_dir=staging_dir,
+                    max_pe_bytes=max_pe_bytes,
+                    timeout_budget=timeout_budget,
+                    settings=settings,
+                    cab_exec_fn=cab_exec_fn,
+                    allow_winbindex=allow_winbindex,
+                )
 
             # Convert PDB (+ optional PE) into Breakpad .sym via dump_syms.
+            pe_used = False
             try:
-                sym_bytes, _ = await run_dump_syms(
+                sym_bytes, pe_used = await run_dump_syms(
                     pdb_path=pdb_path,
                     pe_path=pe_path,
                     settings=settings,
                     exec_fn=exec_fn,
                 )
-            except SymbolConversionError:
+            except SymbolConversionError as exc:
                 if pe_path is None:
                     _write_negative_cache(
                         storage,
@@ -1046,15 +1834,15 @@ async def _import_single_candidate(
                         candidate.debug_id,
                         exc_info=True,
                     )
-                    return "failed"
+                    return _result("failed", str(exc) or "dump_syms conversion failed")
                 try:
-                    sym_bytes, _ = await run_dump_syms(
+                    sym_bytes, pe_used = await run_dump_syms(
                         pdb_path=pdb_path,
                         pe_path=None,
                         settings=settings,
                         exec_fn=exec_fn,
                     )
-                except SymbolConversionError:
+                except SymbolConversionError as exc2:
                     _write_negative_cache(
                         storage,
                         candidate.debug_file,
@@ -1068,11 +1856,11 @@ async def _import_single_candidate(
                         candidate.debug_id,
                         exc_info=True,
                     )
-                    return "failed"
+                    return _result("failed", str(exc2) or "dump_syms PDB-only fallback failed")
 
             try:
                 header = parse_sym_header(sym_bytes.decode("utf-8", errors="replace"))
-            except SymbolConversionError:
+            except SymbolConversionError as exc:
                 _write_negative_cache(
                     storage,
                     candidate.debug_file,
@@ -1080,7 +1868,7 @@ async def _import_single_candidate(
                     "invalid_sym_header",
                     min(neg_ttl, TRANSIENT_MISS_TTL_SECONDS) if neg_ttl else 0,
                 )
-                return "failed"
+                return _result("failed", str(exc) or "Invalid Breakpad .sym header")
 
             if header.debug_id.upper() != candidate.debug_id.upper():
                 logger.warning(
@@ -1096,20 +1884,47 @@ async def _import_single_candidate(
                     "debug_id_mismatch",
                     min(neg_ttl, TRANSIENT_MISS_TTL_SECONDS) if neg_ttl else 0,
                 )
-                return "failed"
+                return _result(
+                    "failed",
+                    f"debug_id mismatch: expected {candidate.debug_id}, got {header.debug_id}",
+                )
 
             if not _public_cache_has_room(storage, additional_bytes=len(sym_bytes)):
-                return "skipped"
+                return _result("skipped", "Public symbol cache quota or host disk floor reached")
 
-            rel_sym_path = _public_cache_sym_rel(candidate.debug_file, candidate.debug_id)
-            _resolve_in_partition(storage, "symbols/public_cache", rel_sym_path)
-            await asyncio.to_thread(storage.atomic_write_bytes, rel_sym_path, sym_bytes)
-            logger.info(
-                "Imported Windows system symbol from MSDL: %s (%d bytes)",
-                rel_sym_path,
-                len(sym_bytes),
+            # Preserve requested debug_file casing if header only differs by case
+            sym_id, db_upgraded = await _persist_public_msdl_symbol(
+                session=session,
+                session_factory=session_factory,
+                db_lock=db_lock,
+                storage=storage,
+                settings=settings,
+                sym_bytes=sym_bytes,
+                header=header,
+                staged_pdb=pdb_path,
+                staged_pe=pe_path if pe_used and header.has_unwind_records else None,
             )
-            return "imported"
+            clear_negative_cache(storage, candidate.debug_file, candidate.debug_id)
+            status_label = "upgraded" if (was_upgrade or db_upgraded) else "imported"
+            logger.info(
+                "%s Windows/public symbol from MSDL: %s/%s (%d bytes, pe_unwind=%s)",
+                status_label.capitalize(),
+                header.debug_file,
+                header.debug_id,
+                len(sym_bytes),
+                header.has_unwind_records,
+            )
+            status_detail = (
+                "Upgraded with PE unwind records"
+                if status_label == "upgraded"
+                else "Imported from MSDL"
+            )
+            return _result(
+                status_label,
+                status_detail,
+                has_pe_unwind=header.has_unwind_records,
+                symbol_id=sym_id,
+            )
 
 
 async def fetch_and_import_windows_symbols(
@@ -1118,28 +1933,60 @@ async def fetch_and_import_windows_symbols(
     settings: Settings,
     *,
     project_id: uuid.UUID | str | None = None,
+    session: AsyncSession | None = None,
+    session_factory: Any = None,
+    explicit_targets: bool = False,
+    force: bool = False,
+    bypass_auto_fetch_flag: bool = False,
+    allow_winbindex: bool = False,
     exec_fn: Any = None,
     cab_exec_fn: Any = None,
     http_transport: httpx.AsyncBaseTransport | None = None,
 ) -> MSFetchSummary:
-    """Download missing Windows system symbols from MSDL, convert via dump_syms, and cache."""
+    """Download missing Windows/public symbols from MSDL, convert via dump_syms, and store."""
     summary = MSFetchSummary()
-    if not settings.ENABLE_PUBLIC_SYMBOLS or not settings.MS_SYMBOL_AUTO_FETCH:
+    candidate_list = list(candidates)
+    if not bypass_auto_fetch_flag and (
+        not settings.ENABLE_PUBLIC_SYMBOLS or not settings.MS_SYMBOL_AUTO_FETCH
+    ):
         return summary
 
     _, symsrv_urls = split_public_symbol_urls(settings.PUBLIC_SYMBOL_URLS)
     if not symsrv_urls:
+        if bypass_auto_fetch_flag:
+            for cand in candidate_list:
+                summary.skipped += 1
+                summary.items.append(
+                    MSFetchItemResult(
+                        module_name=cand.module_name,
+                        debug_file=cand.debug_file,
+                        debug_id=cand.debug_id,
+                        status="skipped",
+                        detail="No SymSrv/MSDL URL configured in PUBLIC_SYMBOL_URLS",
+                    )
+                )
         return summary
 
-    if is_circuit_open(storage):
+    if not force and is_circuit_open(storage):
         summary.circuit_open = True
+        for cand in candidate_list:
+            summary.skipped += 1
+            summary.items.append(
+                MSFetchItemResult(
+                    module_name=cand.module_name,
+                    debug_file=cand.debug_file,
+                    debug_id=cand.debug_id,
+                    status="skipped",
+                    detail="MSDL circuit breaker is temporarily open",
+                )
+            )
         return summary
 
-    candidate_list = list(candidates)
     if not candidate_list:
         return summary
 
     sem = asyncio.Semaphore(MAX_MS_FETCH_CONCURRENCY)
+    db_lock = asyncio.Lock() if session is not None else None
     client_kwargs: dict[str, Any] = {
         "follow_redirects": True,
         "headers": {"User-Agent": SYMSRV_USER_AGENT},
@@ -1149,12 +1996,18 @@ async def fetch_and_import_windows_symbols(
 
     async with httpx.AsyncClient(**client_kwargs) as client:
 
-        async def _worker(cand: WindowsSymbolCandidate) -> tuple[WindowsSymbolCandidate, str]:
+        async def _worker(cand: WindowsSymbolCandidate) -> MSFetchItemResult:
             async with sem:
-                if is_circuit_open(storage):
-                    return cand, "circuit_open"
+                if not force and is_circuit_open(storage):
+                    return MSFetchItemResult(
+                        module_name=cand.module_name,
+                        debug_file=cand.debug_file,
+                        debug_id=cand.debug_id,
+                        status="circuit_open",
+                        detail="MSDL circuit breaker opened during batch",
+                    )
                 try:
-                    outcome = await _import_single_candidate(
+                    return await _import_single_candidate(
                         candidate=cand,
                         symsrv_urls=symsrv_urls,
                         client=client,
@@ -1163,38 +2016,63 @@ async def fetch_and_import_windows_symbols(
                         project_id=project_id,
                         exec_fn=exec_fn,
                         cab_exec_fn=cab_exec_fn,
+                        session=session,
+                        session_factory=session_factory,
+                        db_lock=db_lock,
+                        explicit_targets=explicit_targets,
+                        force=force,
+                        allow_winbindex=allow_winbindex,
                     )
-                    return cand, outcome
                 except asyncio.CancelledError:
                     raise
-                except Exception:
+                except Exception as exc:
                     logger.warning(
                         "Unexpected error importing MSDL symbol %s/%s",
                         cand.debug_file,
                         cand.debug_id,
                         exc_info=True,
                     )
-                    return cand, "failed"
+                    return MSFetchItemResult(
+                        module_name=cand.module_name,
+                        debug_file=cand.debug_file,
+                        debug_id=cand.debug_id,
+                        status="failed",
+                        detail=str(exc) or type(exc).__name__,
+                    )
 
         results = await asyncio.gather(*(_worker(c) for c in candidate_list))
 
-    for cand, outcome in results:
+    for item in results:
+        outcome = item.status
         if outcome == "circuit_open":
             summary.circuit_open = True
             summary.skipped += 1
-        elif outcome == "imported":
+            summary.items.append(
+                MSFetchItemResult(
+                    module_name=item.module_name,
+                    debug_file=item.debug_file,
+                    debug_id=item.debug_id,
+                    status="skipped",
+                    detail=item.detail,
+                )
+            )
+            continue
+
+        summary.items.append(item)
+        if outcome == "imported":
             summary.attempted += 1
             summary.imported += 1
-            summary.imported_keys.append(f"{cand.debug_file}/{cand.debug_id}")
+            summary.imported_keys.append(f"{item.debug_file}/{item.debug_id}")
+        elif outcome == "upgraded":
+            summary.attempted += 1
+            summary.upgraded += 1
+            summary.imported_keys.append(f"{item.debug_file}/{item.debug_id}")
         elif outcome == "cached_hit":
             summary.cached_hit += 1
         elif outcome == "not_found":
             summary.attempted += 1
             summary.not_found += 1
-        elif outcome == "network_error":
-            summary.attempted += 1
-            summary.failed += 1
-        elif outcome == "failed":
+        elif outcome in {"network_error", "failed"}:
             summary.attempted += 1
             summary.failed += 1
         else:
@@ -1208,14 +2086,20 @@ async def fetch_and_import_windows_symbols(
 __all__ = [
     "CIRCUIT_COOLDOWN_SECONDS",
     "CIRCUIT_FAILURE_THRESHOLD",
+    "MSFetchItemResult",
     "MSFetchSummary",
     "SYMSRV_USER_AGENT",
     "WindowsSymbolCandidate",
+    "clear_negative_cache",
     "fetch_and_import_windows_symbols",
+    "get_negative_cache_info",
     "has_cached_symbol",
+    "has_cached_symbol_detail",
     "is_circuit_open",
     "is_negative_cached",
     "is_windows_system_module",
+    "parse_manual_ms_target",
+    "reset_circuit_breaker",
     "select_windows_system_candidates",
     "split_public_symbol_urls",
 ]

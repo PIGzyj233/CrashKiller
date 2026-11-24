@@ -16,6 +16,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -64,18 +65,33 @@ class Symbol(Base):
             "debug_id",
             name="uq_symbols_project_debug_file_id",
         ),
+        Index(
+            "uq_symbols_public_debug_file_id",
+            "debug_file",
+            "debug_id",
+            unique=True,
+            sqlite_where=text("project_id IS NULL"),
+            postgresql_where=text("project_id IS NULL"),
+        ),
         Index("ix_symbols_debug_file_debug_id", "debug_file", "debug_id"),
         Index("ix_symbols_code_file_code_id", "code_file", "code_id"),
+        Index("ix_symbols_source", "source"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUIDType, primary_key=True, default=uuid.uuid4)
-    project_id: Mapped[uuid.UUID] = mapped_column(
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
         UUIDType,
         ForeignKey("projects.id", ondelete="CASCADE"),
-        nullable=False,
+        nullable=True,
         index=True,
     )
-    app_version: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    app_version: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    source: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="upload",
+        server_default="upload",
+    )
     module_name: Mapped[str] = mapped_column(String(255), nullable=False)
     debug_file: Mapped[str] = mapped_column(String(255), nullable=False)
     debug_id: Mapped[str] = mapped_column(String(128), nullable=False)
@@ -94,7 +110,7 @@ class Symbol(Base):
     )
     created_at: Mapped[datetime] = mapped_column(TZDateTime, nullable=False, default=utcnow)
 
-    project: Mapped[Project] = relationship(back_populates="symbols")
+    project: Mapped[Project | None] = relationship(back_populates="symbols")
 
 
 class Issue(Base):

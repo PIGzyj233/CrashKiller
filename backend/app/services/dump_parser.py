@@ -321,17 +321,15 @@ async def parse_dump(
         else:
             sym_dir = sym_root
         cmd = [settings.MINIDUMP_STACKWALK_BIN, "--json"]
-        pub_cache: Path | None = None
+        pub_cache = storage.partition_path("symbols/public_cache")
+        pub_cache.mkdir(parents=True, exist_ok=True)
         if settings.ENABLE_PUBLIC_SYMBOLS:
-            pub_cache = storage.partition_path("symbols/public_cache")
             breakpad_urls, _ = split_public_symbol_urls(settings.PUBLIC_SYMBOL_URLS)
             if breakpad_urls:
                 for url in breakpad_urls:
                     cmd.extend(["--symbols-url", url])
                 cmd.extend(["--symbols-cache", str(pub_cache)])
-        cmd.extend([str(staged_dmp), str(sym_dir)])
-        if pub_cache is not None:
-            cmd.append(str(pub_cache))
+        cmd.extend([str(staged_dmp), str(sym_dir), str(pub_cache)])
 
         exec_callable = exec_fn or asyncio.create_subprocess_exec
         try:

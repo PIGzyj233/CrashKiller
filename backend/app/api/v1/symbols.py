@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import (
     APIRouter,
@@ -36,13 +36,16 @@ from app.config import Settings
 from app.db.models import CrashReport, Symbol
 from app.schemas.symbol import (
     MissingSymbolQueueItem,
+    PublicSymbolSyncItemResult,
+    PublicSymbolSyncRequest,
+    PublicSymbolSyncResponse,
     ResymbolicateRequest,
     ResymbolicateResponse,
     SymbolListResponse,
     SymbolRead,
     SymbolUploadResponse,
 )
-from app.services import symbol_service
+from app.services import ms_symbol_service, symbol_service
 from app.services.storage import StorageCapacityError, StorageError, StorageManager
 from app.services.symbol_service import (
     SymbolConversionError,
@@ -101,6 +104,7 @@ async def aggregate_missing_symbols(
     project_id: uuid.UUID | None = None,
     limit: int = 50,
     offset: int = 0,
+    storage: StorageManager | None = None,
 ) -> tuple[list[MissingSymbolQueueItem], int]:
     """Aggregate missing symbols from CrashReport.missing_symbols_json across crashes."""
     stmt = select(
@@ -174,29 +178,136 @@ async def aggregate_missing_symbols(
                 if bucket["module_name"] == "unknown" and module_name != "unknown":
                     bucket["module_name"] = module_name
 
-    items = [
-        MissingSymbolQueueItem(
-            debug_file=b["debug_file"],
-            debug_id=b["debug_id"],
-            module_name=b["module_name"],
-            code_file=b["code_file"],
-            code_id=b["code_id"],
-            crash_count=len(b["affected_crash_ids"]),
-            latest_crash_at=b["latest_crash_at"],
-            affected_crash_ids=b["affected_crash_ids"],
-        )
-        for b in buckets.values()
-    ]
-    items.sort(
-        key=lambda item: (
-            -item.crash_count,
-            -item.latest_crash_at.timestamp(),
-            item.debug_file.lower(),
-            item.debug_id,
+    raw_buckets = list(buckets.values())
+    raw_buckets.sort(
+        key=lambda b: (
+            -len(b["affected_crash_ids"]),
+            -b["latest_crash_at"].timestamp(),
+            b["debug_file"].lower(),
+            b["debug_id"],
         )
     )
-    total = len(items)
-    return items[offset : offset + limit], total
+    total = len(raw_buckets)
+    page_buckets = raw_buckets[offset : offset + limit]
+
+    items: list[MissingSymbolQueueItem] = []
+    for b in page_buckets:
+        debug_file = b["debug_file"]
+        debug_id = b["debug_id"]
+        is_win_sys = ms_symbol_service.is_windows_system_module(
+            filename=b["code_file"],
+            code_file=b["code_file"],
+            module_name=b["module_name"],
+            debug_file=debug_file,
+        )
+        is_avail = False
+        loc_scope: Literal["public", "project"] | None = None
+        neg_cached = False
+        neg_reason: str | None = None
+        if storage is not None and debug_file and debug_id:
+            is_avail, raw_scope, _ = ms_symbol_service.has_cached_symbol_detail(
+                storage,
+                debug_file,
+                debug_id,
+                project_id=project_id,
+            )
+            if raw_scope in {"public", "project"}:
+                loc_scope = raw_scope  # type: ignore[assignment]
+            neg_info = ms_symbol_service.get_negative_cache_info(storage, debug_file, debug_id)
+            if neg_info is not None:
+                neg_cached = True
+                raw_reason = neg_info.get("reason")
+                neg_reason = str(raw_reason) if raw_reason else None
+
+        items.append(
+            MissingSymbolQueueItem(
+                debug_file=debug_file,
+                debug_id=debug_id,
+                module_name=b["module_name"],
+                code_file=b["code_file"],
+                code_id=b["code_id"],
+                crash_count=len(b["affected_crash_ids"]),
+                latest_crash_at=b["latest_crash_at"],
+                affected_crash_ids=b["affected_crash_ids"],
+                is_windows_system=is_win_sys,
+                is_available_locally=is_avail,
+                local_scope=loc_scope,
+                msdl_negative_cached=neg_cached,
+                msdl_last_reason=neg_reason,
+            )
+        )
+
+    return items, total
+
+
+async def _queue_resymbolication(
+    *,
+    session: AsyncSession,
+    dispatcher: TaskDispatcher,
+    storage: StorageManager,
+    project_id: uuid.UUID | None = None,
+    debug_ids: set[str] | None = None,
+    crash_ids: list[uuid.UUID] | None = None,
+    missing_only: bool = False,
+) -> list[uuid.UUID]:
+    """Reserve eligible idle crashes and enqueue durable resymbolication jobs."""
+    if crash_ids is not None and len(crash_ids) == 0:
+        return []
+    norm_debug_ids = {d.strip().upper() for d in (debug_ids or set()) if d and d.strip()}
+    if debug_ids is not None and not norm_debug_ids:
+        return []
+
+    async with storage.shared_lock("capacity"):
+        stmt = select(CrashReport.id, CrashReport.missing_symbols_json).where(
+            CrashReport.dump_path.is_not(None),
+            CrashReport.status.notin_(ACTIVE_CRASH_STATUSES),
+            ~crash_has_job(),
+        )
+        if crash_ids is not None:
+            stmt = stmt.where(CrashReport.id.in_(crash_ids))
+        if project_id is not None:
+            stmt = stmt.where(CrashReport.project_id == project_id)
+
+        rows = (await session.execute(stmt)).all()
+        matched_ids: list[uuid.UUID] = []
+        for row_id, missing_json in rows:
+            if missing_only or norm_debug_ids:
+                if not any(
+                    isinstance(entry, dict)
+                    and (
+                        not norm_debug_ids
+                        or str(entry.get("debug_id") or "").strip().upper() in norm_debug_ids
+                    )
+                    for entry in (missing_json or [])
+                ):
+                    continue
+            matched_ids.append(row_id)
+
+        queued_ids: list[uuid.UUID] = []
+        job_ids: list[uuid.UUID] = []
+        for start in range(0, len(matched_ids), 100):
+            batch = matched_ids[start : start + 100]
+            reserved = await session.scalars(
+                update(CrashReport)
+                .where(
+                    CrashReport.id.in_(batch),
+                    CrashReport.dump_path.is_not(None),
+                    CrashReport.status.notin_(ACTIVE_CRASH_STATUSES),
+                    ~crash_has_job(),
+                )
+                .values(status="PENDING")
+                .returning(CrashReport.id)
+            )
+            for crash_id in reserved:
+                queued_ids.append(crash_id)
+                job_ids.append(stage_crash_job(session, crash_id, "resymbolicate"))
+
+        if queued_ids:
+            await session.commit()
+
+    if job_ids:
+        await dispatcher.kick_crash_jobs(job_ids)
+    return queued_ids
 
 
 @router.post("/upload", response_model=SymbolUploadResponse, status_code=status.HTTP_201_CREATED)
@@ -272,23 +383,262 @@ async def upload_symbol(
     return SymbolUploadResponse(
         **sym_read.model_dump(),
         deduplicated=result.deduplicated,
+        upgraded=result.upgraded,
+    )
+
+
+@router.post(
+    "/public/upload",
+    response_model=SymbolUploadResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def upload_public_symbol(
+    request: Request,
+    pdb_file: UploadFile = File(...),
+    pe_file: UploadFile | None = File(default=None),
+    auto_resymbolicate: bool = Form(default=False),
+    session: AsyncSession = Depends(get_db),
+    storage: StorageManager = Depends(get_storage),
+    dispatcher: TaskDispatcher = Depends(get_dispatcher),
+    base_settings: Settings = Depends(get_app_settings),
+) -> SymbolUploadResponse:
+    """Manually complete the global Public Symbol Store without binding project or app_version."""
+    pdb_name = _sanitize_upload_basename(pdb_file.filename, "upload.pdb")
+    pe_name: str | None = None
+    if pe_file is not None:
+        pe_name = _sanitize_upload_basename(pe_file.filename, "upload.dll")
+
+    effective_app, eff_storage = await get_effective_storage(session, storage, base_settings)
+    await session.rollback()
+    exec_fn = getattr(request.app.state, "exec_fn", None)
+
+    try:
+        result = await symbol_service.ingest_public_symbol(
+            session=session,
+            storage=eff_storage,
+            settings=effective_app,
+            pdb_filename=pdb_name,
+            pdb_bytes_or_path=pdb_file.file,
+            pe_filename=pe_name,
+            pe_bytes_or_path=pe_file.file if pe_file is not None else None,
+            source="upload",
+            exec_fn=exec_fn,
+        )
+    except (StorageCapacityError, OSError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_507_INSUFFICIENT_STORAGE,
+            detail=str(exc),
+        ) from exc
+    except SymbolConversionError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=str(exc),
+        ) from exc
+
+    queued_ids: list[uuid.UUID] = []
+    if auto_resymbolicate:
+        queued_ids = await _queue_resymbolication(
+            session=session,
+            dispatcher=dispatcher,
+            storage=eff_storage,
+            debug_ids={result.symbol.debug_id},
+        )
+
+    sym_read = SymbolRead.model_validate(result.symbol)
+    return SymbolUploadResponse(
+        **sym_read.model_dump(),
+        deduplicated=result.deduplicated,
+        upgraded=result.upgraded,
+        resymbolicate_queued_count=len(queued_ids),
+        resymbolicate_crash_ids=queued_ids,
+    )
+
+
+@router.post(
+    "/public/sync",
+    response_model=PublicSymbolSyncResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def sync_public_symbols(
+    request: Request,
+    payload: PublicSymbolSyncRequest,
+    session: AsyncSession = Depends(get_db),
+    storage: StorageManager = Depends(get_storage),
+    dispatcher: TaskDispatcher = Depends(get_dispatcher),
+    base_settings: Settings = Depends(get_app_settings),
+) -> PublicSymbolSyncResponse:
+    """Actively fetch Microsoft public symbols into the global Public Symbol Store."""
+    effective_app, eff_storage = await get_effective_storage(session, storage, base_settings)
+    await session.rollback()
+
+    candidates: list[ms_symbol_service.WindowsSymbolCandidate] = []
+    seen_keys: set[tuple[str, str]] = set()
+    explicit_targets = payload.mode == "targets"
+
+    if explicit_targets:
+        if not payload.targets:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="targets must contain at least one symbol when mode='targets'",
+            )
+        if len(payload.targets) > 50:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="At most 50 targets can be synced in a single request",
+            )
+        for target in payload.targets:
+            name_input = (target.debug_file or target.module_name or target.code_file or "").strip()
+            if not name_input:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    detail="Each target requires debug_file or module_name",
+                )
+            try:
+                cand = ms_symbol_service.parse_manual_ms_target(
+                    name_input,
+                    target.debug_id,
+                    age=target.age,
+                    code_file=target.code_file,
+                    code_id=target.code_id,
+                )
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    detail=str(exc),
+                ) from exc
+            dedup = (cand.debug_file.lower(), cand.debug_id.upper())
+            if dedup not in seen_keys:
+                seen_keys.add(dedup)
+                candidates.append(cand)
+    else:
+        missing_items, _ = await aggregate_missing_symbols(
+            session,
+            project_id=payload.project_id,
+            limit=500,
+            offset=0,
+            storage=eff_storage,
+        )
+        for item in missing_items:
+            if len(candidates) >= payload.max_targets:
+                break
+            if not item.is_windows_system:
+                continue
+            if not item.debug_file or not item.debug_id:
+                continue
+            if not item.debug_file.lower().endswith(".pdb"):
+                continue
+            dedup = (item.debug_file.lower(), item.debug_id.upper())
+            if dedup in seen_keys:
+                continue
+            seen_keys.add(dedup)
+            candidates.append(
+                ms_symbol_service.WindowsSymbolCandidate(
+                    module_name=item.module_name or item.debug_file,
+                    debug_file=item.debug_file,
+                    debug_id=item.debug_id.upper(),
+                    code_file=item.code_file,
+                    code_id=item.code_id,
+                    filename=item.code_file,
+                )
+            )
+
+    if not candidates:
+        return PublicSymbolSyncResponse()
+
+    exec_fn = getattr(request.app.state, "exec_fn", None)
+    cab_exec_fn = getattr(request.app.state, "cab_exec_fn", None)
+    http_transport = getattr(request.app.state, "http_transport", None)
+
+    summary = await ms_symbol_service.fetch_and_import_windows_symbols(
+        candidates,
+        eff_storage,
+        effective_app,
+        project_id=payload.project_id,
+        session=session,
+        explicit_targets=explicit_targets,
+        force=payload.force,
+        bypass_auto_fetch_flag=True,
+        allow_winbindex=explicit_targets,
+        exec_fn=exec_fn,
+        cab_exec_fn=cab_exec_fn,
+        http_transport=http_transport,
+    )
+
+    if summary.cached_hit > 0:
+        await symbol_service.reconcile_public_symbol_cache(session, eff_storage)
+
+    queued_ids: list[uuid.UUID] = []
+    if payload.auto_resymbolicate:
+        ready_debug_ids = {
+            item.debug_id.upper()
+            for item in summary.items
+            if item.status in {"imported", "upgraded", "cached_hit"}
+        }
+        if ready_debug_ids:
+            queued_ids = await _queue_resymbolication(
+                session=session,
+                dispatcher=dispatcher,
+                storage=eff_storage,
+                project_id=payload.project_id,
+                debug_ids=ready_debug_ids,
+            )
+
+    return PublicSymbolSyncResponse(
+        attempted=summary.attempted,
+        imported=summary.imported,
+        upgraded=summary.upgraded,
+        cached_hit=summary.cached_hit,
+        not_found=summary.not_found,
+        skipped=summary.skipped,
+        failed=summary.failed,
+        circuit_open=summary.circuit_open,
+        resymbolicate_queued_count=len(queued_ids),
+        resymbolicate_crash_ids=queued_ids,
+        results=[
+            PublicSymbolSyncItemResult(
+                module_name=item.module_name,
+                debug_file=item.debug_file,
+                debug_id=item.debug_id,
+                status=item.status,  # type: ignore[arg-type]
+                detail=item.detail,
+                has_pe_unwind=item.has_pe_unwind,
+                symbol_id=item.symbol_id,
+            )
+            for item in summary.items
+        ],
     )
 
 
 @router.get("", response_model=SymbolListResponse)
 async def list_symbols(
     project_id: uuid.UUID | None = None,
+    scope: Literal["project", "public", "all"] | None = Query(default=None),
+    source: str | None = Query(default=None),
     app_version: str | None = None,
     q: str | None = None,
     has_pe_unwind: bool | None = None,
     limit: int = Query(default=50, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     session: AsyncSession = Depends(get_db),
+    storage: StorageManager = Depends(get_storage),
 ) -> SymbolListResponse:
+    if scope in {"public", "all"}:
+        await symbol_service.reconcile_public_symbol_cache(session, storage)
+
     filters = []
-    if project_id is not None:
-        filters.append(Symbol.project_id == project_id)
-    if app_version is not None and app_version.strip():
+    if scope == "public":
+        filters.append(Symbol.project_id.is_(None))
+    elif scope == "all":
+        if project_id is not None:
+            filters.append(or_(Symbol.project_id == project_id, Symbol.project_id.is_(None)))
+    else:
+        filters.append(Symbol.project_id.is_not(None))
+        if project_id is not None:
+            filters.append(Symbol.project_id == project_id)
+
+    if source is not None and source.strip():
+        filters.append(Symbol.source == source.strip())
+    if scope != "public" and app_version is not None and app_version.strip():
         filters.append(Symbol.app_version == app_version.strip())
     if has_pe_unwind is not None:
         filters.append(Symbol.has_pe_unwind == has_pe_unwind)
@@ -327,12 +677,14 @@ async def list_missing_symbols(
     limit: int = Query(default=50, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     session: AsyncSession = Depends(get_db),
+    storage: StorageManager = Depends(get_storage),
 ) -> list[MissingSymbolQueueItem]:
     items, _ = await aggregate_missing_symbols(
         session,
         project_id=project_id,
         limit=limit,
         offset=offset,
+        storage=storage,
     )
     return items
 
@@ -348,62 +700,15 @@ async def resymbolicate_crashes(
     dispatcher: TaskDispatcher = Depends(get_dispatcher),
     storage: StorageManager = Depends(get_storage),
 ) -> ResymbolicateResponse:
-    if payload.crash_ids is not None and len(payload.crash_ids) == 0:
-        return ResymbolicateResponse(queued_count=0, crash_ids=[])
-
-    async with storage.shared_lock("capacity"):
-        stmt = select(CrashReport.id, CrashReport.missing_symbols_json).where(
-            CrashReport.dump_path.is_not(None),
-            CrashReport.status.notin_(ACTIVE_CRASH_STATUSES),
-            ~crash_has_job(),
-        )
-        if payload.crash_ids is not None:
-            stmt = stmt.where(CrashReport.id.in_(payload.crash_ids))
-        if payload.project_id is not None:
-            stmt = stmt.where(CrashReport.project_id == payload.project_id)
-
-        rows = (await session.execute(stmt)).all()
-        target_debug_id = payload.debug_id.strip().upper() if payload.debug_id else None
-
-        matched_ids: list[uuid.UUID] = []
-        for row_id, missing_json in rows:
-            if payload.missing_only or target_debug_id:
-                if not any(
-                    isinstance(entry, dict)
-                    and (
-                        not target_debug_id
-                        or str(entry.get("debug_id") or "").strip().upper() == target_debug_id
-                    )
-                    for entry in (missing_json or [])
-                ):
-                    continue
-            matched_ids.append(row_id)
-
-        queued_ids: list[uuid.UUID] = []
-        job_ids: list[uuid.UUID] = []
-        for start in range(0, len(matched_ids), 100):
-            batch = matched_ids[start:start + 100]
-            reserved = await session.scalars(
-                update(CrashReport)
-                .where(
-                    CrashReport.id.in_(batch),
-                    CrashReport.dump_path.is_not(None),
-                    CrashReport.status.notin_(ACTIVE_CRASH_STATUSES),
-                    ~crash_has_job(),
-                )
-                .values(status="PENDING")
-                .returning(CrashReport.id)
-            )
-            for crash_id in reserved:
-                queued_ids.append(crash_id)
-                job_ids.append(stage_crash_job(session, crash_id, "resymbolicate"))
-
-        if queued_ids:
-            await session.commit()
-
-    if job_ids:
-        await dispatcher.kick_crash_jobs(job_ids)
-
+    queued_ids = await _queue_resymbolication(
+        session=session,
+        dispatcher=dispatcher,
+        storage=storage,
+        project_id=payload.project_id,
+        debug_ids={payload.debug_id} if payload.debug_id else None,
+        crash_ids=payload.crash_ids,
+        missing_only=payload.missing_only,
+    )
     return ResymbolicateResponse(
         queued_count=len(queued_ids),
         crash_ids=queued_ids,
@@ -421,6 +726,11 @@ async def delete_symbol(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Symbol not found")
 
     sym_path = sym.sym_path
+    sym_partition = (
+        "symbols/public_cache"
+        if sym.project_id is None or (sym_path or "").startswith("symbols/public_cache/")
+        else "symbols/sym"
+    )
     raw_archive_path = sym.raw_archive_path
     code_id = sym.code_id
     code_file = sym.code_file
@@ -437,7 +747,7 @@ async def delete_symbol(
             ).scalar_one()
         )
         if sym_ref_count == 0:
-            _unlink_and_prune(storage, sym_path, "symbols/sym")
+            _unlink_and_prune(storage, sym_path, sym_partition)
 
     if raw_archive_path:
         raw_ref_count = int(

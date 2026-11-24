@@ -21,11 +21,14 @@ from app.services.ms_symbol_service import (
     CIRCUIT_FAILURE_THRESHOLD,
     SYMSRV_USER_AGENT,
     WindowsSymbolCandidate,
+    _normalize_pe_code_ids,
     fetch_and_import_windows_symbols,
     has_cached_symbol,
+    has_cached_symbol_detail,
     is_circuit_open,
     is_negative_cached,
     is_windows_system_module,
+    parse_manual_ms_target,
     select_windows_system_candidates,
     split_public_symbol_urls,
 )
@@ -775,3 +778,148 @@ async def test_fetch_ms_symbols_preserves_existing_ai_run_and_skips_active_crash
             assert job.run_ai_override is False
     finally:
         await engine.dispose()
+
+
+def test_parse_manual_ms_target_and_pe_code_id_normalization() -> None:
+    gc_did = "90D28435EAAB109449C47402C53C42D31"
+    cand = parse_manual_ms_target("GraphicsCapture.dll", gc_did)
+    assert cand.module_name == "GraphicsCapture.dll"
+    assert cand.debug_file == "GraphicsCapture.pdb"
+    assert cand.debug_id == gc_did
+    assert cand.code_file == "GraphicsCapture.dll"
+
+    dashed = parse_manual_ms_target(
+        "GraphicsCapture.pdb",
+        "{90d28435-eaab-1094-49c4-7402c53c42d3}",
+        age="1",
+        code_id="65A1B2C30001A000",
+    )
+    assert dashed.debug_file == "GraphicsCapture.pdb"
+    assert dashed.debug_id == gc_did
+    assert dashed.code_id == "65A1B2C30001A000"
+
+    assert _normalize_pe_code_ids("65A1B2C30001A000") == [
+        "65A1B2C31a000",
+        "65A1B2C30001A000",
+    ]
+    assert _normalize_pe_code_ids("65A1B2C31a000") == [
+        "65A1B2C31a000",
+        "65A1B2C31A000",
+    ]
+
+    assert is_windows_system_module(
+        filename=None,
+        code_file=None,
+        module_name="GraphicsCapture.dll",
+        debug_file="GraphicsCapture.pdb",
+    )
+
+
+async def test_explicit_force_sync_bypasses_allowlist_normalizes_urls_and_upgrades_pe(
+    storage_manager: StorageManager,
+    test_settings: Settings,
+    db_session: AsyncSession,
+) -> None:
+    from app.db.models import Symbol
+
+    gc_did = "90D28435EAAB109449C47402C53C42D31"
+    raw_code_id = "65A1B2C30001A000"
+    canonical_code_id = "65A1B2C31a000"
+    requested_paths: list[str] = []
+    serve_pe = {"enabled": False}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_paths.append(request.url.path)
+        if request.url.path.endswith(
+            f"/graphicscapture.pdb/{gc_did}/graphicscapture.pdb"
+        ):
+            return httpx.Response(200, content=FAKE_PDB_BYTES)
+        if serve_pe["enabled"] and request.url.path.endswith(
+            f"/graphicscapture.dll/{canonical_code_id}/graphicscapture.dll"
+        ):
+            return httpx.Response(200, content=FAKE_PE_BYTES)
+        return httpx.Response(404)
+
+    async def fake_dump_syms(*cmd: str, **_kwargs: Any) -> Any:
+        has_pe = len(cmd) >= 3
+        out = _sample_sym(
+            "GraphicsCapture.pdb",
+            gc_did,
+            canonical_code_id if has_pe else None,
+        )
+
+        class _Proc:
+            returncode = 0
+
+            async def communicate(self) -> tuple[bytes, bytes]:
+                return out, b""
+
+            def kill(self) -> None:
+                pass
+
+        return _Proc()
+
+    cand = parse_manual_ms_target(
+        "GraphicsCapture.dll",
+        gc_did,
+        code_id=raw_code_id,
+    )
+    # 1. Initial sync without PE imports PDB-only and stores global Symbol row
+    s1 = await fetch_and_import_windows_symbols(
+        [cand],
+        storage_manager,
+        test_settings.model_copy(update={"MS_SYMBOL_AUTO_FETCH": False}),
+        session=db_session,
+        explicit_targets=True,
+        force=True,
+        bypass_auto_fetch_flag=True,
+        exec_fn=fake_dump_syms,
+        http_transport=httpx.MockTransport(handler),
+    )
+    assert s1.imported == 1
+    assert s1.items[0].status == "imported"
+    assert s1.items[0].has_pe_unwind is False
+    assert any(
+        p.endswith(f"/graphicscapture.pdb/{gc_did}/graphicscapture.pdb")
+        for p in requested_paths
+    )
+    assert any(
+        p.endswith(f"/graphicscapture.dll/{canonical_code_id}/graphicscapture.dll")
+        for p in requested_paths
+    )
+
+    found, scope, _ = has_cached_symbol_detail(
+        storage_manager, "GraphicsCapture.pdb", gc_did
+    )
+    assert found is True
+    assert scope == "public"
+
+    row = (
+        await db_session.scalars(
+            select(Symbol).where(Symbol.debug_id == gc_did)
+        )
+    ).one()
+    assert row.project_id is None
+    assert row.app_version is None
+    assert row.source == "msdl"
+    assert row.has_pe_unwind is False
+
+    # 2. Second force sync once PE is available upgrades existing public symbol
+    serve_pe["enabled"] = True
+    s2 = await fetch_and_import_windows_symbols(
+        [cand],
+        storage_manager,
+        test_settings,
+        session=db_session,
+        explicit_targets=True,
+        force=True,
+        bypass_auto_fetch_flag=True,
+        exec_fn=fake_dump_syms,
+        http_transport=httpx.MockTransport(handler),
+    )
+    assert s2.upgraded == 1
+    assert s2.items[0].status == "upgraded"
+    assert s2.items[0].has_pe_unwind is True
+    await db_session.refresh(row)
+    assert row.has_pe_unwind is True
+

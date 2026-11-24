@@ -109,14 +109,15 @@ async def get_dashboard(
         count for st, count in issue_status_counts.items() if st in {"NEW", "KNOWN", "REGRESSION"}
     )
 
+    _, eff_storage = await get_effective_storage(session, storage, base_settings)
     top_missing, total_missing = await aggregate_missing_symbols(
         session,
         project_id=project_id,
         limit=10,
         offset=0,
+        storage=eff_storage,
     )
 
-    _, eff_storage = await get_effective_storage(session, storage, base_settings)
     db_used_bytes = await eff_storage.get_db_size_bytes(session)
     storage_report = await asyncio.to_thread(eff_storage.get_disk_usage_report, db_used_bytes)
 
