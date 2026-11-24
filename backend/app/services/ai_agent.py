@@ -53,7 +53,7 @@ _INT32_MAX = 2_147_483_647
 
 _FENCE_RE = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*$", re.DOTALL | re.IGNORECASE)
 
-AI_SYSTEM_PROMPT = """You are a senior C++ Windows/Native Crash Triage Engineer for CrashKiller.
+_AI_SYSTEM_PROMPT_BASE = """You are a senior C++ Windows/Native Crash Triage Engineer.
 You investigate a crash dump and its diagnostic logs using ONLY the provided read-only tools.
 
 Investigation rules:
@@ -82,16 +82,92 @@ Investigation rules:
   "verdict": "KNOWN_ISSUE | NEW_ISSUE | REGRESSION | NEEDS_REVIEW",
   "matched_issue_id": 42,
   "confidence": 0.91,
-  "suggested_title": "concise issue title",
-  "root_cause_analysis": "technical explanation grounded in stack + logs",
-  "reasoning_summary": "step-by-step justification",
+  "suggested_title": "concise plain-text issue title in the required output language",
+  "root_cause_analysis": "structured Markdown analysis (headings, lists, inline code)",
+  "reasoning_summary": "structured Markdown numbered reasoning steps and conclusion",
   "evidence_log_snippets": [
     {"log_id": "uuid", "start_line": 1, "end_line": 5, "relevance": "why this matters"}
   ],
-  "key_log_patterns": ["distinctive error substring"],
+  "key_log_patterns": ["distinctive literal error substring from logs or stack"],
   "suggested_component": "subsystem name or null"
 }
 """
+
+
+def _build_output_language_instructions(output_language: str) -> str:
+    """Return strict language, brevity, and impact-focused Markdown rules."""
+    if output_language == "en-US":
+        return (
+            "\n6. Output language, brevity & impact-focused Markdown rules (STRICT — optimize "
+            "for 10-second human scanning, NOT an essay):\n"
+            "   - Write ALL human-readable fields (`suggested_title`, `root_cause_analysis`, "
+            "`reasoning_summary`, and `evidence_log_snippets[].relevance`) in clear, concise "
+            "English.\n"
+            "   - `suggested_title`: one short plain-text title (<= 14 words, no Markdown). "
+            "State scenario + core error cleanly.\n"
+            "   - `suggested_component`: short subsystem name (<= 4 words, e.g. "
+            "`DXGI / WGC Capture`), never a full sentence.\n"
+            "   - `root_cause_analysis`: rendered as Markdown in the main card. Keep total length "
+            "tight (~130-230 words, ~10-15 lines). DO NOT recite the full call stack or paste raw "
+            "log lines (the UI already displays the stack and clickable log cards). Answer what "
+            "engineers care about most in exactly 3 concise sections separated by `\\n\\n`:\n"
+            "     `### Root Cause`\\n(2-3 direct sentences explaining why it crashed, the root "
+            "cause, and the single decisive stack/log fact)\\n\\n"
+            "`### Session & Subsequent Impact`\\n"
+            "- **Current Session**: (Did this interrupt/hang/kill the active session, or was it "
+            "recovered? 1 concise sentence grounded in logs/dump.)\\n"
+            "- **Subsequent Sessions**: (Based on post-crash restart/trailing logs, did the "
+            "process restart cleanly and resume service, or is there lingering GPU/driver/state "
+            "risk? State explicitly if log evidence is insufficient.)\\n\\n"
+            "`### Recommended Actions`\\n- (2-3 concrete, 1-sentence engineering fixes)\n"
+            "   - Use inline backticks sparingly (1-2 key symbols/error codes per sentence). Do "
+            "NOT wrap entire log lines, timestamps, or internal JSON field names in backticks.\n"
+            "   - `reasoning_summary`: shown in a secondary collapsible panel. Keep to 3-4 brief "
+            "bullets (<= 100 words total) explaining ONLY why the verdict/issue match was chosen "
+            "and cross-checks performed. DO NOT repeat `root_cause_analysis`.\n"
+            "   - `evidence_log_snippets[].relevance`: 1 concise sentence (<= 20 words) per item.\n"
+            "   - `key_log_patterns`: keep strictly to 2-5 high-signal searchable error substrings "
+            "(never dump 10+ generic stack frame names).\n"
+        )
+    return (
+        "\n6. 输出语言、精炼度与影响评估规范（必须严格遵守，让工程师 10 秒内看懂，"
+        "严禁写成高密度长文）：\n"
+        "   - 所有面向人类阅读的字段（`suggested_title`、`root_cause_analysis`、"
+        "`reasoning_summary`、`evidence_log_snippets[].relevance`）必须使用**简体中文**撰写。\n"
+        "   - `suggested_title`：一行精炼中文标题（不超过 40 字，无 Markdown 标记），"
+        "省去冗长命名空间，直接说明“触发场景 + 核心错误”。\n"
+        "   - `suggested_component`：简短子系统名（不超过 20 字，如 `DXGI/WGC 显存采集`），"
+        "不要写整句带括号和箭头的长描述。\n"
+        "   - `root_cause_analysis`：前端主卡片按 Markdown 渲染。**严格控制总篇幅在 260~450 字"
+        "（约 10~15 行）**，**禁止复述完整调用栈或抄写整行原始日志**（页面下方已有完整调用栈和"
+        "可点击的证据日志卡片）。围绕工程师最关心的两个核心问题，固定使用以下 3 个精炼小节"
+        "（小节间用 `\\n\\n` 分隔）：\n"
+        "     `### 根因与触发原因`\\n（2~3 句直奔主题：为什么崩溃、根本原因是什么，带出 1 个最核心"
+        "业务入口与 1 个决定性错误码/日志事实即可）\\n\\n"
+        "`### 影响评估`\\n"
+        "- **当次会话影响**：（明确结论：是否中断/卡死/强杀了当次会话，还是容错继续运行，1 句话给出"
+        "日志或堆栈依据）\\n"
+        "- **后续会话影响**：（结合 `post_session_lines` 与崩溃后日志，明确说明进程是否正常自动"
+        "重启并恢复服务、是否存在 GPU/驱动异常或脏状态延续到下一次会话的风险；若无后续日志则如实"
+        "注明“无崩溃后日志，暂无法确认”）\\n\\n"
+        "`### 修复建议`\\n- （2~3 条可直接落地的短动作，每条 1 句话，不展开长篇说教）\n"
+        "   - **克制使用行内代码反引号**：每句仅对 1~2 个最关键的函数名/错误码/文件名加反引号，"
+        "**禁止把整条日志、时间戳、内部字段名或所有参数都包成代码胶囊**，避免满屏灰块干扰阅读。\n"
+        "   - `reasoning_summary`：在前端默认折叠的「推理依据」区域展示。仅用 **3~4 条极简短句"
+        "列表（总字数不超过 200 字）**说明为何做出该 `verdict` 判定（如命中哪个已知问题、关键"
+        "交叉验证结果），**严禁把 `root_cause_analysis` 的内容再重复写一遍**。\n"
+        "   - `evidence_log_snippets[].relevance`：每条限 1 句精炼中文（不超过 45 字），直接"
+        "说明该段日志证明了什么。\n"
+        "   - `key_log_patterns`：严格精选 **2~5 条**最具检索价值的核心错误特征子串，"
+        "不要塞入十余个普通函数名或泛用词。\n"
+    )
+
+
+def _build_system_prompt(output_language: str = "zh-CN") -> str:
+    return _AI_SYSTEM_PROMPT_BASE + _build_output_language_instructions(output_language)
+
+
+AI_SYSTEM_PROMPT = _build_system_prompt("zh-CN")
 
 AI_TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
@@ -337,6 +413,53 @@ def _fit_list_prefix(
     return lo
 
 
+def _fit_list_suffix(
+    trimmed: dict[str, Any],
+    key: str,
+    items: list[Any],
+    budget: int,
+) -> int:
+    """Binary-search the largest suffix of items that keeps json.dumps(trimmed) <= budget."""
+    lo, hi = 0, len(items)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        trimmed[key] = items[-mid:] if mid > 0 else []
+        if len(json.dumps(trimmed, default=str)) <= budget:
+            lo = mid
+        else:
+            hi = mid - 1
+    trimmed[key] = items[-lo:] if lo > 0 else []
+    return lo
+
+
+def _clip_digest_entries(entries: list[Any], *, max_text_chars: int = 500) -> list[Any]:
+    """Clip overly long log lines in digest previews so one mega-line cannot starve siblings."""
+    clipped: list[Any] = []
+    suffix = "...[LINE_TRUNCATED]"
+    keep = max(1, max_text_chars - len(suffix))
+    for entry in entries:
+        if isinstance(entry, dict) and isinstance(entry.get("text"), str):
+            text = entry["text"]
+            if len(text) > max_text_chars:
+                entry = {**entry, "text": text[:keep] + suffix}
+        clipped.append(entry)
+    return clipped
+
+
+def _compact_overview_frame(frame: Any) -> Any:
+    """Strip bulky register dumps and empty inlines from overview stack frames."""
+    if not isinstance(frame, dict):
+        return frame
+    compact: dict[str, Any] = {}
+    for k, v in frame.items():
+        if k == "registers":
+            continue
+        if k == "inlines" and not v:
+            continue
+        compact[k] = v
+    return compact
+
+
 # Identifier-like fields are delivered whole or omitted; clipping an address or module
 # name would hand the model a different value than the one in the report.
 _ATOMIC_ENTRY_FIELDS = frozenset(
@@ -436,17 +559,17 @@ def _prepare_tool_output_for_llm(
 
     list_priority: dict[str, tuple[str, ...]] = {
         "get_crash_overview": (
-            "top_frames",
-            "missing_symbols",
             "logs",
             "candidate_issues",
             "related_session_crashes",
+            "top_frames",
+            "missing_symbols",
         ),
         "get_other_threads": ("threads",),
         "get_log_summary": (
             "session_recent_errors",
-            "session_tail_lines",
             "post_session_lines",
+            "session_tail_lines",
             "recent_errors",
             "tail_lines",
         ),
@@ -456,6 +579,10 @@ def _prepare_tool_output_for_llm(
         "search_known_issues": ("issues",),
         "get_issue_detail": ("clusters",),
     }
+
+    suffix_list_keys: frozenset[str] = frozenset(
+        {"session_tail_lines", "tail_lines"} if tool_name == "get_log_summary" else set()
+    )
 
     trimmed: dict[str, Any] = {
         k: ([] if isinstance(v, list) else v) for k, v in parsed.items()
@@ -488,10 +615,16 @@ def _prepare_tool_output_for_llm(
         items = parsed[key]
         if not items:
             continue
-        fitted = _fit_list_prefix(trimmed, key, items, budget)
-        if fitted >= len(items):
-            continue
-        next_item = items[fitted]
+        if key in suffix_list_keys:
+            fitted = _fit_list_suffix(trimmed, key, items, budget)
+            if fitted >= len(items):
+                continue
+            next_item = items[len(items) - fitted - 1]
+        else:
+            fitted = _fit_list_prefix(trimmed, key, items, budget)
+            if fitted >= len(items):
+                continue
+            next_item = items[fitted]
         if (
             tool_name == "get_other_threads"
             and key == "threads"
@@ -873,6 +1006,7 @@ class AITriageAgent:
             "llm_model": effective.llm_model,
             "llm_thinking_level": effective.llm_thinking_level,
             "ai_triage_mode": effective.ai_triage_mode,
+            "ai_output_language": effective.ai_output_language,
             "ai_max_steps": effective.ai_max_steps,
             "ai_timeout_seconds": effective.ai_timeout_seconds,
             "ai_tool_output_max_chars": effective.ai_tool_output_max_chars,
@@ -896,6 +1030,12 @@ class AITriageAgent:
             )
         except ValueError:
             cfg["llm_thinking_level"] = effective.llm_thinking_level
+        try:
+            cfg["ai_output_language"] = settings_service.normalize_output_language(
+                cfg["ai_output_language"]
+            )
+        except ValueError:
+            cfg["ai_output_language"] = effective.ai_output_language
         cfg["ai_max_steps"] = max(1, int(cfg["ai_max_steps"]))
         cfg["ai_timeout_seconds"] = max(1, int(cfg["ai_timeout_seconds"]))
         cfg["ai_tool_output_max_chars"] = max(50, int(cfg["ai_tool_output_max_chars"]))
@@ -986,9 +1126,11 @@ class AITriageAgent:
             and 0 <= crashing_idx < len(threads)
             and isinstance(threads[crashing_idx], dict)
         ):
-            top_frames = list((threads[crashing_idx].get("frames") or [])[:30])
+            raw_top_frames = list((threads[crashing_idx].get("frames") or [])[:30])
+            top_frames = [_compact_overview_frame(f) for f in raw_top_frames]
         elif crash_report.parsed_summary_json:
-            top_frames = list((crash_report.parsed_summary_json.get("top_frames") or [])[:30])
+            raw_top_frames = list((crash_report.parsed_summary_json.get("top_frames") or [])[:30])
+            top_frames = [_compact_overview_frame(f) for f in raw_top_frames]
 
         cluster_info: dict[str, Any] | None = None
         if crash_report.cluster_id is not None:
@@ -1090,6 +1232,32 @@ class AITriageAgent:
                     for rel in rel_rows
                 ]
 
+        all_missing = list(crash_report.missing_symbols_json or [])
+        crashing_missing_mods: set[str] = set()
+        for frame in top_frames:
+            if not isinstance(frame, dict):
+                continue
+            if frame.get("missing_symbols") or (not frame.get("function") and frame.get("module")):
+                mod = str(frame.get("module") or "").replace("\\", "/").rsplit("/", 1)[-1].lower()
+                if mod:
+                    crashing_missing_mods.add(mod)
+
+        crashing_missing: list[Any] = []
+        other_missing: list[Any] = []
+        for sym in all_missing:
+            if isinstance(sym, dict) and crashing_missing_mods:
+                candidates = {
+                    str(sym.get(field) or "").replace("\\", "/").rsplit("/", 1)[-1].lower()
+                    for field in ("module_name", "code_file", "debug_file")
+                    if sym.get(field)
+                }
+                if candidates & crashing_missing_mods:
+                    crashing_missing.append(sym)
+                    continue
+            other_missing.append(sym)
+        other_limit = max(0, 10 - len(crashing_missing))
+        overview_missing = crashing_missing[:20] + other_missing[:other_limit]
+
         overview: dict[str, Any] = {
             "crash_id": str(crash_report.id),
             "project_id": str(crash_report.project_id),
@@ -1102,7 +1270,9 @@ class AITriageAgent:
             "crash_time": _as_utc(crash_report.crash_time).isoformat(),
             "crashing_thread_index": crashing_idx,
             "top_frames": top_frames,
-            "missing_symbols": list(crash_report.missing_symbols_json or []),
+            "missing_symbol_count": len(all_missing),
+            "crashing_stack_missing_symbol_count": len(crashing_missing),
+            "missing_symbols": overview_missing,
             "cluster": cluster_info,
             "candidate_issues": candidate_issues,
             "logs": logs_list,
@@ -1186,8 +1356,8 @@ class AITriageAgent:
             "compressed_size": log_row.compressed_size,
             "error_count": int(digest.get("error_count", 0)),
             "warn_count": int(digest.get("warn_count", 0)),
-            "tail_lines": list(digest.get("tail_lines") or [])[-80:],
-            "recent_errors": list(digest.get("recent_errors") or [])[-50:],
+            "tail_lines": _clip_digest_entries(list(digest.get("tail_lines") or [])[-25:]),
+            "recent_errors": _clip_digest_entries(list(digest.get("recent_errors") or [])[-25:]),
         }
         sess_digest = digest.get("session")
         if isinstance(sess_digest, dict):
@@ -1202,13 +1372,15 @@ class AITriageAgent:
             summary["trailing_lines_after_session"] = int(
                 sess_digest.get("trailing_lines_after_session", 0)
             )
-            summary["session_recent_errors"] = list(
-                sess_digest.get("recent_errors") or []
-            )[-50:]
-            summary["session_tail_lines"] = list(sess_digest.get("tail_lines") or [])[-80:]
-            summary["post_session_lines"] = list(
-                sess_digest.get("post_session_lines") or []
-            )[:30]
+            summary["session_recent_errors"] = _clip_digest_entries(
+                list(sess_digest.get("recent_errors") or [])[-25:]
+            )
+            summary["session_tail_lines"] = _clip_digest_entries(
+                list(sess_digest.get("tail_lines") or [])[-25:]
+            )
+            summary["post_session_lines"] = _clip_digest_entries(
+                list(sess_digest.get("post_session_lines") or [])[:25]
+            )
         return summary
 
     def _resolve_log_paths(self, log_row: CrashLog) -> tuple[Any, Any, str | None]:
@@ -1706,6 +1878,7 @@ class AITriageAgent:
         preset = llm_providers.get_provider_preset(provider_id)
 
         model_name = str(runtime_cfg["llm_model"])
+        output_language = str(runtime_cfg["ai_output_language"])
         max_steps = int(runtime_cfg["ai_max_steps"])
         timeout_seconds = int(runtime_cfg["ai_timeout_seconds"])
         tool_max_chars = int(runtime_cfg["ai_tool_output_max_chars"])
@@ -1781,16 +1954,30 @@ class AITriageAgent:
                     label_part = f" [{raw_lbl.strip()}]"
             session_clause = f", session_id{label_part}={crash_report.session_id}"
 
+        language_reminder = (
+            "Write `suggested_title`, `root_cause_analysis`, `reasoning_summary`, and snippet "
+            "`relevance` in concise Simplified Chinese (简体中文). Keep `root_cause_analysis` "
+            "brief (260-450 chars, 3 Markdown sections: 根因与触发原因 / 影响评估"
+            " [当次会话影响 & 后续会话影响] / 修复建议, minimal inline code), keep "
+            "`reasoning_summary` to 3-4 short non-repetitive bullets (<=200 chars), and limit "
+            "`key_log_patterns` to 2-5 core patterns."
+            if output_language == "zh-CN"
+            else "Write `suggested_title`, `root_cause_analysis`, `reasoning_summary`, and snippet "
+            "`relevance` in concise English. Keep `root_cause_analysis` brief (130-230 words, "
+            "3 Markdown sections: Root Cause / Session & Subsequent Impact / Recommended Actions, "
+            "minimal inline code), keep `reasoning_summary` to 3-4 short non-repetitive bullets "
+            "(<=100 words), and limit `key_log_patterns` to 2-5 core patterns."
+        )
         user_prompt = (
             f"Triage CrashReport {crash_report.id} "
             f"(app_version={crash_report.app_version}, "
             f"crash_reason={crash_report.crash_reason or 'UNKNOWN'}{session_clause}). "
             "Start by calling get_crash_overview to inspect stack traces, attached logs, "
             "session metadata, and candidate known issues. After completing your investigation, "
-            "output ONLY the final JSON verdict."
+            f"output ONLY the final JSON verdict. {language_reminder}"
         )
         messages: list[dict[str, Any]] = [
-            {"role": "system", "content": AI_SYSTEM_PROMPT},
+            {"role": "system", "content": _build_system_prompt(output_language)},
             {"role": "user", "content": user_prompt},
         ]
 
@@ -2024,7 +2211,7 @@ class AITriageAgent:
                                 "suggested_title, root_cause_analysis, reasoning_summary, "
                                 "evidence_log_snippets, key_log_patterns, and suggested_component. "
                                 "All text fields must be strings, and root_cause_analysis or "
-                                "reasoning_summary must not be empty."
+                                f"reasoning_summary must not be empty. {language_reminder}"
                             ),
                         }
                     )
@@ -2089,7 +2276,7 @@ class AITriageAgent:
                             "confidence, suggested_title, root_cause_analysis, reasoning_summary, "
                             "evidence_log_snippets, key_log_patterns, suggested_component). "
                             "All text fields must be strings, and root_cause_analysis or "
-                            "reasoning_summary must not be empty."
+                            f"reasoning_summary must not be empty. {language_reminder}"
                         ),
                     }
                 )

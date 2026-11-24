@@ -24,6 +24,8 @@ export type IssueStatus =
 
 export type AITriageMode = "SMART_TRIAGE" | "ALWAYS" | "MANUAL";
 
+export type AIOutputLanguage = "zh-CN" | "en-US";
+
 export type LLMProviderId =
   | "openai"
   | "anthropic"
@@ -609,6 +611,7 @@ export interface SystemSettingsRead {
   llm_model: string;
   llm_thinking_level: LLMThinkingLevel;
   ai_triage_mode: AITriageMode;
+  ai_output_language: AIOutputLanguage;
   ai_max_steps: number;
   ai_timeout_seconds: number;
   ai_tool_output_max_chars: number;
@@ -639,6 +642,7 @@ export interface SystemSettingsUpdate {
   llm_model?: string;
   llm_thinking_level?: LLMThinkingLevel;
   ai_triage_mode?: AITriageMode;
+  ai_output_language?: AIOutputLanguage;
   ai_max_steps?: number;
   ai_timeout_seconds?: number;
   ai_tool_output_max_chars?: number;

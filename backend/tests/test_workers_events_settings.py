@@ -315,6 +315,44 @@ async def test_settings_llm_provider_and_thinking_level_lifecycle(
     assert recovered.llm_thinking_level == test_settings.LLM_THINKING_LEVEL
 
 
+async def test_settings_ai_output_language_lifecycle(
+    db_session: AsyncSession,
+    test_settings: Settings,
+) -> None:
+    baseline = await settings_service.get_effective_settings(
+        db_session, base_settings=test_settings
+    )
+    assert baseline.ai_output_language == "zh-CN"
+    assert baseline.to_public_dict()["ai_output_language"] == "zh-CN"
+
+    updated_en = await settings_service.update_settings(
+        db_session,
+        {"ai_output_language": "en_US"},
+        base_settings=test_settings,
+    )
+    assert updated_en.ai_output_language == "en-US"
+    assert updated_en.to_app_settings(base_settings=test_settings).AI_OUTPUT_LANGUAGE == "en-US"
+
+    updated_zh = await settings_service.update_settings(
+        db_session,
+        {"ai_output_language": "zh"},
+        base_settings=test_settings,
+    )
+    assert updated_zh.ai_output_language == "zh-CN"
+
+    with pytest.raises(ValidationError):
+        settings_service.SystemSettingsUpdate(ai_output_language="fr-FR")  # type: ignore[arg-type]
+
+    await db_session.merge(
+        SystemSetting(key="ai_output_language", value_json={"value": "invalid-lang"})
+    )
+    await db_session.commit()
+    recovered = await settings_service.get_effective_settings(
+        db_session, base_settings=test_settings
+    )
+    assert recovered.ai_output_language == test_settings.AI_OUTPUT_LANGUAGE
+
+
 # ---------------------------------------------------------------------------
 # events.py tests
 # ---------------------------------------------------------------------------

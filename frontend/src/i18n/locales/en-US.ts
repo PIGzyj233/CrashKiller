@@ -129,7 +129,7 @@ const enUS: DeepStringify<typeof zhCN> = {
     subtitle: "Configure interface language and display preferences for this browser",
     languageSectionTitle: "Interface Language",
     languageSectionDesc:
-      "Simplified Chinese is used by default. You can switch languages anytime and your choice is saved locally in your browser.",
+      "Simplified Chinese is used by default. Switching saves your choice locally and syncs the server's default AI analysis report language.",
     zhLabel: "简体中文",
     zhSublabel: "Simplified Chinese (Default)",
     enLabel: "English",
@@ -139,7 +139,11 @@ const enUS: DeepStringify<typeof zhCN> = {
     previewDateLabel: "Date & Time Format",
     previewNumberLabel: "Number Format",
     previewSavedHint:
-      "Language preference is saved immediately to browser localStorage (crashkiller.locale) and persists across reloads.",
+      "Language preference is saved immediately to browser localStorage (crashkiller.locale) and synced for server-side AI triage reports.",
+    aiLanguageSyncing: "Syncing server AI report output language...",
+    aiLanguageSynced: "Synced as the server's default AI analysis report language",
+    aiLanguageSyncFailed:
+      "UI language updated (server AI language sync failed; adjust in Admin Console)",
     adminCardTitle: "Administrator Configuration",
     adminCardDesc:
       "LLM model providers, models & thinking levels, project API keys, disk quotas, and storage GC are managed on the Admin page.",
@@ -239,6 +243,9 @@ const enUS: DeepStringify<typeof zhCN> = {
         "Automatically mapped per provider to reasoning_effort / thinking budget / enable_thinking; safely falls back on models without thinking support.",
       guardrailsTitle: "AI Triage Guardrails",
       defaultTriageMode: "Default AI Triage Mode",
+      aiOutputLanguage: "AI Report Language",
+      aiOutputLanguageZh: "Simplified Chinese (zh-CN)",
+      aiOutputLanguageEn: "English (en-US)",
       aiMaxSteps: "AI Max Steps",
       aiTimeoutSeconds: "AI Timeout (sec)",
       toolOutputMaxChars: "Tool Output Max Chars",
@@ -524,8 +531,10 @@ const enUS: DeepStringify<typeof zhCN> = {
     untitledFinding: "Untitled Finding",
     rootCauseAnalysis: "Root Cause Analysis",
     noRootCause: "No root cause summary.",
-    reasoningSummary: "Reasoning Summary",
+    reasoningSummary: "Reasoning Basis",
+    reasoningCollapsedHint: "Expand AI verdict & cross-check notes",
     noReasoningSummary: "No reasoning summary.",
+    expandDetails: "Expand",
     evidenceLogSnippets: "Evidence Log Snippets ({{count}})",
     jumpToLog: "Jump to log →",
     noLogSnippets: "No log evidence snippets cited.",
@@ -856,6 +865,17 @@ const enUS: DeepStringify<typeof zhCN> = {
       "1 missing symbol — stack frames may be incomplete or unsymbolicated",
     missingBannerTitleOther:
       "{{count}} missing symbols — stack frames may be incomplete or unsymbolicated",
+    missingBannerUnaffectedOne:
+      "1 missing symbol in non-crashing module (crashing stack unaffected)",
+    missingBannerUnaffectedOther:
+      "{{count}} missing symbols in non-crashing modules (crashing stack unaffected)",
+    missingBannerAffectedOne:
+      "1 missing symbol ({{affected}} crashing stack frame affected)",
+    missingBannerAffectedOther:
+      "{{count}} missing symbols ({{affected}} crashing stack frames affected)",
+    missingBannerExpand: "Show details",
+    missingBannerCollapse: "Hide details",
+    missingBannerCrashingTag: "On crashing stack",
     uploadSymbols: "Upload symbols",
     debugIdLabel: "Debug ID: {{id}}",
     codeLabel: "Code: {{file}}",

@@ -2527,3 +2527,163 @@ async def test_ai_agent_session_midfile_restart_tools_fallback_and_trim_priority
     assert len(trimmed["post_session_lines"]) == 1
     assert len(trimmed["recent_errors"]) < 20
 
+
+async def test_ai_triage_prompt_respects_output_language_and_markdown_rules(
+    db_session: AsyncSession,
+    storage_manager: StorageManager,
+    test_settings: Settings,
+    tmp_path: Path,
+) -> None:
+    _proj, crash, _log = await _seed_crash_with_log(
+        db_session, storage_manager, tmp_path, with_log=False
+    )
+
+    zh_verdict = json.dumps(
+        {
+            "verdict": "NEW_ISSUE",
+            "matched_issue_id": None,
+            "confidence": 0.86,
+            "suggested_title": "渲染提交阶段访问空纹理指针导致崩溃 (Renderer::SubmitDraw)",
+            "root_cause_analysis": (
+                "### 核心根因\n\n`Renderer::SubmitDraw` 在解引用纹理指针前缺少判空。\n\n"
+                "### 修复与排查建议\n- 在 `renderer.cpp:128` 处补充空指针校验。"
+            ),
+            "reasoning_summary": (
+                "1. **堆栈分析**：崩溃位于 `Renderer.dll!Renderer::SubmitDraw`。\n\n"
+                "**最终结论**：判定为新问题。"
+            ),
+            "evidence_log_snippets": [],
+            "key_log_patterns": ["Renderer::SubmitDraw"],
+            "suggested_component": "Renderer",
+        },
+        ensure_ascii=False,
+    )
+
+    # Default language is zh-CN -> system & user prompts must require Simplified Chinese + Markdown.
+    zh_client = FakeOpenAIClient(_investigate_then_verdict(zh_verdict))
+    agent = AITriageAgent(storage=storage_manager, settings=test_settings)
+    zh_run = await agent.run_triage(db_session, crash, openai_client=zh_client)
+    assert zh_run.status == "COMPLETED"
+    zh_sys_prompt = zh_client.calls[0]["messages"][0]["content"]
+    zh_user_prompt = zh_client.calls[0]["messages"][1]["content"]
+    assert "简体中文" in zh_sys_prompt
+    assert "Markdown" in zh_sys_prompt
+    assert "### 根因与触发原因" in zh_sys_prompt
+    assert "### 影响评估" in zh_sys_prompt
+    assert "Simplified Chinese" in zh_user_prompt
+
+    # Switching system setting to en-US -> system & user prompts must require English + Markdown.
+    await db_session.merge(
+        SystemSetting(key="ai_output_language", value_json={"value": "en-US"})
+    )
+    await db_session.commit()
+
+    en_verdict = json.dumps(
+        {
+            "verdict": "NEW_ISSUE",
+            "matched_issue_id": None,
+            "confidence": 0.86,
+            "suggested_title": "Null texture dereference in Renderer::SubmitDraw",
+            "root_cause_analysis": (
+                "### Core Root Cause\n\n`Renderer::SubmitDraw` dereferences a null texture."
+            ),
+            "reasoning_summary": (
+                "1. **Stack Analysis**: Crash in `Renderer.dll!Renderer::SubmitDraw`.\n\n"
+                "**Conclusion**: New issue."
+            ),
+            "evidence_log_snippets": [],
+            "key_log_patterns": ["Renderer::SubmitDraw"],
+            "suggested_component": "Renderer",
+        }
+    )
+    en_client = FakeOpenAIClient(_investigate_then_verdict(en_verdict))
+    en_run = await agent.run_triage(db_session, crash, openai_client=en_client)
+    assert en_run.status == "COMPLETED"
+    en_sys_prompt = en_client.calls[0]["messages"][0]["content"]
+    en_user_prompt = en_client.calls[0]["messages"][1]["content"]
+    assert "### Root Cause" in en_sys_prompt
+    assert "### Session & Subsequent Impact" in en_sys_prompt
+    assert "简体中文" not in en_sys_prompt
+    assert "concise English" in en_user_prompt
+
+
+async def test_overview_with_many_missing_symbols_never_starves_logs_and_candidates(
+    db_session: AsyncSession,
+    storage_manager: StorageManager,
+    test_settings: Settings,
+    tmp_path: Path,
+) -> None:
+    """Regression: 100+ non-crashing missing symbols must never starve logs or candidate_issues."""
+    proj, crash, log_row = await _seed_crash_with_log(
+        db_session, storage_manager, tmp_path, with_log=True
+    )
+    assert log_row is not None
+
+    # Simulate a real Windows crash with register dumps + 110 missing OS/driver symbols.
+    stacks = dict(crash.parsed_stacks_json or {})
+    frames = list(stacks["threads"][0]["frames"])
+    frames[0] = {
+        **frames[0],
+        "registers": {f"r{i}": f"0x{i:016x}" for i in range(16)},
+    }
+    stacks["threads"][0]["frames"] = frames
+    crash.parsed_stacks_json = stacks
+    crash.missing_symbols_json = [
+        {
+            "module_name": f"sysmod_{i:03d}.dll",
+            "debug_file": f"sysmod_{i:03d}.pdb",
+            "debug_id": f"{i:032X}1",
+            "code_file": f"C:\\Windows\\System32\\sysmod_{i:03d}.dll",
+            "code_id": f"6789{i:04X}",
+        }
+        for i in range(110)
+    ]
+    await db_session.commit()
+
+    agent = AITriageAgent(storage=storage_manager, settings=test_settings)
+    raw_overview = await agent._tool_get_crash_overview(
+        db_session, crash, proj, await agent._resolve_runtime_config(db_session, None)
+    )
+    assert raw_overview["missing_symbol_count"] == 110
+    assert raw_overview["crashing_stack_missing_symbol_count"] == 0
+    assert len(raw_overview["missing_symbols"]) == 10
+    assert "registers" not in raw_overview["top_frames"][0]
+    assert len(raw_overview["logs"]) == 1
+    assert raw_overview["logs"][0]["id"] == str(log_row.id)
+
+    # Even if raw payload had 110 missing symbols directly, trimmer must still keep logs first.
+    bloated_overview = {**raw_overview, "missing_symbols": list(crash.missing_symbols_json)}
+    _delivered, trimmed = _prepare_tool_output_for_llm(
+        "get_crash_overview", json.dumps(bloated_overview, default=str), max_chars=2500
+    )
+    assert trimmed is not None
+    assert len(trimmed["logs"]) == 1
+    assert trimmed["logs"][0]["id"] == str(log_row.id)
+    assert len(trimmed["top_frames"]) >= 1
+
+    # Log summary trimmer must keep post_session_lines and the most recent session_tail_lines.
+    mega_summary = {
+        "log_id": str(log_row.id),
+        "filename": "runtime.log",
+        "session_recent_errors": [],
+        "session_tail_lines": [
+            {"line_number": 100 + i, "text": f"older session line {i} " + ("A" * 120)}
+            for i in range(25)
+        ],
+        "post_session_lines": [
+            {"line_number": 126, "text": "FATAL Unhandled exception right after session"}
+        ],
+        "recent_errors": [],
+        "tail_lines": [],
+    }
+    _del_sum, trimmed_sum = _prepare_tool_output_for_llm(
+        "get_log_summary", json.dumps(mega_summary), max_chars=1200
+    )
+    assert trimmed_sum is not None
+    assert len(trimmed_sum["post_session_lines"]) == 1
+    assert len(trimmed_sum["session_tail_lines"]) >= 1
+    # Suffix preservation: the line closest to the crash (line 124) must be kept!
+    assert trimmed_sum["session_tail_lines"][-1]["line_number"] == 124
+
+
+

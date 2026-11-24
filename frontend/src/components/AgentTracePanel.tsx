@@ -30,6 +30,7 @@ import type {
   CrashDetailRead,
 } from "../api/types";
 import { useAppI18n } from "../i18n";
+import { InlineMarkdown, MarkdownContent } from "./MarkdownContent";
 
 export interface AgentTracePanelProps {
   crash: CrashDetailRead;
@@ -196,6 +197,7 @@ export function AgentTracePanel({
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const prevCrashIdRef = useRef<string>(crash.id);
   const prevNewestRunIdRef = useRef<string | null>(newestRunId);
+  const [reasoningExpanded, setReasoningExpanded] = useState(false);
   const [traceExpanded, setTraceExpanded] = useState(false);
   const [expandedStepKeys, setExpandedStepKeys] = useState<
     Record<string, boolean>
@@ -210,6 +212,7 @@ export function AgentTracePanel({
       prevCrashIdRef.current = crash.id;
       prevNewestRunIdRef.current = newestRunId;
       setSelectedRunId(null);
+      setReasoningExpanded(false);
     }
   }, [crash.id, newestRunId]);
 
@@ -487,40 +490,84 @@ export function AgentTracePanel({
         {result && (
           <div className="space-y-4">
             <div className="flex flex-wrap items-start justify-between gap-2">
-              <div>
+              <div className="min-w-0 flex-1">
                 <div className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
                   {t("agent.suggestedTitle")}
                 </div>
-                <h3 className="mt-0.5 text-sm font-semibold text-slate-900">
+                <h3 className="mt-0.5 text-[15px] font-semibold leading-snug text-slate-900">
                   {result.suggested_title || t("agent.untitledFinding")}
                 </h3>
               </div>
               {result.suggested_component && (
-                <span className="rounded-md border border-slate-200 bg-slate-100 px-2 py-0.5 font-mono text-xs text-slate-700">
+                <span
+                  title={result.suggested_component}
+                  className="max-w-xs truncate rounded-md border border-slate-200 bg-slate-100 px-2 py-0.5 font-mono text-xs text-slate-700"
+                >
                   {result.suggested_component}
                 </span>
               )}
             </div>
 
-            <div className="grid gap-4 lg:grid-cols-2">
-              <div className="rounded-lg border border-slate-200 bg-slate-50/70 p-3">
-                <div className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">
+            {/* Primary Reading Card: Root Cause & Session Impact */}
+            <div className="rounded-lg border border-slate-200 bg-slate-50/40 p-5">
+              <div className="mb-3 flex items-center justify-between gap-2 border-b border-slate-200/70 pb-2">
+                <span className="text-xs font-semibold tracking-wide text-slate-700">
                   {t("agent.rootCauseAnalysis")}
-                </div>
-                <p className="mt-1.5 whitespace-pre-wrap text-xs leading-relaxed text-slate-800">
-                  {result.root_cause_analysis || t("agent.noRootCause")}
-                </p>
+                </span>
               </div>
-
-              <div className="rounded-lg border border-slate-200 bg-slate-50/70 p-3">
-                <div className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">
-                  {t("agent.reasoningSummary")}
-                </div>
-                <p className="mt-1.5 whitespace-pre-wrap text-xs leading-relaxed text-slate-700">
-                  {result.reasoning_summary || t("agent.noReasoningSummary")}
-                </p>
+              <div className="max-w-4xl">
+                {result.root_cause_analysis ? (
+                  <MarkdownContent content={result.root_cause_analysis} />
+                ) : (
+                  <p className="text-xs text-slate-500">
+                    {t("agent.noRootCause")}
+                  </p>
+                )}
               </div>
             </div>
+
+            {/* Secondary Collapsible Panel: Reasoning Basis */}
+            {result.reasoning_summary && (
+              <div className="overflow-hidden rounded-lg border border-slate-200 bg-white">
+                <button
+                  type="button"
+                  onClick={() => setReasoningExpanded((prev) => !prev)}
+                  aria-expanded={reasoningExpanded}
+                  className="flex w-full items-center justify-between gap-3 px-4 py-2.5 text-left transition-colors hover:bg-slate-50"
+                >
+                  <div className="flex min-w-0 items-center gap-2">
+                    {reasoningExpanded ? (
+                      <ChevronDown className="h-4 w-4 shrink-0 text-slate-400" />
+                    ) : (
+                      <ChevronRight className="h-4 w-4 shrink-0 text-slate-400" />
+                    )}
+                    <span className="text-xs font-semibold text-slate-700">
+                      {t("agent.reasoningSummary")}
+                    </span>
+                    {!reasoningExpanded && (
+                      <span className="truncate text-xs text-slate-400">
+                        {t("agent.reasoningCollapsedHint")}
+                      </span>
+                    )}
+                  </div>
+                  <span className="shrink-0 rounded bg-slate-100 px-1.5 py-0.5 text-[11px] font-medium text-slate-500">
+                    {reasoningExpanded
+                      ? t("agent.showLess")
+                      : t("agent.expandDetails")}
+                  </span>
+                </button>
+                {reasoningExpanded && (
+                  <div className="border-t border-slate-200/80 bg-slate-50/40 px-5 py-4">
+                    <div className="max-w-4xl">
+                      <MarkdownContent
+                        content={result.reasoning_summary}
+                        className="text-[13px] text-slate-600"
+                      />
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
 
             {/* Evidence Log Snippets */}
             <div>
@@ -533,7 +580,7 @@ export function AgentTracePanel({
               </div>
               {result.evidence_log_snippets &&
               result.evidence_log_snippets.length > 0 ? (
-                <div className="grid gap-2 sm:grid-cols-2">
+                <div className="grid gap-2.5 sm:grid-cols-2">
                   {result.evidence_log_snippets.map((snippet, idx) => {
                     const [safeStart, safeEnd] = formatSafeLineRange(
                       snippet.start_line,
@@ -560,8 +607,8 @@ export function AgentTracePanel({
                             L{safeStart}–L{safeEnd}
                           </span>
                         </div>
-                        <p className="mt-1.5 line-clamp-2 text-xs text-slate-600">
-                          {snippet.relevance}
+                        <p className="mt-1.5 line-clamp-2 text-xs leading-relaxed text-slate-600">
+                          <InlineMarkdown content={snippet.relevance} />
                         </p>
                         <span className="mt-2 text-[11px] font-medium text-indigo-600 group-hover:underline">
                           {t("agent.jumpToLog")}

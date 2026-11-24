@@ -37,6 +37,7 @@ import {
   updateSystemSettings,
 } from "../api/client";
 import type {
+  AIOutputLanguage,
   AITriageMode,
   GCReport,
   LLMProviderId,
@@ -405,6 +406,8 @@ export function AdminPage() {
   const [showLlmApiKey, setShowLlmApiKey] = useState(false);
   const [aiTriageMode, setAiTriageMode] =
     useState<AITriageMode>("SMART_TRIAGE");
+  const [aiOutputLanguage, setAiOutputLanguage] =
+    useState<AIOutputLanguage>("zh-CN");
   const [aiMaxSteps, setAiMaxSteps] = useState("10");
   const [aiTimeoutSeconds, setAiTimeoutSeconds] = useState("120");
   const [aiToolOutputMaxChars, setAiToolOutputMaxChars] = useState("8000");
@@ -581,6 +584,7 @@ export function AdminPage() {
     );
 
     setAiTriageMode(s.ai_triage_mode);
+    setAiOutputLanguage(s.ai_output_language ?? "zh-CN");
     setAiMaxSteps(String(s.ai_max_steps));
     setAiTimeoutSeconds(String(s.ai_timeout_seconds));
     setAiToolOutputMaxChars(String(s.ai_tool_output_max_chars));
@@ -910,6 +914,7 @@ export function AdminPage() {
       llm_model: llmModel.trim(),
       llm_thinking_level: llmThinkingLevel,
       ai_triage_mode: aiTriageMode,
+      ai_output_language: aiOutputLanguage,
       ai_max_steps: parsedNums.ai_max_steps,
       ai_timeout_seconds: parsedNums.ai_timeout_seconds,
       ai_tool_output_max_chars: parsedNums.ai_tool_output_max_chars,
@@ -1452,7 +1457,7 @@ export function AdminPage() {
               <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-600">
                 {t("admin.system.guardrailsTitle")}
               </h3>
-              <div className="grid gap-3 sm:grid-cols-4">
+              <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
                 <div>
                   <label className="block text-xs font-medium text-slate-700">
                     {t("admin.system.defaultTriageMode")}
@@ -1469,6 +1474,25 @@ export function AdminPage() {
                         {formatTriageMode(m)}
                       </option>
                     ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-700">
+                    {t("admin.system.aiOutputLanguage")}
+                  </label>
+                  <select
+                    value={aiOutputLanguage}
+                    onChange={(e) =>
+                      setAiOutputLanguage(e.target.value as AIOutputLanguage)
+                    }
+                    className="mt-1 h-9 w-full rounded-md border border-slate-300 bg-white px-2.5 text-sm text-slate-900"
+                  >
+                    <option value="zh-CN">
+                      {t("admin.system.aiOutputLanguageZh")}
+                    </option>
+                    <option value="en-US">
+                      {t("admin.system.aiOutputLanguageEn")}
+                    </option>
                   </select>
                 </div>
                 <div>

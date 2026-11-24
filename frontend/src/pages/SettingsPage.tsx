@@ -1,15 +1,43 @@
+import { useState } from "react";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import {
   ArrowRight,
   CheckCircle2,
   Globe,
+  Loader2,
   Settings,
   ShieldCheck,
 } from "lucide-react";
+import { updateSystemSettings } from "../api/client";
 import { useAppI18n, type Locale } from "../i18n";
 
 export function SettingsPage() {
   const { t, locale, setLocale, formatDateTime, formatNumber } = useAppI18n();
+  const queryClient = useQueryClient();
+  const [syncStatus, setSyncStatus] = useState<
+    "idle" | "syncing" | "synced" | "error"
+  >("idle");
+
+  const syncAiLanguageMutation = useMutation({
+    mutationFn: (nextLocale: Locale) =>
+      updateSystemSettings({ ai_output_language: nextLocale }),
+    onMutate: () => {
+      setSyncStatus("syncing");
+    },
+    onSuccess: (updated) => {
+      queryClient.setQueryData(["system-settings"], updated);
+      setSyncStatus("synced");
+    },
+    onError: () => {
+      setSyncStatus("error");
+    },
+  });
+
+  const handleSelectLocale = (nextLocale: Locale) => {
+    setLocale(nextLocale);
+    syncAiLanguageMutation.mutate(nextLocale);
+  };
 
   const languageOptions: Array<{
     value: Locale;
@@ -77,7 +105,7 @@ export function SettingsPage() {
                 type="button"
                 role="radio"
                 aria-checked={isActive}
-                onClick={() => setLocale(opt.value)}
+                onClick={() => handleSelectLocale(opt.value)}
                 data-testid={`locale-option-${opt.value}`}
                 className={`flex items-start justify-between gap-3 rounded-xl border p-4 text-left transition-all ${
                   isActive
@@ -133,6 +161,31 @@ export function SettingsPage() {
           <p className="mt-3 text-xs text-slate-500">
             {t("settings.previewSavedHint")}
           </p>
+          {syncStatus !== "idle" && (
+            <p
+              className={`mt-1.5 inline-flex items-center gap-1.5 text-xs ${
+                syncStatus === "error"
+                  ? "text-amber-700"
+                  : syncStatus === "synced"
+                    ? "text-emerald-700"
+                    : "text-slate-500"
+              }`}
+            >
+              {syncStatus === "syncing" && (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              )}
+              {syncStatus === "synced" && (
+                <CheckCircle2 className="h-3.5 w-3.5" />
+              )}
+              <span>
+                {syncStatus === "syncing"
+                  ? t("settings.aiLanguageSyncing")
+                  : syncStatus === "synced"
+                    ? t("settings.aiLanguageSynced")
+                    : t("settings.aiLanguageSyncFailed")}
+              </span>
+            </p>
+          )}
         </div>
       </section>
 

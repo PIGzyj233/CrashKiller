@@ -128,6 +128,7 @@ class Settings(BaseSettings):
     LLM_MODEL: str = "gpt-4o-mini"
     LLM_THINKING_LEVEL: Literal["auto", "off", "low", "medium", "high"] = "auto"
     AI_TRIAGE_MODE: Literal["SMART_TRIAGE", "ALWAYS", "MANUAL"] = "SMART_TRIAGE"
+    AI_OUTPUT_LANGUAGE: Literal["zh-CN", "en-US"] = "zh-CN"
     AI_MAX_STEPS: int = 10
     AI_TIMEOUT_SECONDS: int = 120
     AI_TOOL_OUTPUT_MAX_CHARS: int = 8000

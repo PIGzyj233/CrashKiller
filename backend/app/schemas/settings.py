@@ -10,6 +10,7 @@ from app.services.llm_providers import LLMProtocol, LLMProviderId, LLMThinkingLe
 from app.services.settings_service import SystemSettingsUpdate
 
 AITriageModeLiteral = Literal["SMART_TRIAGE", "ALWAYS", "MANUAL"]
+AIOutputLanguageLiteral = Literal["zh-CN", "en-US"]
 
 
 class LLMProviderPresetRead(BaseModel):
@@ -31,6 +32,7 @@ class SystemSettingsRead(BaseModel):
     llm_model: str
     llm_thinking_level: LLMThinkingLevel
     ai_triage_mode: AITriageModeLiteral
+    ai_output_language: AIOutputLanguageLiteral = "zh-CN"
     ai_max_steps: int
     ai_timeout_seconds: int
     ai_tool_output_max_chars: int
@@ -67,6 +69,7 @@ class GCReport(BaseModel):
 
 
 __all__ = [
+    "AIOutputLanguageLiteral",
     "AITriageModeLiteral",
     "GCReport",
     "GCRequest",

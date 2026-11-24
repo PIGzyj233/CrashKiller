@@ -23,6 +23,21 @@ from app.services.llm_providers import (
 logger = logging.getLogger(__name__)
 
 AITriageMode = Literal["SMART_TRIAGE", "ALWAYS", "MANUAL"]
+AIOutputLanguage = Literal["zh-CN", "en-US"]
+
+
+def normalize_output_language(value: Any) -> AIOutputLanguage:
+    """Normalize supported AI output language codes to 'zh-CN' or 'en-US'."""
+    if not isinstance(value, str):
+        raise ValueError("ai_output_language must be a string ('zh-CN' or 'en-US')")
+    cleaned = value.strip().replace("_", "-").lower()
+    if cleaned in {"zh", "zh-cn", "zh-hans", "zh-sg", "cn", "chinese"}:
+        return "zh-CN"
+    if cleaned in {"en", "en-us", "en-gb", "english"}:
+        return "en-US"
+    raise ValueError(
+        f"Unsupported ai_output_language {value!r}; expected 'zh-CN' or 'en-US'"
+    )
 
 DEFAULT_NOISE_MODULES: tuple[str, ...] = (
     "ntdll.dll",
@@ -82,6 +97,7 @@ SETTINGS_TO_ENV_MAP: dict[str, str] = {
     "llm_model": "LLM_MODEL",
     "llm_thinking_level": "LLM_THINKING_LEVEL",
     "ai_triage_mode": "AI_TRIAGE_MODE",
+    "ai_output_language": "AI_OUTPUT_LANGUAGE",
     "ai_max_steps": "AI_MAX_STEPS",
     "ai_timeout_seconds": "AI_TIMEOUT_SECONDS",
     "ai_tool_output_max_chars": "AI_TOOL_OUTPUT_MAX_CHARS",
@@ -186,6 +202,7 @@ class EffectiveSettings(BaseModel):
     llm_model: str = "gpt-4o-mini"
     llm_thinking_level: LLMThinkingLevel = "auto"
     ai_triage_mode: AITriageMode = "SMART_TRIAGE"
+    ai_output_language: AIOutputLanguage = "zh-CN"
     ai_max_steps: int = Field(default=10, ge=1, le=50)
     ai_timeout_seconds: int = Field(default=120, ge=1, le=3600)
     ai_tool_output_max_chars: int = Field(default=8000, ge=100, le=200000)
@@ -230,6 +247,11 @@ class EffectiveSettings(BaseModel):
     def _validate_llm_thinking_level(cls, value: Any) -> LLMThinkingLevel:
         return normalize_thinking_level(value)
 
+    @field_validator("ai_output_language", mode="before")
+    @classmethod
+    def _validate_ai_output_language(cls, value: Any) -> AIOutputLanguage:
+        return normalize_output_language(value)
+
     @field_validator(
         "public_symbol_urls",
         "default_noise_modules",
@@ -269,6 +291,7 @@ class EffectiveSettings(BaseModel):
             "llm_model": self.llm_model,
             "llm_thinking_level": self.llm_thinking_level,
             "ai_triage_mode": self.ai_triage_mode,
+            "ai_output_language": self.ai_output_language,
             "ai_max_steps": self.ai_max_steps,
             "ai_timeout_seconds": self.ai_timeout_seconds,
             "ai_tool_output_max_chars": self.ai_tool_output_max_chars,
@@ -304,6 +327,7 @@ class SystemSettingsUpdate(BaseModel):
     llm_model: str | None = None
     llm_thinking_level: LLMThinkingLevel | None = None
     ai_triage_mode: AITriageMode | None = None
+    ai_output_language: AIOutputLanguage | None = None
     ai_max_steps: int | None = Field(default=None, ge=1, le=50)
     ai_timeout_seconds: int | None = Field(default=None, ge=1, le=3600)
     ai_tool_output_max_chars: int | None = Field(default=None, ge=100, le=200000)
@@ -347,6 +371,13 @@ class SystemSettingsUpdate(BaseModel):
         if value is None:
             return None
         return normalize_thinking_level(value)
+
+    @field_validator("ai_output_language", mode="before")
+    @classmethod
+    def _validate_optional_ai_output_language(cls, value: Any) -> AIOutputLanguage | None:
+        if value is None:
+            return None
+        return normalize_output_language(value)
 
     @field_validator(
         "public_symbol_urls",
