@@ -12,6 +12,15 @@ if TYPE_CHECKING:
     from app.schemas.crash import CrashSummary
 
 IssueStatusLiteral = Literal["NEW", "KNOWN", "FIXED", "WONTFIX", "REGRESSION"]
+IssueStatusEventSourceLiteral = Literal[
+    "manual",
+    "batch",
+    "form_edit",
+    "ai_triage",
+    "ai_regression",
+    "human_verdict",
+    "split",
+]
 
 
 class CrashClusterRead(BaseModel):
@@ -113,6 +122,47 @@ class IssueSplitResponse(BaseModel):
     cluster: CrashClusterRead
 
 
+class IssueStatusEventRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    issue_id: int
+    from_status: IssueStatusLiteral | None = None
+    to_status: IssueStatusLiteral
+    source: IssueStatusEventSourceLiteral
+    fixed_in_version: str | None = None
+    note: str | None = None
+    crash_id: uuid.UUID | None = None
+    created_at: datetime
+
+
+class IssueTransitionRequest(BaseModel):
+    to_status: IssueStatusLiteral
+    fixed_in_version: str | None = Field(default=None, max_length=128)
+    clear_fixed_in_version: bool = False
+    note: str | None = Field(default=None, max_length=1000)
+
+
+class IssueTransitionResponse(BaseModel):
+    issue: IssueRead
+    event: IssueStatusEventRead
+
+
+class IssueBatchTransitionRequest(BaseModel):
+    issue_ids: list[int] = Field(min_length=1, max_length=200)
+    to_status: IssueStatusLiteral
+    fixed_in_version: str | None = Field(default=None, max_length=128)
+    clear_fixed_in_version: bool = False
+    note: str | None = Field(default=None, max_length=1000)
+
+
+class IssueBatchTransitionResponse(BaseModel):
+    updated_count: int
+    skipped_count: int
+    items: list[IssueRead] = Field(default_factory=list)
+
+
 class IssueDetailRead(IssueRead):
     clusters: list[CrashClusterRead] = Field(default_factory=list)
     recent_crashes: list[CrashSummary] = Field(default_factory=list)
+    status_events: list[IssueStatusEventRead] = Field(default_factory=list)

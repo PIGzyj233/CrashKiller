@@ -22,6 +22,7 @@ from app.db.models import (
     CrashLog,
     CrashReport,
     Issue,
+    IssueStatusEvent,
     Project,
     SystemSetting,
 )
@@ -489,6 +490,18 @@ async def test_verdict_regression_on_fixed_issue_version_comparison(
     await db_session.refresh(fixed_issue)
     assert crash_new.ai_verdict == "REGRESSION"
     assert fixed_issue.status == "REGRESSION"
+
+    reg_events = (
+        await db_session.execute(
+            select(IssueStatusEvent).where(IssueStatusEvent.issue_id == fixed_issue.id)
+        )
+    ).scalars().all()
+    assert len(reg_events) == 1
+    assert reg_events[0].from_status == "FIXED"
+    assert reg_events[0].to_status == "REGRESSION"
+    assert reg_events[0].source == "ai_regression"
+    assert reg_events[0].fixed_in_version == "1.2.0"
+    assert reg_events[0].crash_id == crash_new.id
 
 
 async def test_guardrail_max_steps_timeout_truncation_and_malformed_json(

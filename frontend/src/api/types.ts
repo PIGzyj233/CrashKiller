@@ -22,6 +22,15 @@ export type IssueStatus =
   | "WONTFIX"
   | "REGRESSION";
 
+export type IssueStatusEventSource =
+  | "manual"
+  | "batch"
+  | "form_edit"
+  | "ai_triage"
+  | "ai_regression"
+  | "human_verdict"
+  | "split";
+
 export type AITriageMode = "SMART_TRIAGE" | "ALWAYS" | "MANUAL";
 
 export type AIOutputLanguage = "zh-CN" | "en-US";
@@ -634,6 +643,44 @@ export interface IssueSplitResponse {
   cluster: CrashClusterRead;
 }
 
+export interface IssueStatusEventRead {
+  id: number;
+  issue_id: number;
+  from_status: IssueStatus | null;
+  to_status: IssueStatus;
+  source: IssueStatusEventSource;
+  fixed_in_version: string | null;
+  note: string | null;
+  crash_id: string | null;
+  created_at: string;
+}
+
+export interface IssueTransitionRequest {
+  to_status: IssueStatus;
+  fixed_in_version?: string | null;
+  clear_fixed_in_version?: boolean;
+  note?: string | null;
+}
+
+export interface IssueTransitionResponse {
+  issue: IssueRead;
+  event: IssueStatusEventRead;
+}
+
+export interface IssueBatchTransitionRequest {
+  issue_ids: number[];
+  to_status: IssueStatus;
+  fixed_in_version?: string | null;
+  clear_fixed_in_version?: boolean;
+  note?: string | null;
+}
+
+export interface IssueBatchTransitionResponse {
+  updated_count: number;
+  skipped_count: number;
+  items: IssueRead[];
+}
+
 // ============================================================================
 // Crashes & SSE (/api/v1/crashes)
 // ============================================================================
@@ -681,6 +728,7 @@ export interface CrashDetailRead extends CrashSummary {
 export interface IssueDetailRead extends IssueRead {
   clusters: CrashClusterRead[];
   recent_crashes: CrashSummary[];
+  status_events: IssueStatusEventRead[];
 }
 
 export interface CrashSSEEvent {

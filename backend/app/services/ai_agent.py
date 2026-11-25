@@ -30,6 +30,7 @@ from app.db.models import (
 )
 from app.services import llm_providers, settings_service
 from app.services.clustering import ClusteringService, _compare_versions
+from app.services.issue_workflow import record_issue_status_event
 from app.services.log_engine import LogEngine, normalize_session_id
 from app.services.storage import StorageError, StorageManager
 
@@ -2510,12 +2511,32 @@ class AITriageAgent:
                                 result_dict["verdict"] = "REGRESSION"
                                 if matched_issue.status == "FIXED":
                                     matched_issue.status = "REGRESSION"
+                                    record_issue_status_event(
+                                        session,
+                                        issue_id=matched_issue.id,
+                                        from_status="FIXED",
+                                        to_status="REGRESSION",
+                                        source="ai_regression",
+                                        fixed_in_version=matched_issue.fixed_in_version,
+                                        note=f"Detected in app version {crash_report.app_version}",
+                                        crash_id=crash_report.id,
+                                    )
                             else:
                                 if verdict == "REGRESSION":
                                     verdict = "KNOWN_ISSUE"
                                     result_dict["verdict"] = "KNOWN_ISSUE"
                         elif verdict == "REGRESSION" and matched_issue.status == "FIXED":
                             matched_issue.status = "REGRESSION"
+                            record_issue_status_event(
+                                session,
+                                issue_id=matched_issue.id,
+                                from_status="FIXED",
+                                to_status="REGRESSION",
+                                source="ai_regression",
+                                fixed_in_version=matched_issue.fixed_in_version,
+                                note=f"Detected in app version {crash_report.app_version}",
+                                crash_id=crash_report.id,
+                            )
                     elif verdict == "REGRESSION":
                         verdict = "KNOWN_ISSUE"
                         result_dict["verdict"] = "KNOWN_ISSUE"
@@ -2593,6 +2614,15 @@ class AITriageAgent:
                                 if _as_utc(winner.last_seen_at) < crash_ts:
                                     winner.last_seen_at = crash_ts
                                 await session.delete(new_issue)
+                    if final_issue_id == new_issue.id:
+                        record_issue_status_event(
+                            session,
+                            issue_id=new_issue.id,
+                            from_status=None,
+                            to_status="NEW",
+                            source="ai_triage",
+                            crash_id=crash_report.id,
+                        )
                     result_dict["matched_issue_id"] = final_issue_id
                 elif crash_report.issue_id is not None:
                     await session.delete(new_issue)
@@ -2600,6 +2630,14 @@ class AITriageAgent:
                     result_dict["matched_issue_id"] = crash_report.issue_id
                 else:
                     await session.refresh(new_issue, attribute_names=["crash_count"])
+                    record_issue_status_event(
+                        session,
+                        issue_id=new_issue.id,
+                        from_status=None,
+                        to_status="NEW",
+                        source="ai_triage",
+                        crash_id=crash_report.id,
+                    )
                     result_dict["matched_issue_id"] = new_issue.id
 
         if should_write_verdict:

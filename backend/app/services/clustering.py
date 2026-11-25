@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.base import utcnow
 from app.db.models import CrashCluster, CrashJob, CrashReport, Issue, Project
+from app.services.issue_workflow import record_issue_status_event
 from app.services.settings_service import (
     DEFAULT_NOISE_FUNCTIONS,
     DEFAULT_NOISE_MODULES,
@@ -1198,6 +1199,14 @@ async def apply_human_verdict(
             target_issue.crash_count = (target_issue.crash_count or 0) + 1
         if target_issue.status == "NEW":
             target_issue.status = "KNOWN"
+            record_issue_status_event(
+                session,
+                issue_id=target_issue.id,
+                from_status="NEW",
+                to_status="KNOWN",
+                source="human_verdict",
+                crash_id=crash_report.id,
+            )
         if _as_utc(target_issue.last_seen_at) < crash_ts:
             target_issue.last_seen_at = crash_ts
 
@@ -1244,6 +1253,14 @@ async def apply_human_verdict(
         )
         session.add(target_issue)
         await session.flush()
+        record_issue_status_event(
+            session,
+            issue_id=target_issue.id,
+            from_status=None,
+            to_status=status_val,
+            source="human_verdict",
+            crash_id=crash_report.id,
+        )
         crash_report.issue_id = target_issue.id
 
     assert target_issue is not None

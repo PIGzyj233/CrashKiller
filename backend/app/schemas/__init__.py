@@ -26,6 +26,8 @@ from app.schemas.dashboard import (
 from app.schemas.issue import (
     ClusterListResponse,
     CrashClusterRead,
+    IssueBatchTransitionRequest,
+    IssueBatchTransitionResponse,
     IssueCreateRequest,
     IssueDetailRead,
     IssueListResponse,
@@ -33,6 +35,9 @@ from app.schemas.issue import (
     IssueRead,
     IssueSplitRequest,
     IssueSplitResponse,
+    IssueStatusEventRead,
+    IssueTransitionRequest,
+    IssueTransitionResponse,
     IssueUpdateRequest,
 )
 from app.schemas.log import (
@@ -86,6 +91,8 @@ __all__ = [
     "DashboardResponse",
     "GCReport",
     "GCRequest",
+    "IssueBatchTransitionRequest",
+    "IssueBatchTransitionResponse",
     "IssueCreateRequest",
     "IssueDetailRead",
     "IssueListResponse",
@@ -94,6 +101,9 @@ __all__ = [
     "IssueSplitRequest",
     "IssueSplitResponse",
     "IssueStatusDistributionItem",
+    "IssueStatusEventRead",
+    "IssueTransitionRequest",
+    "IssueTransitionResponse",
     "IssueUpdateRequest",
     "LogAroundTimeResponse",
     "LogLine",

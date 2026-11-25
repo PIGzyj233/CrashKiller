@@ -11,11 +11,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_db
 from app.db.base import utcnow
-from app.db.models import CrashCluster, CrashReport, Issue, Project
+from app.db.models import CrashCluster, CrashReport, Issue, IssueStatusEvent, Project
 from app.schemas.crash import CrashSummary
 from app.schemas.issue import (
     ClusterListResponse,
     CrashClusterRead,
+    IssueBatchTransitionRequest,
+    IssueBatchTransitionResponse,
     IssueCreateRequest,
     IssueDetailRead,
     IssueListResponse,
@@ -23,8 +25,15 @@ from app.schemas.issue import (
     IssueRead,
     IssueSplitRequest,
     IssueSplitResponse,
+    IssueStatusEventRead,
     IssueStatusLiteral,
+    IssueTransitionRequest,
+    IssueTransitionResponse,
     IssueUpdateRequest,
+)
+from app.services.issue_workflow import (
+    record_issue_status_event,
+    transition_issue_status,
 )
 
 router = APIRouter(prefix="/issues", tags=["issues"])
@@ -80,11 +89,21 @@ async def _load_issue_detail(session: AsyncSession, issue_id: int) -> IssueDetai
         )
     ).scalars().all()
 
+    status_events = (
+        await session.execute(
+            select(IssueStatusEvent)
+            .where(IssueStatusEvent.issue_id == issue_id)
+            .order_by(IssueStatusEvent.created_at.desc(), IssueStatusEvent.id.desc())
+            .limit(50)
+        )
+    ).scalars().all()
+
     issue_data = IssueRead.model_validate(issue).model_dump()
     return IssueDetailRead(
         **issue_data,
         clusters=[CrashClusterRead.model_validate(c) for c in clusters],
         recent_crashes=[CrashSummary.model_validate(cr) for cr in recent_crashes],
+        status_events=[IssueStatusEventRead.model_validate(ev) for ev in status_events],
     )
 
 
@@ -249,6 +268,9 @@ async def merge_issues(
         .where(CrashReport.issue_id.in_(source_ids))
         .values(issue_id=target.id)
     )
+    await session.execute(
+        delete(IssueStatusEvent).where(IssueStatusEvent.issue_id.in_(source_ids))
+    )
     await session.execute(delete(Issue).where(Issue.id.in_(source_ids)))
     session.expire_all()
 
@@ -257,6 +279,58 @@ async def merge_issues(
     await _recompute_issue_stats(session, target)
     await session.commit()
     return await _load_issue_detail(session, target.id)
+
+
+@router.post("/batch-transition", response_model=IssueBatchTransitionResponse)
+async def batch_transition_issues(
+    payload: IssueBatchTransitionRequest,
+    session: AsyncSession = Depends(get_db),
+) -> IssueBatchTransitionResponse:
+    issue_ids = list(dict.fromkeys(payload.issue_ids))
+    if not issue_ids:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="issue_ids must not be empty",
+        )
+
+    rows = (
+        await session.execute(select(Issue).where(Issue.id.in_(issue_ids)))
+    ).scalars().all()
+    by_id = {row.id: row for row in rows}
+    if len(by_id) != len(issue_ids):
+        missing = [iid for iid in issue_ids if iid not in by_id]
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Issues not found: {missing}",
+        )
+
+    updated_issues: list[Issue] = []
+    skipped_count = 0
+    for issue_id in issue_ids:
+        issue = by_id[issue_id]
+        if issue.status == payload.to_status:
+            skipped_count += 1
+            continue
+        transition_issue_status(
+            session,
+            issue,
+            to_status=payload.to_status,
+            source="batch",
+            fixed_in_version=payload.fixed_in_version,
+            clear_fixed_in_version=payload.clear_fixed_in_version,
+            note=payload.note,
+        )
+        updated_issues.append(issue)
+
+    await session.commit()
+    for issue in updated_issues:
+        await session.refresh(issue)
+
+    return IssueBatchTransitionResponse(
+        updated_count=len(updated_issues),
+        skipped_count=skipped_count,
+        items=[IssueRead.model_validate(item) for item in updated_issues],
+    )
 
 
 @router.post("", response_model=IssueRead, status_code=status.HTTP_201_CREATED)
@@ -298,6 +372,15 @@ async def create_issue(
         last_seen_at=now,
     )
     session.add(issue)
+    await session.flush()
+    record_issue_status_event(
+        session,
+        issue_id=issue.id,
+        from_status=None,
+        to_status=issue.status,
+        source="manual",
+        fixed_in_version=issue.fixed_in_version,
+    )
     await session.commit()
     await session.refresh(issue)
     return IssueRead.model_validate(issue)
@@ -309,6 +392,42 @@ async def get_issue(
     session: AsyncSession = Depends(get_db),
 ) -> IssueDetailRead:
     return await _load_issue_detail(session, issue_id)
+
+
+@router.post("/{issue_id}/transition", response_model=IssueTransitionResponse)
+async def transition_issue(
+    issue_id: int,
+    payload: IssueTransitionRequest,
+    session: AsyncSession = Depends(get_db),
+) -> IssueTransitionResponse:
+    issue = await session.get(Issue, issue_id)
+    if issue is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Issue not found",
+        )
+    if issue.status == payload.to_status:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Issue is already in status {payload.to_status}",
+        )
+
+    event = transition_issue_status(
+        session,
+        issue,
+        to_status=payload.to_status,
+        source="manual",
+        fixed_in_version=payload.fixed_in_version,
+        clear_fixed_in_version=payload.clear_fixed_in_version,
+        note=payload.note,
+    )
+    await session.commit()
+    await session.refresh(issue)
+    await session.refresh(event)
+    return IssueTransitionResponse(
+        issue=IssueRead.model_validate(issue),
+        event=IssueStatusEventRead.model_validate(event),
+    )
 
 
 @router.patch("/{issue_id}", response_model=IssueRead)
@@ -324,6 +443,7 @@ async def update_issue(
             detail="Issue not found",
         )
 
+    previous_status = issue.status
     updates = payload.model_dump(exclude_unset=True)
     if "title" in updates and updates["title"] is not None:
         issue.title = updates["title"]
@@ -345,6 +465,18 @@ async def update_issue(
         issue.is_ambiguous_stack = bool(updates["is_ambiguous_stack"])
     if "is_pinned" in updates and updates["is_pinned"] is not None:
         issue.is_pinned = bool(updates["is_pinned"])
+
+    if issue.status != previous_status:
+        record_issue_status_event(
+            session,
+            issue_id=issue.id,
+            from_status=previous_status,
+            to_status=issue.status,
+            source="form_edit",
+            fixed_in_version=(
+                issue.fixed_in_version if issue.status in {"FIXED", "REGRESSION"} else None
+            ),
+        )
 
     await session.commit()
     await session.refresh(issue)
@@ -412,6 +544,14 @@ async def split_issue_cluster(
         )
         session.add(target_issue)
         await session.flush()
+        record_issue_status_event(
+            session,
+            issue_id=target_issue.id,
+            from_status=None,
+            to_status="NEW",
+            source="split",
+            note=f"Split from issue #{source_issue.id}",
+        )
 
     cluster.issue_id = target_issue.id
     crashes = (

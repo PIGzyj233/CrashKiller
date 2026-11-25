@@ -8,6 +8,7 @@ import {
 } from "@tanstack/react-query";
 import {
   AlertTriangle,
+  ArrowRightLeft,
   Check,
   ChevronLeft,
   ChevronRight,
@@ -21,10 +22,12 @@ import {
 } from "lucide-react";
 import {
   ApiError,
+  batchTransitionIssues,
   createIssue,
   listClusters,
   listIssues,
   mergeIssues,
+  transitionIssue,
   updateIssue,
 } from "../api/client";
 import type {
@@ -33,26 +36,18 @@ import type {
   IssueStatus,
   SignatureFrameItem,
 } from "../api/types";
+import {
+  ISSUE_STATUSES,
+  IssueTransitionModal,
+  IssueTransitionSplitButton,
+  STATUS_BADGE_CLASSES,
+  type IssueTransitionModalSubmitPayload,
+  type TransitionActionConfig,
+} from "../components/IssueStatusWorkflow";
 import { useProjectContext } from "../components/Layout";
 import { useAppI18n } from "../i18n";
 
 const PAGE_SIZE = 25;
-
-const ISSUE_STATUSES: readonly IssueStatus[] = [
-  "NEW",
-  "KNOWN",
-  "FIXED",
-  "WONTFIX",
-  "REGRESSION",
-];
-
-const STATUS_BADGE_CLASSES: Record<IssueStatus, string> = {
-  NEW: "border-sky-200 bg-sky-50 text-sky-700",
-  KNOWN: "border-indigo-200 bg-indigo-50 text-indigo-700",
-  FIXED: "border-emerald-200 bg-emerald-50 text-emerald-700",
-  WONTFIX: "border-slate-200 bg-slate-100 text-slate-700",
-  REGRESSION: "border-rose-200 bg-rose-50 text-rose-700",
-};
 
 function formatSignatureFrames(
   frames: SignatureFrameItem[],
@@ -135,10 +130,19 @@ export function IssuesPage() {
   const [newIsAmbiguous, setNewIsAmbiguous] = useState(false);
   const [newIsPinned, setNewIsPinned] = useState(false);
 
-  // Feedback / copy state
+  // Feedback / copy / transition state
   const [pinningIssueId, setPinningIssueId] = useState<number | null>(null);
+  const [transitioningIssueId, setTransitioningIssueId] = useState<
+    number | null
+  >(null);
+  const [transitionModal, setTransitionModal] = useState<
+    | { mode: "single"; issue: IssueRead; targetStatus: IssueStatus }
+    | { mode: "batch"; targetStatus: IssueStatus }
+    | null
+  >(null);
   const [copiedHash, setCopiedHash] = useState<string | null>(null);
   const [actionFeedback, setActionFeedback] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -270,10 +274,80 @@ export function IssuesPage() {
       setNewLogPatternsText("");
       setNewIsAmbiguous(false);
       setNewIsPinned(false);
+      setActionError(null);
       setActionFeedback(
         t("issues.createdFeedback", { id: created.id, title: created.title }),
       );
       void queryClient.invalidateQueries({ queryKey: ["issues"] });
+      void queryClient.invalidateQueries({ queryKey: ["dashboard"] });
+    },
+  });
+
+  const transitionMutation = useMutation({
+    mutationFn: ({
+      id,
+      payload,
+    }: {
+      id: number;
+      payload: IssueTransitionModalSubmitPayload;
+    }) => transitionIssue(id, payload),
+    onMutate: ({ id }) => {
+      setTransitioningIssueId(id);
+      setActionError(null);
+    },
+    onSuccess: (res) => {
+      setTransitionModal(null);
+      setSelectedIssuesMap((prev) => {
+        if (!prev.has(res.issue.id)) {
+          return prev;
+        }
+        const next = new Map(prev);
+        next.set(res.issue.id, res.issue);
+        return next;
+      });
+      setActionFeedback(
+        t("issues.transitionFeedback", {
+          id: res.issue.id,
+          from: formatIssueStatus(res.event.from_status ?? res.issue.status),
+          to: formatIssueStatus(res.issue.status),
+        }),
+      );
+      void queryClient.invalidateQueries({ queryKey: ["issues"] });
+      void queryClient.invalidateQueries({ queryKey: ["issue", res.issue.id] });
+      void queryClient.invalidateQueries({ queryKey: ["dashboard"] });
+    },
+    onError: (err) => {
+      if (!transitionModal) {
+        setActionError(
+          err instanceof ApiError ? err.message : t("issues.transitionFailed"),
+        );
+      }
+    },
+    onSettled: () => {
+      setTransitioningIssueId(null);
+    },
+  });
+
+  const batchTransitionMutation = useMutation({
+    mutationFn: batchTransitionIssues,
+    onSuccess: (res, vars) => {
+      setTransitionModal(null);
+      setSelectedIssuesMap(new Map());
+      setActionError(null);
+      setActionFeedback(
+        res.skipped_count > 0
+          ? t("issues.batchTransitionWithSkippedFeedback", {
+              updated: res.updated_count,
+              skipped: res.skipped_count,
+              to: formatIssueStatus(vars.to_status),
+            })
+          : t("issues.batchTransitionFeedback", {
+              updated: res.updated_count,
+              to: formatIssueStatus(vars.to_status),
+            }),
+      );
+      void queryClient.invalidateQueries({ queryKey: ["issues"] });
+      void queryClient.invalidateQueries({ queryKey: ["issue"] });
       void queryClient.invalidateQueries({ queryKey: ["dashboard"] });
     },
   });
@@ -384,6 +458,59 @@ export function IssuesPage() {
     });
   };
 
+  const handleRowTransitionAction = (
+    issue: IssueRead,
+    action: TransitionActionConfig,
+  ) => {
+    setActionError(null);
+    if (!action.requiresModal) {
+      transitionMutation.mutate({
+        id: issue.id,
+        payload: { to_status: action.toStatus },
+      });
+      return;
+    }
+    transitionMutation.reset();
+    setTransitionModal({
+      mode: "single",
+      issue,
+      targetStatus: action.toStatus,
+    });
+  };
+
+  const openBatchTransitionModal = () => {
+    if (selectedIssues.length === 0) {
+      return;
+    }
+    const allNew = selectedIssues.every((item) => item.status === "NEW");
+    const defaultTarget: IssueStatus = allNew ? "KNOWN" : "FIXED";
+    batchTransitionMutation.reset();
+    setActionError(null);
+    setTransitionModal({
+      mode: "batch",
+      targetStatus: defaultTarget,
+    });
+  };
+
+  const handleTransitionModalSubmit = (
+    payload: IssueTransitionModalSubmitPayload,
+  ) => {
+    if (!transitionModal) {
+      return;
+    }
+    if (transitionModal.mode === "single") {
+      transitionMutation.mutate({
+        id: transitionModal.issue.id,
+        payload,
+      });
+    } else {
+      batchTransitionMutation.mutate({
+        issue_ids: selectedIssueIds,
+        ...payload,
+      });
+    }
+  };
+
   const handleCopyHash = (hash: string) => {
     if (typeof navigator !== "undefined" && navigator.clipboard) {
       void navigator.clipboard.writeText(hash);
@@ -443,6 +570,20 @@ export function IssuesPage() {
             type="button"
             onClick={() => setActionFeedback(null)}
             className="rounded p-1 text-emerald-700 hover:bg-emerald-100"
+            aria-label={t("issues.dismissNotification")}
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+      )}
+
+      {actionError && (
+        <div className="flex items-center justify-between rounded-xl border border-rose-200 bg-rose-50 px-4 py-2.5 text-sm text-rose-800">
+          <span>{actionError}</span>
+          <button
+            type="button"
+            onClick={() => setActionError(null)}
+            className="rounded p-1 text-rose-700 hover:bg-rose-100"
             aria-label={t("issues.dismissNotification")}
           >
             <X className="h-4 w-4" />
@@ -559,23 +700,23 @@ export function IssuesPage() {
             )}
           </div>
 
-          {/* Multi-select Merge Bar */}
-          {selectedIssueIds.length >= 2 && (
+          {/* Multi-select Batch Action Bar */}
+          {selectedIssueIds.length >= 1 && (
             <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-indigo-200 bg-indigo-50 px-4 py-2.5 text-sm">
-              <div className="flex items-center gap-2 text-indigo-900">
-                <GitMerge className="h-4 w-4 text-indigo-600" />
+              <div className="flex flex-wrap items-center gap-2 text-indigo-900">
+                <ArrowRightLeft className="h-4 w-4 text-indigo-600" />
                 <span className="font-medium">
                   {t("issues.selectedCount", {
                     count: selectedIssueIds.length,
                   })}
                 </span>
-                {hasCrossProjectSelection && (
+                {selectedIssueIds.length >= 2 && hasCrossProjectSelection && (
                   <span className="rounded bg-rose-100 px-2 py-0.5 text-xs font-medium text-rose-700">
                     {t("issues.crossProjectWarning")}
                   </span>
                 )}
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
                 <button
                   type="button"
                   onClick={() => setSelectedIssuesMap(new Map())}
@@ -585,13 +726,25 @@ export function IssuesPage() {
                 </button>
                 <button
                   type="button"
-                  disabled={hasCrossProjectSelection}
-                  onClick={openMergeModal}
-                  className="inline-flex items-center gap-1.5 rounded-md bg-indigo-600 px-3 py-1 text-xs font-medium text-white hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50"
+                  onClick={openBatchTransitionModal}
+                  className="inline-flex items-center gap-1.5 rounded-md border border-indigo-300 bg-white px-3 py-1 text-xs font-medium text-indigo-700 hover:bg-indigo-100/60"
                 >
-                  <GitMerge className="h-3.5 w-3.5" />
-                  {t("issues.mergeButton", { count: selectedIssueIds.length })}
+                  <ArrowRightLeft className="h-3.5 w-3.5" />
+                  {t("issues.batchTransitionButton")}
                 </button>
+                {selectedIssueIds.length >= 2 && (
+                  <button
+                    type="button"
+                    disabled={hasCrossProjectSelection}
+                    onClick={openMergeModal}
+                    className="inline-flex items-center gap-1.5 rounded-md bg-indigo-600 px-3 py-1 text-xs font-medium text-white hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    <GitMerge className="h-3.5 w-3.5" />
+                    {t("issues.mergeButton", {
+                      count: selectedIssueIds.length,
+                    })}
+                  </button>
+                )}
               </div>
             </div>
           )}
@@ -630,12 +783,20 @@ export function IssuesPage() {
                       />
                     </th>
                     <th className="px-4 py-3">{t("issues.colIssue")}</th>
-                    <th className="px-4 py-3">{t("issues.colStatus")}</th>
-                    <th className="px-4 py-3">{t("issues.colComponent")}</th>
-                    <th className="px-4 py-3">{t("issues.colCrashes")}</th>
-                    <th className="px-4 py-3">{t("issues.colLastSeen")}</th>
-                    <th className="px-4 py-3 text-right">
-                      {t("issues.colPin")}
+                    <th className="whitespace-nowrap px-4 py-3">
+                      {t("issues.colStatus")}
+                    </th>
+                    <th className="whitespace-nowrap px-4 py-3">
+                      {t("issues.colComponent")}
+                    </th>
+                    <th className="whitespace-nowrap px-4 py-3">
+                      {t("issues.colCrashes")}
+                    </th>
+                    <th className="whitespace-nowrap px-4 py-3">
+                      {t("issues.colLastSeen")}
+                    </th>
+                    <th className="whitespace-nowrap px-4 py-3 text-right">
+                      {t("issues.colActions")}
                     </th>
                   </tr>
                 </thead>
@@ -715,9 +876,9 @@ export function IssuesPage() {
                               </p>
                             )}
                           </td>
-                          <td className="px-4 py-3">
+                          <td className="whitespace-nowrap px-4 py-3">
                             <span
-                              className={`inline-flex rounded-full border px-2.5 py-0.5 text-xs font-medium ${
+                              className={`inline-flex whitespace-nowrap rounded-full border px-2.5 py-0.5 text-xs font-medium ${
                                 STATUS_BADGE_CLASSES[issue.status]
                               }`}
                             >
@@ -727,51 +888,65 @@ export function IssuesPage() {
                           <td className="px-4 py-3 text-xs text-slate-600">
                             {issue.component || "—"}
                           </td>
-                          <td className="px-4 py-3 font-mono text-xs font-semibold text-slate-800">
+                          <td className="whitespace-nowrap px-4 py-3 font-mono text-xs font-semibold text-slate-800">
                             {formatNumber(issue.crash_count)}
                           </td>
                           <td
-                            className="px-4 py-3 text-xs text-slate-600"
+                            className="whitespace-nowrap px-4 py-3 text-xs text-slate-600"
                             title={t("issues.firstSeenTitle", {
                               time: formatDateTime(issue.first_seen_at),
                             })}
                           >
                             {formatDateTime(issue.last_seen_at)}
                           </td>
-                          <td className="px-4 py-3 text-right">
-                            <button
-                              type="button"
-                              disabled={
-                                pinMutation.isPending &&
-                                pinningIssueId === issue.id
-                              }
-                              onClick={() =>
-                                pinMutation.mutate({
-                                  id: issue.id,
-                                  isPinned: !issue.is_pinned,
-                                })
-                              }
-                              title={
-                                issue.is_pinned
-                                  ? t("issues.unpinTitle")
-                                  : t("issues.pinTitle")
-                              }
-                              aria-label={
-                                issue.is_pinned
-                                  ? t("issues.unpinAria", { id: issue.id })
-                                  : t("issues.pinAria", { id: issue.id })
-                              }
-                              className={`inline-flex items-center gap-1 rounded-md border px-2 py-1 text-xs font-medium transition-colors ${
-                                issue.is_pinned
-                                  ? "border-amber-300 bg-amber-50 text-amber-800 hover:bg-amber-100"
-                                  : "border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
-                              }`}
-                            >
-                              <Pin className="h-3.5 w-3.5" />
-                              {issue.is_pinned
-                                ? t("issues.pinned")
-                                : t("issues.pin")}
-                            </button>
+                          <td className="whitespace-nowrap px-4 py-3 text-right">
+                            <div className="inline-flex items-center justify-end gap-1.5">
+                              <IssueTransitionSplitButton
+                                currentStatus={issue.status}
+                                issueId={issue.id}
+                                size="sm"
+                                isPending={
+                                  transitionMutation.isPending &&
+                                  transitioningIssueId === issue.id
+                                }
+                                onSelectAction={(action) =>
+                                  handleRowTransitionAction(issue, action)
+                                }
+                              />
+                              <button
+                                type="button"
+                                disabled={
+                                  pinMutation.isPending &&
+                                  pinningIssueId === issue.id
+                                }
+                                onClick={() =>
+                                  pinMutation.mutate({
+                                    id: issue.id,
+                                    isPinned: !issue.is_pinned,
+                                  })
+                                }
+                                title={
+                                  issue.is_pinned
+                                    ? t("issues.unpinTitle")
+                                    : t("issues.pinTitle")
+                                }
+                                aria-label={
+                                  issue.is_pinned
+                                    ? t("issues.unpinAria", { id: issue.id })
+                                    : t("issues.pinAria", { id: issue.id })
+                                }
+                                className={`inline-flex items-center gap-1 whitespace-nowrap rounded-md border px-2 py-1 text-xs font-medium transition-colors ${
+                                  issue.is_pinned
+                                    ? "border-amber-300 bg-amber-50 text-amber-800 hover:bg-amber-100"
+                                    : "border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
+                                }`}
+                              >
+                                <Pin className="h-3.5 w-3.5" />
+                                {issue.is_pinned
+                                  ? t("issues.pinned")
+                                  : t("issues.pin")}
+                              </button>
+                            </div>
                           </td>
                         </tr>
                       );
@@ -1288,6 +1463,34 @@ export function IssuesPage() {
           </div>
         </div>
       )}
+
+      <IssueTransitionModal
+        isOpen={transitionModal !== null}
+        mode={transitionModal?.mode ?? "single"}
+        issue={transitionModal?.mode === "single" ? transitionModal.issue : null}
+        selectedIssues={selectedIssues}
+        initialTargetStatus={transitionModal?.targetStatus ?? "KNOWN"}
+        isPending={
+          transitionModal?.mode === "batch"
+            ? batchTransitionMutation.isPending
+            : transitionMutation.isPending
+        }
+        errorMessage={
+          transitionModal?.mode === "batch"
+            ? batchTransitionMutation.isError
+              ? batchTransitionMutation.error instanceof ApiError
+                ? batchTransitionMutation.error.message
+                : t("issues.transitionFailed")
+              : null
+            : transitionMutation.isError
+              ? transitionMutation.error instanceof ApiError
+                ? transitionMutation.error.message
+                : t("issues.transitionFailed")
+              : null
+        }
+        onClose={() => setTransitionModal(null)}
+        onSubmit={handleTransitionModalSubmit}
+      />
     </div>
   );
 }

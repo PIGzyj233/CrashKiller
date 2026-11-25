@@ -153,6 +153,38 @@ class Issue(Base):
     project: Mapped[Project] = relationship(back_populates="issues")
     clusters: Mapped[list[CrashCluster]] = relationship(back_populates="issue")
     crash_reports: Mapped[list[CrashReport]] = relationship(back_populates="issue")
+    status_events: Mapped[list[IssueStatusEvent]] = relationship(
+        back_populates="issue",
+        cascade="all, delete-orphan",
+    )
+
+
+class IssueStatusEvent(Base):
+    __tablename__ = "issue_status_events"
+    __table_args__ = (
+        Index("ix_issue_status_events_issue_created", "issue_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    issue_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("issues.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    from_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    to_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default="manual")
+    fixed_in_version: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    crash_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUIDType,
+        ForeignKey("crash_reports.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(TZDateTime, nullable=False, default=utcnow)
+
+    issue: Mapped[Issue] = relationship(back_populates="status_events")
 
 
 class CrashCluster(Base):

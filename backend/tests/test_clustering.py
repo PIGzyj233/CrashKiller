@@ -8,10 +8,11 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import CrashCluster, CrashReport, Issue, Project
+from app.db.models import CrashCluster, CrashReport, Issue, IssueStatusEvent, Project
 from app.services.clustering import (
     ClusteringError,
     ClusteringService,
@@ -690,6 +691,21 @@ async def test_apply_human_verdict_confirm_assign_and_create_issue(
     await db_session.refresh(created_issue)
     assert created_issue.status == "KNOWN"
     assert created_issue.log_patterns_json == ["NullPtrException", "FatalAbort"]
+
+    verdict_events = (
+        await db_session.execute(
+            select(IssueStatusEvent)
+            .where(IssueStatusEvent.issue_id == created_issue.id)
+            .order_by(IssueStatusEvent.id.asc())
+        )
+    ).scalars().all()
+    assert any(
+        ev.from_status == "NEW"
+        and ev.to_status == "KNOWN"
+        and ev.source == "human_verdict"
+        and ev.crash_id == crash.id
+        for ev in verdict_events
+    )
 
     # assign_issue moves crash to another issue and decrements old issue; ambiguous unbinds cluster.
     target_issue = Issue(project_id=proj.id, title="Target Issue", status="KNOWN", crash_count=0)

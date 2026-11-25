@@ -14,6 +14,8 @@ import type {
   DashboardResponse,
   GCReport,
   HealthResponse,
+  IssueBatchTransitionRequest,
+  IssueBatchTransitionResponse,
   IssueCreateRequest,
   IssueDetailRead,
   IssueListResponse,
@@ -22,6 +24,8 @@ import type {
   IssueSplitRequest,
   IssueSplitResponse,
   IssueStatus,
+  IssueTransitionRequest,
+  IssueTransitionResponse,
   IssueUpdateRequest,
   LLMProviderPreset,
   LogAroundTimeResponse,
@@ -951,6 +955,31 @@ export function splitIssueCluster(
 ): Promise<IssueSplitResponse> {
   return requestJson<IssueSplitResponse>(
     `${API_BASE}/issues/${encodeURIComponent(String(issueId))}/split`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+  );
+}
+
+export function transitionIssue(
+  issueId: number,
+  payload: IssueTransitionRequest,
+): Promise<IssueTransitionResponse> {
+  return requestJson<IssueTransitionResponse>(
+    `${API_BASE}/issues/${encodeURIComponent(String(issueId))}/transition`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+  );
+}
+
+export function batchTransitionIssues(
+  payload: IssueBatchTransitionRequest,
+): Promise<IssueBatchTransitionResponse> {
+  return requestJson<IssueBatchTransitionResponse>(
+    `${API_BASE}/issues/batch-transition`,
     {
       method: "POST",
       body: JSON.stringify(payload),

@@ -1996,5 +1996,159 @@ async def test_sync_skips_invalid_zero_guid_in_missing_windows_and_rejects_in_ta
         api_harness.app.state.http_transport = None
 
 
+async def test_issue_status_transitions_batch_and_history(api_harness: Any) -> None:
+    client: httpx.AsyncClient = api_harness.client
+    proj = (
+        await client.post("/api/v1/projects", json={"key": "wf-proj", "name": "Workflow Proj"})
+    ).json()
+
+    # 1. Create issue -> initial manual event recorded
+    created = (
+        await client.post(
+            "/api/v1/issues",
+            json={"project_id": proj["id"], "title": "DXGI capture crash", "status": "NEW"},
+        )
+    ).json()
+    issue_id = created["id"]
+
+    detail = (await client.get(f"/api/v1/issues/{issue_id}")).json()
+    assert len(detail["status_events"]) == 1
+    assert detail["status_events"][0]["from_status"] is None
+    assert detail["status_events"][0]["to_status"] == "NEW"
+    assert detail["status_events"][0]["source"] == "manual"
+
+    # 2. Same-status transition is rejected with 400
+    same_resp = await client.post(
+        f"/api/v1/issues/{issue_id}/transition",
+        json={"to_status": "NEW"},
+    )
+    assert same_resp.status_code == 400
+
+    # 3. Single transitions: NEW -> KNOWN -> FIXED -> REGRESSION -> KNOWN
+    t1 = await client.post(
+        f"/api/v1/issues/{issue_id}/transition",
+        json={"to_status": "KNOWN"},
+    )
+    assert t1.status_code == 200
+    assert t1.json()["issue"]["status"] == "KNOWN"
+    assert t1.json()["event"]["from_status"] == "NEW"
+    assert t1.json()["event"]["to_status"] == "KNOWN"
+    assert t1.json()["event"]["source"] == "manual"
+
+    t2 = await client.post(
+        f"/api/v1/issues/{issue_id}/transition",
+        json={
+            "to_status": "FIXED",
+            "fixed_in_version": "2.4.1",
+            "note": "Fixed texture creation guard",
+        },
+    )
+    assert t2.status_code == 200
+    assert t2.json()["issue"]["status"] == "FIXED"
+    assert t2.json()["issue"]["fixed_in_version"] == "2.4.1"
+    assert t2.json()["event"]["fixed_in_version"] == "2.4.1"
+    assert t2.json()["event"]["note"] == "Fixed texture creation guard"
+
+    # FIXED -> REGRESSION preserves fixed_in_version by default
+    t3 = await client.post(
+        f"/api/v1/issues/{issue_id}/transition",
+        json={"to_status": "REGRESSION", "note": "Seen again in 2.4.2"},
+    )
+    assert t3.status_code == 200
+    assert t3.json()["issue"]["status"] == "REGRESSION"
+    assert t3.json()["issue"]["fixed_in_version"] == "2.4.1"
+
+    # REGRESSION -> KNOWN with clear_fixed_in_version clears fixed_in_version
+    t4 = await client.post(
+        f"/api/v1/issues/{issue_id}/transition",
+        json={"to_status": "KNOWN", "clear_fixed_in_version": True},
+    )
+    assert t4.status_code == 200
+    assert t4.json()["issue"]["status"] == "KNOWN"
+    assert t4.json()["issue"]["fixed_in_version"] is None
+
+    # 4. PATCH status change records form_edit; title-only PATCH does not add event
+    p1 = await client.patch(f"/api/v1/issues/{issue_id}", json={"status": "WONTFIX"})
+    assert p1.status_code == 200
+    p2 = await client.patch(
+        f"/api/v1/issues/{issue_id}",
+        json={"title": "DXGI capture crash (updated)"},
+    )
+    assert p2.status_code == 200
+
+    detail_after = (await client.get(f"/api/v1/issues/{issue_id}")).json()
+    events = detail_after["status_events"]
+    assert len(events) == 6
+    assert events[0]["from_status"] == "KNOWN"
+    assert events[0]["to_status"] == "WONTFIX"
+    assert events[0]["source"] == "form_edit"
+    assert [e["to_status"] for e in events] == [
+        "WONTFIX",
+        "KNOWN",
+        "REGRESSION",
+        "FIXED",
+        "KNOWN",
+        "NEW",
+    ]
+
+    # 5. Batch transition: updates non-matching, skips already-in-target, 404 on unknown ID
+    issue_b = (
+        await client.post(
+            "/api/v1/issues",
+            json={"project_id": proj["id"], "title": "Second issue", "status": "NEW"},
+        )
+    ).json()
+    issue_c = (
+        await client.post(
+            "/api/v1/issues",
+            json={
+                "project_id": proj["id"],
+                "title": "Already fixed",
+                "status": "FIXED",
+                "fixed_in_version": "2.0.0",
+            },
+        )
+    ).json()
+
+    not_found_batch = await client.post(
+        "/api/v1/issues/batch-transition",
+        json={"issue_ids": [issue_id, 999999], "to_status": "FIXED"},
+    )
+    assert not_found_batch.status_code == 404
+
+    batch_resp = await client.post(
+        "/api/v1/issues/batch-transition",
+        json={
+            "issue_ids": [issue_id, issue_b["id"], issue_c["id"]],
+            "to_status": "FIXED",
+            "fixed_in_version": "2.5.0",
+            "note": "Released in 2.5.0",
+        },
+    )
+    assert batch_resp.status_code == 200
+    batch_data = batch_resp.json()
+    assert batch_data["updated_count"] == 2
+    assert batch_data["skipped_count"] == 1
+    assert {item["id"] for item in batch_data["items"]} == {issue_id, issue_b["id"]}
+
+    detail_b = (await client.get(f"/api/v1/issues/{issue_b['id']}")).json()
+    assert detail_b["status"] == "FIXED"
+    assert detail_b["fixed_in_version"] == "2.5.0"
+    assert detail_b["status_events"][0]["source"] == "batch"
+    assert detail_b["status_events"][0]["note"] == "Released in 2.5.0"
+
+    # Already-FIXED issue was skipped and kept its original version
+    detail_c = (await client.get(f"/api/v1/issues/{issue_c['id']}")).json()
+    assert detail_c["fixed_in_version"] == "2.0.0"
+
+    # 6. Merging an issue that has status_events succeeds cleanly
+    merge_resp = await client.post(
+        "/api/v1/issues/merge",
+        json={"target_issue_id": issue_id, "source_issue_ids": [issue_b["id"]]},
+    )
+    assert merge_resp.status_code == 200
+
+
+
 
 
