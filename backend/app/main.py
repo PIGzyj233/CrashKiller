@@ -106,6 +106,7 @@ def create_app(
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+        expose_headers=["X-Total-Count"],
     )
 
     def _sanitize_json_errors(obj: Any) -> Any:

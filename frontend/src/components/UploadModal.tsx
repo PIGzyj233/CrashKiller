@@ -51,7 +51,14 @@ export interface UploadModalProps {
   onSuccess?: (
     result:
       | { mode: "crash"; crashId: string }
-      | { mode: "symbol"; symbolId: string; scope?: SymbolScope },
+      | {
+          mode: "symbol";
+          symbolId: string;
+          scope?: SymbolScope;
+          resymbolicateCrashIds?: string[];
+          resymbolicateActiveCrashIds?: string[];
+          resymbolicateSkippedActiveCount?: number;
+        },
   ) => void;
 }
 
@@ -439,7 +446,15 @@ export function UploadModal({
           signal: controller.signal,
         });
 
-        onSuccess?.({ mode: "symbol", symbolId: res.id, scope: "public" });
+        onSuccess?.({
+          mode: "symbol",
+          symbolId: res.id,
+          scope: "public",
+          resymbolicateCrashIds: res.resymbolicate_crash_ids,
+          resymbolicateActiveCrashIds: res.resymbolicate_active_crash_ids,
+          resymbolicateSkippedActiveCount:
+            res.resymbolicate_skipped_active_count,
+        });
         onClose();
       } else {
         const trimmedKey = apiKey.trim();

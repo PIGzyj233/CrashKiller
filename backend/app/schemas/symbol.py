@@ -43,6 +43,8 @@ class SymbolUploadResponse(SymbolRead):
     upgraded: bool = False
     resymbolicate_queued_count: int = 0
     resymbolicate_crash_ids: list[uuid.UUID] = Field(default_factory=list)
+    resymbolicate_skipped_active_count: int = 0
+    resymbolicate_active_crash_ids: list[uuid.UUID] = Field(default_factory=list)
 
 
 class SymbolListResponse(BaseModel):
@@ -81,7 +83,7 @@ class PublicSymbolSyncRequest(BaseModel):
     project_id: uuid.UUID | None = None
     force: bool = True
     auto_resymbolicate: bool = True
-    max_targets: int = Field(default=20, ge=1, le=50)
+    max_targets: int | None = Field(default=None, ge=1, le=2000)
 
 
 class PublicSymbolSyncItemResult(BaseModel):
@@ -113,6 +115,8 @@ class PublicSymbolSyncResponse(BaseModel):
     circuit_open: bool = False
     resymbolicate_queued_count: int = 0
     resymbolicate_crash_ids: list[uuid.UUID] = Field(default_factory=list)
+    resymbolicate_skipped_active_count: int = 0
+    resymbolicate_active_crash_ids: list[uuid.UUID] = Field(default_factory=list)
     results: list[PublicSymbolSyncItemResult] = Field(default_factory=list)
 
 
@@ -126,3 +130,17 @@ class ResymbolicateRequest(BaseModel):
 class ResymbolicateResponse(BaseModel):
     queued_count: int
     crash_ids: list[uuid.UUID]
+    skipped_active_count: int = 0
+    active_crash_ids: list[uuid.UUID] = Field(default_factory=list)
+
+
+class ResymbolicateStatusResponse(BaseModel):
+    total: int = 0
+    pending: int = 0
+    parsing: int = 0
+    triaging: int = 0
+    analyzed: int = 0
+    failed: int = 0
+    completed: int = 0
+    in_progress: int = 0
+    done: bool = True

@@ -733,8 +733,21 @@ const enUS: DeepStringify<typeof zhCN> = {
     emptyPublicPullAction: "pull from Microsoft Symbol Server",
     syncSelectedBtn: "Sync Selected ({{count}})",
     syncSystemMissingBtn: "Sync Microsoft Symbols",
+    syncSystemMissingBtnCount: "Sync Microsoft Symbols ({{count}})",
     syncRowBtn: "MS Sync",
     syncingBtn: "Syncing...",
+    syncProgressTitle: "Syncing Microsoft Public Symbols...",
+    syncProgressCount: "Completed {{completed}} / {{total}} ({{percent}}%)",
+    syncProgressActive: "Fetching: {{modules}}",
+    syncProgressAlreadyCached: "Skipped {{count}} complete local cache(s)",
+    syncCancelBtn: "Stop Sync",
+    syncCancelledNotice:
+      "Sync stopped ({{completed}} / {{total}} completed; {{imported}} imported/upgraded symbol(s) were saved to the Public Store).",
+    syncCancelledResymBtn: "Re-symbolicate Now",
+    syncNoEligibleTargets:
+      "No eligible Microsoft system symbols found to sync in the missing queue.",
+    missingQueueTruncatedNote:
+      "Showing the top {{shown}} of {{total}} missing symbols. Sync Microsoft Symbols and Re-symbolicate All still process the full queue.",
     badgeWindowsSystem: "Windows / MS",
     badgeAvailableLocally: "Cached locally (resym pending)",
     badgeNegativeCached: "Recent miss",
@@ -742,7 +755,7 @@ const enUS: DeepStringify<typeof zhCN> = {
     selectMissingRowAria: "Select missing symbol {{file}}",
     syncSummaryTitle: "Microsoft Symbol Sync Complete",
     syncSummaryCounts:
-      "Imported {{imported}} · Upgraded PE {{upgraded}} · Cached {{cached}} · Not found {{notFound}} · Failed {{failed}}",
+      "Imported {{imported}} · Upgraded PE {{upgraded}} · Cached {{cached}} · Not found {{notFound}} · Skipped {{skipped}} · Failed {{failed}}",
     syncCircuitWarning:
       "MSDL circuit breaker is open due to consecutive network errors. Retry later or upload manually.",
     syncFailed: "Failed to sync Microsoft public symbols.",
@@ -772,6 +785,10 @@ const enUS: DeepStringify<typeof zhCN> = {
       "Please enter a module or PDB filename (e.g. GraphicsCapture.dll).",
     syncModalErrDebugId:
       "Please enter a valid Debug ID or 32-hex / dashed GUID.",
+    syncModalResymSkippedActive:
+      "{{count}} affected crash(es) are currently parsing or running AI triage and were not queued yet (track status in the page banner and retry once idle).",
+    syncSummaryResymSkippedActive:
+      "{{count}} affected crash(es) are currently busy / running AI triage and were not queued yet",
     searchPlaceholder: "Search module, debug file, or debug ID...",
     appVersionPlaceholder: "App version (e.g. 1.2.0)",
     filterAppVersionAria: "Filter by app version",
@@ -800,6 +817,28 @@ const enUS: DeepStringify<typeof zhCN> = {
     resymAllMissing: "Re-symbolicate All Missing",
     resymQueuedPrefix: "Queued ",
     resymQueuedSuffix: " crash(es) for re-symbolication",
+    resymProgressTitle: "Re-symbolicating crashes in background...",
+    resymProgressCount:
+      "Completed {{completed}} / {{total}} crash(es) (pending {{pending}} · parsing {{parsing}})",
+    resymCompletedTitle:
+      "Re-symbolication complete: updated {{completed}} / {{total}} crash(es)",
+    resymCompletedFailedSuffix: ", {{failed}} failed",
+    resymCompletedTriagingSuffix: " ({{triaging}} running AI triage in background)",
+    resymActiveSkippedNotice:
+      "{{count}} affected crash(es) are already in progress; tracking status and refreshing automatically...",
+    resymBusyParsingTitle:
+      "{{total}} affected crash(es) are already parsing / re-symbolicating in background...",
+    resymBusyTriagingTitle:
+      "{{triaging}} affected crash(es) are currently running AI triage and were not queued yet",
+    resymBusyTriagingHint:
+      "Waiting for AI triage to finish; once idle you can re-symbolicate them below.",
+    resymBusyIdleTitle:
+      "{{total}} previously busy crash(es) are now idle (not re-symbolicated yet)",
+    resymRetryNowBtn: "Re-symbolicate Now",
+    resymPartialSkippedNote:
+      "{{count}} additional crash(es) were skipped because they were already in progress.",
+    resymNoneEligible:
+      "No idle crashes eligible for re-symbolication (dumps may have been evicted or no matching missing symbols remain).",
     resymIdsLabel: "IDs: ",
     resymFailed: "Failed to queue re-symbolication.",
     loadMissingFailed: "Failed to load missing symbols queue.",
@@ -993,6 +1032,7 @@ const enUS: DeepStringify<typeof zhCN> = {
     filterAll: "All ({{count}})",
     filterLoaded: "Loaded ({{count}})",
     filterMissing: "Missing ({{count}})",
+    filterUnreferenced: "Not Referenced ({{count}})",
     filterCorrupt: "Corrupt ({{count}})",
     noModulesMetadata: "No loaded module metadata available.",
     noModulesMatch: "No modules match the active filters.",
@@ -1003,6 +1043,7 @@ const enUS: DeepStringify<typeof zhCN> = {
     colSymbols: "Symbols",
     statusLoaded: "Loaded",
     statusCorrupt: "Corrupt",
+    statusUnreferenced: "Not Referenced",
     statusMissing: "Missing",
   },
   log: {

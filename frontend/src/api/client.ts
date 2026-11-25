@@ -29,6 +29,7 @@ import type {
   LogSearchResponse,
   LogSessionLinesResponse,
   LogSummaryResponse,
+  MissingSymbolListResult,
   MissingSymbolQueueItem,
   ProjectApiKeyResponse,
   ProjectCreate,
@@ -38,8 +39,10 @@ import type {
   ProjectUpdate,
   PublicSymbolSyncRequest,
   PublicSymbolSyncResponse,
+  PublicSymbolSyncStreamEvent,
   ResymbolicateRequest,
   ResymbolicateResponse,
+  ResymbolicateStatusResponse,
   SymbolListResponse,
   SymbolScope,
   SymbolUploadResponse,
@@ -387,6 +390,31 @@ export function listMissingSymbols(
   );
 }
 
+export async function listMissingSymbolsWithTotal(
+  params?: ListMissingSymbolsParams,
+): Promise<MissingSymbolListResult> {
+  const qs = buildQueryString(params);
+  const response = await fetch(`${API_BASE}/symbols/missing${qs}`, {
+    headers: { Accept: "application/json" },
+  });
+  if (!response.ok) {
+    const rawText = await response.text();
+    const { message, detail } = parseErrorPayload(
+      response.status,
+      response.statusText,
+      rawText,
+    );
+    throw new ApiError(response.status, message, detail);
+  }
+  const items = (await response.json()) as MissingSymbolQueueItem[];
+  const rawTotal = response.headers.get("X-Total-Count");
+  const parsedTotal = rawTotal !== null ? Number.parseInt(rawTotal, 10) : Number.NaN;
+  return {
+    items,
+    total: Number.isFinite(parsedTotal) && parsedTotal >= 0 ? parsedTotal : items.length,
+  };
+}
+
 export function resymbolicate(
   payload: ResymbolicateRequest,
 ): Promise<ResymbolicateResponse> {
@@ -396,6 +424,18 @@ export function resymbolicate(
       method: "POST",
       body: JSON.stringify(payload),
     },
+  );
+}
+
+export function getResymbolicateStatus(
+  crashIds: string[],
+): Promise<ResymbolicateStatusResponse> {
+  const params = new URLSearchParams();
+  for (const id of crashIds) {
+    params.append("crash_ids", id);
+  }
+  return requestJson<ResymbolicateStatusResponse>(
+    `${API_BASE}/symbols/resymbolicate/status?${params.toString()}`,
   );
 }
 
@@ -409,6 +449,98 @@ export function syncPublicSymbols(
       body: JSON.stringify(payload),
     },
   );
+}
+
+export interface SyncPublicSymbolsStreamOptions {
+  onEvent?: (event: PublicSymbolSyncStreamEvent) => void;
+  signal?: AbortSignal;
+}
+
+export async function syncPublicSymbolsStream(
+  payload: PublicSymbolSyncRequest,
+  options?: SyncPublicSymbolsStreamOptions,
+): Promise<PublicSymbolSyncResponse> {
+  const response = await fetch(`${API_BASE}/symbols/public/sync/stream`, {
+    method: "POST",
+    headers: {
+      Accept: "text/event-stream",
+      "Content-Type": "application/json",
+    },
+    credentials: "same-origin",
+    body: JSON.stringify(payload),
+    signal: options?.signal,
+  });
+
+  if (!response.ok) {
+    const rawText = await response.text();
+    const { message, detail } = parseErrorPayload(
+      response.status,
+      response.statusText,
+      rawText,
+    );
+    throw new ApiError(response.status, message, detail);
+  }
+
+  if (!response.body) {
+    throw new ApiError(500, "Streaming response body is unavailable");
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let finalSummary: PublicSymbolSyncResponse | null = null;
+
+  const processBlock = (block: string) => {
+    const lines = block.split(/\r?\n/);
+    const dataLines: string[] = [];
+    for (const line of lines) {
+      if (!line || line.startsWith(":")) {
+        continue;
+      }
+      if (line.startsWith("data:")) {
+        dataLines.push(line.slice(5).trimStart());
+      }
+    }
+    if (dataLines.length === 0) {
+      return;
+    }
+    const rawJson = dataLines.join("\n");
+    const parsed = JSON.parse(rawJson) as PublicSymbolSyncStreamEvent;
+    options?.onEvent?.(parsed);
+    if (parsed.type === "complete") {
+      finalSummary = parsed.summary;
+    } else if (parsed.type === "error") {
+      throw new ApiError(500, parsed.detail || "Public symbol sync failed");
+    }
+  };
+
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) {
+        buffer += decoder.decode();
+        break;
+      }
+      buffer += decoder.decode(value, { stream: true });
+      const parts = buffer.split(/\r?\n\r?\n/);
+      buffer = parts.pop() ?? "";
+      for (const part of parts) {
+        if (part.trim()) {
+          processBlock(part);
+        }
+      }
+    }
+    if (buffer.trim()) {
+      processBlock(buffer);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  if (!finalSummary) {
+    throw new ApiError(500, "Symbol sync stream ended unexpectedly");
+  }
+  return finalSummary;
 }
 
 export function deleteSymbol(symbolId: string): Promise<void> {

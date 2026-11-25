@@ -380,3 +380,207 @@ async def test_cancelling_stackwalk_stops_and_reaps_process(
         await asyncio.wait_for(parse, timeout=2)
     assert killed.is_set() and reaped.is_set()
     assert not list(storage_manager.partition_path("staging").iterdir())
+
+
+def test_normalize_excludes_unreferenced_modules_and_zero_debug_id() -> None:
+    res = normalize_stackwalk_json(
+        {
+            "crash_info": {"type": "EXCEPTION_ACCESS_VIOLATION_READ", "address": "0x0"},
+            "threads": [{"frames": [{"frame": 0, "module": "ntdll.dll", "missing_symbols": True}]}],
+            "modules": [
+                {
+                    # Real minidump-stackwalk behavior: module loaded in process but NOT on any
+                    # stack frame => loaded_symbols=False AND missing_symbols=False.
+                    "filename": "advapi32.dll",
+                    "debug_file": "advapi32.pdb",
+                    "debug_id": "CD58A18DC9D5B08B75F2A08F368012E01",
+                    "loaded_symbols": False,
+                    "missing_symbols": False,
+                },
+                {
+                    # Stripped third-party DLL with empty debug_file and all-zero debug_id.
+                    "filename": "swscale-8.dll",
+                    "debug_file": "",
+                    "debug_id": "000000000000000000000000000000000",
+                    "loaded_symbols": False,
+                    "missing_symbols": True,
+                },
+                {
+                    # Stack-referenced module whose symbol is genuinely missing.
+                    "filename": "ntdll.dll",
+                    "debug_file": "ntdll.pdb",
+                    "debug_id": "23E72AA7E3873AC79882BF6E394DA71E1",
+                    "loaded_symbols": False,
+                    "missing_symbols": True,
+                },
+                {
+                    # Corrupt symbol should still be reported as missing/actionable.
+                    "filename": "broken.dll",
+                    "debug_file": "broken.pdb",
+                    "debug_id": "111122223333444455556666777788881",
+                    "loaded_symbols": False,
+                    "missing_symbols": False,
+                    "corrupt_symbols": True,
+                },
+            ],
+        }
+    )
+    missing_files = [m["debug_file"] for m in res.missing_symbols_json]
+    assert missing_files == ["ntdll.pdb", "broken.pdb"]
+    assert res.parsed_summary_json["missing_symbol_count"] == 2
+
+
+async def test_parse_dump_case_insensitive_alias_resolves_mismatched_sym_path(
+    storage_manager: StorageManager,
+    test_settings: Settings,
+    tmp_path: Path,
+) -> None:
+    raw_dmp = tmp_path / "case.dmp"
+    raw_dmp.write_bytes(b"MDMP_CASE_TEST")
+    rel_zst, _, _ = storage_manager.compress_dump(raw_dmp, "crash-case-alias")
+
+    did = "9F44CD88EBBD578238F8398C4D3CC05E1"
+    # Store symbol on disk with UPPERCASE filename while minidump requests lowercase.
+    storage_manager.atomic_write_bytes(
+        f"symbols/public_cache/KERNEL32.pdb/{did}/KERNEL32.sym",
+        f"MODULE windows x86_64 {did} KERNEL32.pdb\nPUBLIC 1000 0 BaseThreadInitThunk\n".encode(),
+    )
+
+    calls: list[tuple[str, ...]] = []
+
+    async def case_sensitive_stackwalk(*cmd: str, **_kwargs: Any) -> Any:
+        calls.append(cmd)
+        # Positional symbol dirs follow the staged .dmp path
+        dmp_idx = next(i for i, arg in enumerate(cmd) if arg.endswith(".dmp"))
+        sym_dirs = [Path(p) for p in cmd[dmp_idx + 1 :]]
+        # Strictly case-sensitive lookup matching Linux behavior
+        exact_found = any(
+            (d / "kernel32.pdb" / did / "kernel32.sym").is_file()
+            and any(entry.name == "kernel32.pdb" for entry in d.iterdir())
+            for d in sym_dirs
+            if d.is_dir()
+        )
+        payload = {
+            "crash_info": {"type": "EXCEPTION_ACCESS_VIOLATION_READ", "address": "0x0"},
+            "threads": [
+                {
+                    "thread_id": 1,
+                    "frames": [
+                        {
+                            "frame": 0,
+                            "offset": "0x7ff900001000",
+                            "module": "kernel32.dll",
+                            "function": "BaseThreadInitThunk" if exact_found else None,
+                            "missing_symbols": not exact_found,
+                        }
+                    ],
+                }
+            ],
+            "modules": [
+                {
+                    "filename": "kernel32.dll",
+                    "debug_file": "kernel32.pdb",
+                    "debug_id": did,
+                    "loaded_symbols": exact_found,
+                    "missing_symbols": not exact_found,
+                },
+                {
+                    # Hostile path traversal debug_file must be ignored safely.
+                    "filename": "evil.dll",
+                    "debug_file": "../evil.pdb",
+                    "debug_id": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA1",
+                    "loaded_symbols": False,
+                    "missing_symbols": True,
+                },
+            ],
+        }
+        out = json.dumps(payload).encode("utf-8")
+
+        class _Proc:
+            returncode = 0
+
+            async def communicate(self) -> tuple[bytes, bytes]:
+                return out, b""
+
+            def kill(self) -> None:
+                pass
+
+        return _Proc()
+
+    result = await parse_dump(
+        rel_zst,
+        storage_manager,
+        test_settings,
+        exec_fn=case_sensitive_stackwalk,
+    )
+    assert len(calls) == 2
+    assert result.parsed_stacks_json["threads"][0]["frames"][0]["function"] == "BaseThreadInitThunk"
+    assert [m["debug_file"] for m in result.missing_symbols_json] == ["../evil.pdb"]
+    assert list(storage_manager.partition_path("staging").iterdir()) == []
+
+
+async def test_parse_dump_normalizes_windows_absolute_debug_file_path(
+    storage_manager: StorageManager,
+    test_settings: Settings,
+) -> None:
+    import uuid
+
+    crash_id = uuid.uuid4()
+    raw_dmp = storage_manager.data_dir / "abs_path.dmp"
+    raw_dmp.write_bytes(b"MDMP_ABS")
+    rel_zst, _, _ = storage_manager.compress_dump(raw_dmp, crash_id)
+    raw_dmp.unlink(missing_ok=True)
+
+    did = "9F44CD88EBBD578238F8398C4D3CC05E1"
+    storage_manager.atomic_write_bytes(
+        f"symbols/public_cache/KERNEL32.pdb/{did}/KERNEL32.sym",
+        f"MODULE windows x86_64 {did} KERNEL32.pdb\nPUBLIC 1000 0 BaseThreadInitThunk\n".encode(),
+    )
+
+    async def fake_stackwalk(*cmd: str, **_kwargs: Any) -> Any:
+        dmp_idx = next(i for i, arg in enumerate(cmd) if arg.endswith(".dmp"))
+        sym_dirs = [Path(p) for p in cmd[dmp_idx + 1 :]]
+        exact_found = any(
+            (d / "kernel32.pdb" / did / "kernel32.sym").is_file()
+            and any(entry.name == "kernel32.pdb" for entry in d.iterdir())
+            for d in sym_dirs
+            if d.is_dir()
+        )
+        payload = {
+            "crash_info": {"type": "EXCEPTION_ACCESS_VIOLATION_READ", "address": "0x0"},
+            "threads": [{"thread_id": 1, "frames": [{"frame": 0, "module": "kernel32.dll"}]}],
+            "modules": [
+                {
+                    "filename": r"C:\Windows\System32\kernel32.dll",
+                    "debug_file": r"C:\Windows\System32\kernel32.pdb",
+                    "debug_id": did,
+                    "loaded_symbols": exact_found,
+                    "missing_symbols": not exact_found,
+                },
+                {
+                    "filename": "ntdll.dll",
+                    "debug_file": r"C:\Windows\System32\ntdll.pdb",
+                    "debug_id": "23E72AA7E3873AC79882BF6E394DA71E1",
+                    "loaded_symbols": False,
+                    "missing_symbols": True,
+                },
+            ],
+        }
+        out = json.dumps(payload).encode("utf-8")
+
+        class _Proc:
+            returncode = 0
+
+            async def communicate(self) -> tuple[bytes, bytes]:
+                return out, b""
+
+            def kill(self) -> None:
+                pass
+
+        return _Proc()
+
+    res = await parse_dump(rel_zst, storage_manager, test_settings, exec_fn=fake_stackwalk)
+    assert [m["debug_file"] for m in res.missing_symbols_json] == ["ntdll.pdb"]
+    k32 = next(m for m in res.parsed_stacks_json["modules"] if m["debug_id"] == did)
+    assert k32["loaded_symbols"] is True
+    assert k32["debug_file"] == "kernel32.pdb"

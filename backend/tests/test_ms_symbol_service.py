@@ -21,6 +21,7 @@ from app.services.ms_symbol_service import (
     CIRCUIT_FAILURE_THRESHOLD,
     SYMSRV_USER_AGENT,
     WindowsSymbolCandidate,
+    _is_valid_pdb_identity,
     _normalize_pe_code_ids,
     fetch_and_import_windows_symbols,
     has_cached_symbol,
@@ -814,6 +815,23 @@ def test_parse_manual_ms_target_and_pe_code_id_normalization() -> None:
         debug_file="GraphicsCapture.pdb",
     )
 
+    assert _is_valid_pdb_identity("ntdll.pdb", gc_did) is True
+    assert _is_valid_pdb_identity(".pdb", gc_did) is False
+    assert _is_valid_pdb_identity(" ntdll.pdb", gc_did) is False
+    assert _is_valid_pdb_identity("ntdll:bad.pdb", gc_did) is False
+    assert _is_valid_pdb_identity("ntdll.pdb", gc_did[:32]) is False
+    assert _is_valid_pdb_identity("ntdll.pdb", "0" * 33) is False
+    assert _is_valid_pdb_identity("ntdll.pdb", "0" * 32 + "1") is False
+    assert _is_valid_pdb_identity("ntdll.pdb", "G" * 33) is False
+
+    for bad_did in ("0" * 32, "0" * 33, "0" * 32 + "1", "G" * 33):
+        try:
+            parse_manual_ms_target("ntdll.pdb", bad_did)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"Expected ValueError for bad debug_id={bad_did!r}")
+
 
 async def test_explicit_force_sync_bypasses_allowlist_normalizes_urls_and_upgrades_pe(
     storage_manager: StorageManager,
@@ -922,4 +940,247 @@ async def test_explicit_force_sync_bypasses_allowlist_normalizes_urls_and_upgrad
     assert s2.items[0].has_pe_unwind is True
     await db_session.refresh(row)
     assert row.has_pe_unwind is True
+
+
+def test_expanded_windows_system_modules_and_privacy_invariants() -> None:
+    # Real Windows System32 DLLs seen as bare basenames from minidump-stackwalk
+    for mod, pdb in (
+        ("msvcp_win.dll", "msvcp_win.pdb"),
+        ("kernel.appcore.dll", "Kernel.Appcore.pdb"),
+        ("secur32.dll", "secur32.pdb"),
+        ("wintrust.dll", "wintrust.pdb"),
+        ("fwpuclnt.dll", "fwpuclnt.pdb"),
+        ("clbcatq.dll", "CLBCatQ.pdb"),
+        ("AudioSes.dll", "audioses.pdb"),
+        ("bcryptPrimitives.dll", "bcryptprimitives.pdb"),
+    ):
+        assert is_windows_system_module(
+            filename=mod,
+            code_file=mod,
+            module_name=mod,
+            debug_file=pdb,
+        ), f"Expected Windows system module: {mod}"
+
+    # PDB-only fallback still detects known Windows modules
+    assert is_windows_system_module(
+        filename=None,
+        code_file=None,
+        module_name=None,
+        debug_file="msvcp_win.pdb",
+    )
+
+    # Third-party and proprietary DLLs must remain excluded
+    for mod, pdb in (
+        ("nvwgf2umx.dll", "nvwgf2umx.pdb"),
+        ("nvEncodeAPI64.dll", "nvEncodeAPI64.pdb"),
+        ("boost_log-vc143-mt-x64-1_86.dll", "boost_log-vc143-mt-x64-1_86.pdb"),
+        ("libcurl.dll", "libcurl.pdb"),
+        ("LSRTMP.dll", "LSRTMP.pdb"),
+        ("opus.dll", "opus.pdb"),
+        ("zlib1.dll", "zlib.pdb"),
+    ):
+        assert not is_windows_system_module(
+            filename=mod,
+            code_file=mod,
+            module_name=mod,
+            debug_file=pdb,
+        ), f"Unexpected match for third-party module: {mod}"
+
+
+async def test_import_preserves_requested_casing_callbacks_and_force_circuit(
+    storage_manager: StorageManager,
+    test_settings: Settings,
+) -> None:
+    did = "07672F300BBD98B7671A8D52A55C973E1"
+    started: list[str] = []
+    finished: list[tuple[str, str]] = []
+
+    def ok_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith(f"/audioses.pdb/{did}/audioses.pdb"):
+            return httpx.Response(200, content=FAKE_PDB_BYTES)
+        return httpx.Response(404)
+
+    # dump_syms emits lowercase audioses.pdb even though candidate requested AudioSes.pdb
+    cand = WindowsSymbolCandidate(
+        module_name="AudioSes.dll",
+        debug_file="AudioSes.pdb",
+        debug_id=did,
+        code_file="AudioSes.dll",
+    )
+    settings = test_settings.model_copy(update={"MS_SYMBOL_FETCH_PE_UNWIND": False})
+    summary = await fetch_and_import_windows_symbols(
+        [cand],
+        storage_manager,
+        settings,
+        force=True,
+        bypass_auto_fetch_flag=True,
+        on_item_start=lambda c: started.append(c.debug_file),
+        on_item_done=lambda it: finished.append((it.debug_file, it.status)),
+        exec_fn=make_mock_exec(returncode=0, stdout=_sample_sym("audioses.pdb", did)),
+        http_transport=httpx.MockTransport(ok_handler),
+    )
+    assert summary.imported == 1
+    assert started == ["AudioSes.pdb"]
+    assert finished == [("AudioSes.pdb", "imported")]
+    expected_exact = (
+        storage_manager.partition_path("symbols/public_cache")
+        / "AudioSes.pdb"
+        / did
+        / "AudioSes.sym"
+    )
+    assert expected_exact.is_file()
+
+    # Force batch with sustained outage should trip circuit fresh and short-circuit remaining items
+    offline_calls = 0
+
+    def offline_handler(req: httpx.Request) -> httpx.Response:
+        nonlocal offline_calls
+        offline_calls += 1
+        raise httpx.ConnectError("network down", request=req)
+
+    offline_cands = [
+        WindowsSymbolCandidate(
+            module_name="ntdll.dll",
+            debug_file="ntdll.pdb",
+            debug_id=f"{idx:032X}1",
+            code_file="ntdll.dll",
+        )
+        for idx in range(10, 17)
+    ]
+    done_statuses: list[str] = []
+    offline_summary = await fetch_and_import_windows_symbols(
+        offline_cands,
+        storage_manager,
+        settings,
+        force=True,
+        bypass_auto_fetch_flag=True,
+        max_concurrency=1,
+        on_item_done=lambda it: done_statuses.append(it.status),
+        http_transport=httpx.MockTransport(offline_handler),
+    )
+    assert offline_summary.circuit_open is True
+    assert offline_summary.failed == CIRCUIT_FAILURE_THRESHOLD
+    assert offline_summary.skipped == len(offline_cands) - CIRCUIT_FAILURE_THRESHOLD
+    assert len(done_statuses) == len(offline_cands)
+    assert is_circuit_open(storage_manager)
+
+    # A subsequent force=True retry clears the stale circuit and succeeds when network recovers
+    recover_cand = WindowsSymbolCandidate(
+        module_name="kernel32.dll",
+        debug_file="kernel32.pdb",
+        debug_id=KERNELBASE_DEBUG_ID,
+        code_file="kernel32.dll",
+    )
+    recovered = await fetch_and_import_windows_symbols(
+        [recover_cand],
+        storage_manager,
+        settings,
+        force=True,
+        bypass_auto_fetch_flag=True,
+        exec_fn=make_mock_exec(
+            returncode=0, stdout=_sample_sym("kernel32.pdb", KERNELBASE_DEBUG_ID)
+        ),
+        http_transport=httpx.MockTransport(lambda _r: httpx.Response(200, content=FAKE_PDB_BYTES)),
+    )
+    assert recovered.imported == 1
+    assert not is_circuit_open(storage_manager)
+
+
+async def test_force_sync_cached_pdb_without_pe_returns_cached_hit_not_upgraded(
+    storage_manager: StorageManager,
+    test_settings: Settings,
+    db_session: AsyncSession,
+) -> None:
+    gc_did = "90D28435EAAB109449C47402C53C42D31"
+    raw_code_id = "65A1B2C30001A000"
+    canonical_code_id = "65A1B2C31a000"
+    serve_pe = {"enabled": False}
+    dump_syms_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith(f"/graphicscapture.pdb/{gc_did}/graphicscapture.pdb"):
+            return httpx.Response(200, content=FAKE_PDB_BYTES)
+        if serve_pe["enabled"] and request.url.path.endswith(
+            f"/graphicscapture.dll/{canonical_code_id}/graphicscapture.dll"
+        ):
+            return httpx.Response(200, content=FAKE_PE_BYTES)
+        return httpx.Response(404)
+
+    async def counting_dump_syms(*cmd: str, **_kwargs: Any) -> Any:
+        nonlocal dump_syms_calls
+        dump_syms_calls += 1
+        has_pe = len(cmd) >= 3
+        out = _sample_sym(
+            "GraphicsCapture.pdb",
+            gc_did,
+            canonical_code_id if has_pe else None,
+        )
+
+        class _Proc:
+            returncode = 0
+
+            async def communicate(self) -> tuple[bytes, bytes]:
+                return out, b""
+
+            def kill(self) -> None:
+                pass
+
+        return _Proc()
+
+    cand = parse_manual_ms_target("GraphicsCapture.dll", gc_did, code_id=raw_code_id)
+
+    # 1. First sync imports PDB-only (PE 404)
+    s1 = await fetch_and_import_windows_symbols(
+        [cand],
+        storage_manager,
+        test_settings,
+        session=db_session,
+        explicit_targets=True,
+        force=True,
+        bypass_auto_fetch_flag=True,
+        exec_fn=counting_dump_syms,
+        http_transport=httpx.MockTransport(handler),
+    )
+    assert s1.imported == 1
+    assert s1.upgraded == 0
+    assert s1.items[0].has_pe_unwind is False
+    assert dump_syms_calls == 1
+
+    # 2. Second force sync when PE is STILL 404 must report cached_hit (NOT fake 'upgraded')
+    # and skip redundant dump_syms conversion.
+    s2 = await fetch_and_import_windows_symbols(
+        [cand],
+        storage_manager,
+        test_settings,
+        session=db_session,
+        explicit_targets=True,
+        force=True,
+        bypass_auto_fetch_flag=True,
+        exec_fn=counting_dump_syms,
+        http_transport=httpx.MockTransport(handler),
+    )
+    assert s2.upgraded == 0
+    assert s2.imported == 0
+    assert s2.cached_hit == 1
+    assert s2.items[0].status == "cached_hit"
+    assert s2.items[0].has_pe_unwind is False
+    assert dump_syms_calls == 1
+
+    # 3. Third force sync once PE IS available genuinely upgrades with PE unwind
+    serve_pe["enabled"] = True
+    s3 = await fetch_and_import_windows_symbols(
+        [cand],
+        storage_manager,
+        test_settings,
+        session=db_session,
+        explicit_targets=True,
+        force=True,
+        bypass_auto_fetch_flag=True,
+        exec_fn=counting_dump_syms,
+        http_transport=httpx.MockTransport(handler),
+    )
+    assert s3.upgraded == 1
+    assert s3.items[0].status == "upgraded"
+    assert s3.items[0].has_pe_unwind is True
+    assert dump_syms_calls > 1
 

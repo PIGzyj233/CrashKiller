@@ -14,7 +14,7 @@ import shutil
 import struct
 import time
 import uuid
-from collections.abc import Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -89,44 +89,137 @@ KNOWN_WINDOWS_SYSTEM_MODULES: frozenset[str] = frozenset(
         "shell32.dll",
         "shlwapi.dll",
         "shcore.dll",
+        "shfolder.dll",
+        "comctl32.dll",
+        "comdlg32.dll",
+        "gdiplus.dll",
+        "oleacc.dll",
+        "uiautomationcore.dll",
+        "winspool.drv",
+        "msimg32.dll",
+        "usp10.dll",
+        "normaliz.dll",
+        "urlmon.dll",
+        "iertutil.dll",
         "ws2_32.dll",
+        "wsock32.dll",
         "winhttp.dll",
         "wininet.dll",
+        "webio.dll",
+        "httpapi.dll",
+        "websocket.dll",
         "crypt32.dll",
+        "cryptsp.dll",
+        "cryptnet.dll",
+        "cryptbase.dll",
+        "cryptui.dll",
+        "cryptngc.dll",
+        "certcli.dll",
         "bcrypt.dll",
         "bcryptprimitives.dll",
+        "ncrypt.dll",
+        "ncryptsslp.dll",
+        "ntasn1.dll",
+        "msasn1.dll",
+        "rsaenh.dll",
+        "schannel.dll",
+        "dpapi.dll",
+        "wintrust.dll",
+        "wldp.dll",
+        "secur32.dll",
+        "sspicli.dll",
+        "authz.dll",
+        "gpapi.dll",
+        "mskeyprotect.dll",
+        "tbs.dll",
         "dbghelp.dll",
         "dbgcore.dll",
+        "imagehlp.dll",
+        "wer.dll",
+        "faultrep.dll",
         "imm32.dll",
         "uxtheme.dll",
         "dwmapi.dll",
         "dwmcore.dll",
         "dcomp.dll",
+        "dataexchange.dll",
         "graphicscapture.dll",
         "coremessaging.dll",
         "coreuicomponents.dll",
         "twinapi.dll",
         "twinapi.appcore.dll",
+        "twinui.appcore.dll",
+        "twinui.pcshell.dll",
         "rometadata.dll",
         "winsta.dll",
         "textinputframework.dll",
+        "textshaping.dll",
         "inputhost.dll",
+        "globinputhost.dll",
         "directmanipulation.dll",
         "directxdatabasehelper.dll",
         "msctf.dll",
+        "bcp47langs.dll",
+        "bcp47mrm.dll",
         "powrprof.dll",
+        "umpdc.dll",
         "setupapi.dll",
         "cfgmgr32.dll",
+        "devobj.dll",
+        "drvstore.dll",
+        "hid.dll",
+        "winusb.dll",
+        "bluetoothapis.dll",
         "winmm.dll",
+        "winmmbase.dll",
         "avrt.dll",
         "mmdevapi.dll",
         "audioses.dll",
+        "wdmaud.drv",
+        "midimap.dll",
+        "msacm32.dll",
+        "ksuser.dll",
+        "avicap32.dll",
+        "msvfw32.dll",
         "mswsock.dll",
         "dnsapi.dll",
+        "dnsrslvr.dll",
         "iphlpapi.dll",
+        "dhcpcsvc.dll",
+        "dhcpcsvc6.dll",
+        "fwpuclnt.dll",
+        "nlaapi.dll",
+        "nsi.dll",
+        "winnsi.dll",
+        "napinsp.dll",
+        "pnrpnsp.dll",
+        "winrnr.dll",
+        "wshbth.dll",
+        "wshunix.dll",
+        "rasadhlp.dll",
+        "rasapi32.dll",
+        "rasman.dll",
+        "rtutils.dll",
+        "netprofm.dll",
+        "npmproxy.dll",
+        "ondemandconnroutehelper.dll",
+        "wlanapi.dll",
+        "wlanutil.dll",
+        "wcmsvc.dll",
         "netapi32.dll",
-        "sspicli.dll",
-        "cryptbase.dll",
+        "netutils.dll",
+        "wkscli.dll",
+        "srvcli.dll",
+        "samcli.dll",
+        "logoncli.dll",
+        "mpr.dll",
+        "cscapi.dll",
+        "davclnt.dll",
+        "ntlanman.dll",
+        "wkssvc.dll",
+        "wldap32.dll",
+        "winscard.dll",
+        "sensapi.dll",
         "ntmarta.dll",
         "version.dll",
         "psapi.dll",
@@ -135,6 +228,37 @@ KNOWN_WINDOWS_SYSTEM_MODULES: frozenset[str] = frozenset(
         "profapi.dll",
         "propsys.dll",
         "wintypes.dll",
+        "kernel.appcore.dll",
+        "clbcatq.dll",
+        "resourcepolicyclient.dll",
+        "policymanager.dll",
+        "rmclient.dll",
+        "apphelp.dll",
+        "sxs.dll",
+        "msi.dll",
+        "cabinet.dll",
+        "xmllite.dll",
+        "msxml6.dll",
+        "msxml3.dll",
+        "webservices.dll",
+        "fltlib.dll",
+        "pdh.dll",
+        "wevtapi.dll",
+        "wbemprox.dll",
+        "wbemcomn.dll",
+        "wbemsvc.dll",
+        "fastprox.dll",
+        "wmiutils.dll",
+        "taskschd.dll",
+        "sfc.dll",
+        "sfc_os.dll",
+        "linkinfo.dll",
+        "ntshrui.dll",
+        "edputil.dll",
+        "cldapi.dll",
+        "slc.dll",
+        "sppc.dll",
+        "d3d8.dll",
         "d3d9.dll",
         "d3d10.dll",
         "d3d10_1.dll",
@@ -144,29 +268,54 @@ KNOWN_WINDOWS_SYSTEM_MODULES: frozenset[str] = frozenset(
         "d3d12.dll",
         "d3d12core.dll",
         "d3dcompiler_47.dll",
+        "ddraw.dll",
+        "dinput8.dll",
+        "dsound.dll",
+        "dxva2.dll",
         "dxgi.dll",
         "dxcore.dll",
         "d2d1.dll",
         "dwrite.dll",
         "dxil.dll",
         "dxcompiler.dll",
+        "directml.dll",
+        "opengl32.dll",
+        "glu32.dll",
+        "wincodec.dll",
+        "windowscodecs.dll",
+        "mscms.dll",
+        "coloradapterclient.dll",
+        "mf.dll",
         "mfplat.dll",
         "mfcore.dll",
         "mfreadwrite.dll",
+        "mfsrcsnk.dll",
+        "mftranscode.dll",
         "evr.dll",
+        "quartz.dll",
+        "devenum.dll",
         "xinput1_4.dll",
         "xinput1_3.dll",
         "xaudio2_9.dll",
         "clr.dll",
+        "clrjit.dll",
         "coreclr.dll",
         "mscoree.dll",
+        "mscoreei.dll",
         "mscorwks.dll",
+        "fusion.dll",
+        "diasymreader.dll",
+        "msvcp_win.dll",
+        "msvcp110_win.dll",
         "msvcp140_2.dll",
         "msvcp140_atomic_wait.dll",
         "msvcp140_codecvt_ids.dll",
         "vcruntime140_threads.dll",
+        "ucrtbase_clr0400.dll",
         "msvcr120.dll",
         "msvcp120.dll",
+        "msvcr120_clr0400.dll",
+        "msvcp120_clr0400.dll",
         "msvcr110.dll",
         "msvcp110.dll",
         "msvcr100.dll",
@@ -174,6 +323,29 @@ KNOWN_WINDOWS_SYSTEM_MODULES: frozenset[str] = frozenset(
         "vccorlib140.dll",
         "mfc140u.dll",
         "mfc140.dll",
+        "rtworkq.dll",
+        "d3d9on12.dll",
+        "d3d11_3.dll",
+        "dxgidebug.dll",
+        "dbgeng.dll",
+        "dbgmodel.dll",
+        "symsrv.dll",
+        "olepro32.dll",
+        "riched20.dll",
+        "msftedit.dll",
+        "credui.dll",
+        "kerberos.dll",
+        "msv1_0.dll",
+        "wdigest.dll",
+        "duser.dll",
+        "dui70.dll",
+        "explorerframe.dll",
+        "actxprxy.dll",
+        "esent.dll",
+        "mlang.dll",
+        "compkgsup.dll",
+        "msvproc.dll",
+        "colorcnv.dll",
     }
 )
 
@@ -193,6 +365,9 @@ KNOWN_WINDOWS_MODULE_PREFIXES: tuple[str, ...] = (
     "xaudio2_",
     "xinput1_",
     "wow64",
+    "twinapi",
+    "staterepository.",
+    "appxdeployment",
 )
 
 
@@ -306,6 +481,9 @@ class _PdbMetadata:
         return f"{self.guid.hex.upper()}{age:X}"
 
 
+_ABS_DRIVE_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
+
+
 def _basename(path_str: str) -> str:
     cleaned = path_str.replace("\\", "/").rstrip("/")
     return cleaned.rsplit("/", 1)[-1] if cleaned else ""
@@ -317,6 +495,25 @@ def _is_safe_segment(value: str) -> bool:
     except SymbolConversionError:
         return False
     return True
+
+
+def normalize_debug_file_name(raw_debug_file: str) -> str:
+    """Strip clean absolute Windows/POSIX paths to basename while keeping traversal strings raw."""
+    cleaned = raw_debug_file.strip()
+    if not cleaned or "\x00" in cleaned:
+        return cleaned
+    if "/" not in cleaned and "\\" not in cleaned:
+        return cleaned
+    # Only strip clean absolute paths (e.g. C:\Windows\System32\ntdll.pdb) without '..' segments;
+    # leave relative/hostile paths (like ../evil.pdb) untouched so _is_safe_segment rejects them.
+    is_abs = bool(_ABS_DRIVE_PATH_RE.match(cleaned)) or cleaned.startswith("/")
+    if not is_abs:
+        return cleaned
+    parts = [p for p in cleaned.replace("\\", "/").split("/") if p]
+    if any(p == ".." or ".." in p for p in parts):
+        return cleaned
+    leaf = parts[-1] if parts else ""
+    return leaf if _is_safe_segment(leaf) else cleaned
 
 
 def _is_symsrv_url(raw_url: str) -> tuple[bool, str]:
@@ -400,6 +597,9 @@ def is_windows_system_module(
             low = candidate_name.strip().lower()
             if low:
                 names.append(low)
+    pdb_base = _basename(debug_file).strip().lower()
+    if pdb_base.endswith(".pdb") and len(pdb_base) > 4:
+        names.append(f"{pdb_base[:-4]}.dll")
 
     for name in names:
         if name in KNOWN_WINDOWS_SYSTEM_MODULES:
@@ -411,13 +611,19 @@ def is_windows_system_module(
 
 
 def _is_valid_pdb_identity(debug_file: str, debug_id: str) -> bool:
-    if not debug_file or not debug_file.lower().endswith(".pdb"):
+    if not debug_file or debug_file != debug_file.strip():
         return False
-    if len(debug_file) > 255 or not _is_safe_segment(debug_file):
+    if len(debug_file) <= 4 or not debug_file.lower().endswith(".pdb"):
+        return False
+    if (
+        len(debug_file) > 255
+        or not _is_safe_segment(debug_file)
+        or _INVALID_MANUAL_NAME_RE.search(debug_file)
+    ):
         return False
     if not debug_id or not _DEBUG_ID_RE.match(debug_id):
         return False
-    if _ALL_ZERO_RE.match(debug_id):
+    if _ALL_ZERO_RE.match(debug_id) or _ALL_ZERO_RE.match(debug_id[:32]):
         return False
     return True
 
@@ -573,14 +779,25 @@ def parse_manual_ms_target(
 def _find_local_sym_in_root(root: Path, debug_file: str, debug_id: str) -> Path | None:
     if not root.exists():
         return None
-    stem = Path(debug_file).stem or debug_file
-    exact = root / debug_file / debug_id.upper() / f"{stem}.sym"
-    if exact.is_file():
-        return exact
+    base_df = normalize_debug_file_name(debug_file)
+    if not _is_safe_segment(base_df) or not _is_safe_segment(debug_id):
+        return None
+    stem = Path(base_df).stem or base_df
+    candidate_leaves = [f"{stem}.sym"]
+    full_leaf = f"{base_df}.sym"
+    if full_leaf.lower() != candidate_leaves[0].lower():
+        candidate_leaves.append(full_leaf)
+
+    upper_did = debug_id.upper()
+    for leaf in candidate_leaves:
+        exact = root / base_df / upper_did / leaf
+        if exact.is_file():
+            return exact
+
     # Case-insensitive fallback for Linux hosts storing Windows PDB names
-    df_low = debug_file.lower()
+    df_low = base_df.lower()
     did_low = debug_id.lower()
-    sym_low = f"{stem}.sym".lower()
+    sym_lows = {leaf.lower() for leaf in candidate_leaves}
     try:
         for df_entry in root.iterdir():
             if not df_entry.is_dir() or df_entry.name.lower() != df_low:
@@ -589,7 +806,7 @@ def _find_local_sym_in_root(root: Path, debug_file: str, debug_id: str) -> Path 
                 if not id_entry.is_dir() or id_entry.name.lower() != did_low:
                     continue
                 for file_entry in id_entry.iterdir():
-                    if file_entry.is_file() and file_entry.name.lower() == sym_low:
+                    if file_entry.is_file() and file_entry.name.lower() in sym_lows:
                         return file_entry
     except OSError:
         return None
@@ -1617,18 +1834,24 @@ async def _persist_public_msdl_symbol(
         return res.symbol.id, res.upgraded
 
     if session_factory is not None:
-        async with session_factory() as own_session:
-            res = await store_public_symbol(
-                own_session,
-                storage,
-                settings,
-                sym_bytes=sym_bytes,
-                header=header,
-                source="msdl",
-                staged_pdb=staged_pdb,
-                staged_pe=staged_pe,
-            )
-            return res.symbol.id, res.upgraded
+        async def _write_with_own_session() -> tuple[uuid.UUID | None, bool]:
+            async with session_factory() as own_session:
+                res = await store_public_symbol(
+                    own_session,
+                    storage,
+                    settings,
+                    sym_bytes=sym_bytes,
+                    header=header,
+                    source="msdl",
+                    staged_pdb=staged_pdb,
+                    staged_pe=staged_pe,
+                )
+                return res.symbol.id, res.upgraded
+
+        if db_lock is not None:
+            async with db_lock:
+                return await _write_with_own_session()
+        return await _write_with_own_session()
 
     rel_sym_path = _public_cache_sym_rel(header.debug_file, header.debug_id)
     _resolve_in_partition(storage, "symbols/public_cache", rel_sym_path)
@@ -1810,6 +2033,14 @@ async def _import_single_candidate(
                     allow_winbindex=allow_winbindex,
                 )
 
+            if was_upgrade and pe_path is None:
+                clear_negative_cache(storage, candidate.debug_file, candidate.debug_id)
+                return _result(
+                    "cached_hit",
+                    "Already cached locally (PE unwind unavailable)",
+                    has_pe_unwind=False,
+                )
+
             # Convert PDB (+ optional PE) into Breakpad .sym via dump_syms.
             pe_used = False
             try:
@@ -1893,6 +2124,16 @@ async def _import_single_candidate(
                 return _result("skipped", "Public symbol cache quota or host disk floor reached")
 
             # Preserve requested debug_file casing if header only differs by case
+            if (
+                header.debug_file.lower() == candidate.debug_file.lower()
+                and header.debug_file != candidate.debug_file
+                and _is_safe_segment(candidate.debug_file)
+            ):
+                cand_stem = Path(candidate.debug_file).stem or candidate.debug_file
+                if _is_safe_segment(cand_stem):
+                    header.debug_file = candidate.debug_file
+                    header.stem = cand_stem
+
             sym_id, db_upgraded = await _persist_public_msdl_symbol(
                 session=session,
                 session_factory=session_factory,
@@ -1905,7 +2146,15 @@ async def _import_single_candidate(
                 staged_pe=pe_path if pe_used and header.has_unwind_records else None,
             )
             clear_negative_cache(storage, candidate.debug_file, candidate.debug_id)
-            status_label = "upgraded" if (was_upgrade or db_upgraded) else "imported"
+            if was_upgrade and not header.has_unwind_records and not db_upgraded:
+                return _result(
+                    "cached_hit",
+                    "Already cached locally (PE unwind unavailable)",
+                    has_pe_unwind=False,
+                    symbol_id=sym_id,
+                )
+            is_upgraded = db_upgraded or (was_upgrade and header.has_unwind_records)
+            status_label = "upgraded" if is_upgraded else "imported"
             logger.info(
                 "%s Windows/public symbol from MSDL: %s/%s (%d bytes, pe_unwind=%s)",
                 status_label.capitalize(),
@@ -1927,6 +2176,14 @@ async def _import_single_candidate(
             )
 
 
+async def _invoke_callback(callback: Any, arg: Any) -> None:
+    if callback is None:
+        return
+    maybe_coro = callback(arg)
+    if maybe_coro is not None and asyncio.iscoroutine(maybe_coro):
+        await maybe_coro
+
+
 async def fetch_and_import_windows_symbols(
     candidates: Iterable[WindowsSymbolCandidate],
     storage: StorageManager,
@@ -1939,6 +2196,9 @@ async def fetch_and_import_windows_symbols(
     force: bool = False,
     bypass_auto_fetch_flag: bool = False,
     allow_winbindex: bool = False,
+    max_concurrency: int = MAX_MS_FETCH_CONCURRENCY,
+    on_item_start: Callable[[WindowsSymbolCandidate], Awaitable[None] | None] | None = None,
+    on_item_done: Callable[[MSFetchItemResult], Awaitable[None] | None] | None = None,
     exec_fn: Any = None,
     cab_exec_fn: Any = None,
     http_transport: httpx.AsyncBaseTransport | None = None,
@@ -1956,37 +2216,41 @@ async def fetch_and_import_windows_symbols(
         if bypass_auto_fetch_flag:
             for cand in candidate_list:
                 summary.skipped += 1
-                summary.items.append(
-                    MSFetchItemResult(
-                        module_name=cand.module_name,
-                        debug_file=cand.debug_file,
-                        debug_id=cand.debug_id,
-                        status="skipped",
-                        detail="No SymSrv/MSDL URL configured in PUBLIC_SYMBOL_URLS",
-                    )
-                )
-        return summary
-
-    if not force and is_circuit_open(storage):
-        summary.circuit_open = True
-        for cand in candidate_list:
-            summary.skipped += 1
-            summary.items.append(
-                MSFetchItemResult(
+                item = MSFetchItemResult(
                     module_name=cand.module_name,
                     debug_file=cand.debug_file,
                     debug_id=cand.debug_id,
                     status="skipped",
-                    detail="MSDL circuit breaker is temporarily open",
+                    detail="No SymSrv/MSDL URL configured in PUBLIC_SYMBOL_URLS",
                 )
+                summary.items.append(item)
+                await _invoke_callback(on_item_done, item)
+        return summary
+
+    if force:
+        # Clear any stale circuit-breaker cooldown before an explicit user retry;
+        # consecutive network errors during this batch will still trip it fresh.
+        reset_circuit_breaker(storage)
+    elif is_circuit_open(storage):
+        summary.circuit_open = True
+        for cand in candidate_list:
+            summary.skipped += 1
+            item = MSFetchItemResult(
+                module_name=cand.module_name,
+                debug_file=cand.debug_file,
+                debug_id=cand.debug_id,
+                status="skipped",
+                detail="MSDL circuit breaker is temporarily open",
             )
+            summary.items.append(item)
+            await _invoke_callback(on_item_done, item)
         return summary
 
     if not candidate_list:
         return summary
 
-    sem = asyncio.Semaphore(MAX_MS_FETCH_CONCURRENCY)
-    db_lock = asyncio.Lock() if session is not None else None
+    sem = asyncio.Semaphore(max(1, int(max_concurrency)))
+    db_lock = asyncio.Lock() if (session is not None or session_factory is not None) else None
     client_kwargs: dict[str, Any] = {
         "follow_redirects": True,
         "headers": {"User-Agent": SYMSRV_USER_AGENT},
@@ -1998,7 +2262,15 @@ async def fetch_and_import_windows_symbols(
 
         async def _worker(cand: WindowsSymbolCandidate) -> MSFetchItemResult:
             async with sem:
-                if not force and is_circuit_open(storage):
+                if is_circuit_open(storage):
+                    circuit_item = MSFetchItemResult(
+                        module_name=cand.module_name,
+                        debug_file=cand.debug_file,
+                        debug_id=cand.debug_id,
+                        status="skipped",
+                        detail="MSDL circuit breaker opened during batch",
+                    )
+                    await _invoke_callback(on_item_done, circuit_item)
                     return MSFetchItemResult(
                         module_name=cand.module_name,
                         debug_file=cand.debug_file,
@@ -2006,8 +2278,9 @@ async def fetch_and_import_windows_symbols(
                         status="circuit_open",
                         detail="MSDL circuit breaker opened during batch",
                     )
+                await _invoke_callback(on_item_start, cand)
                 try:
-                    return await _import_single_candidate(
+                    res = await _import_single_candidate(
                         candidate=cand,
                         symsrv_urls=symsrv_urls,
                         client=client,
@@ -2032,13 +2305,15 @@ async def fetch_and_import_windows_symbols(
                         cand.debug_id,
                         exc_info=True,
                     )
-                    return MSFetchItemResult(
+                    res = MSFetchItemResult(
                         module_name=cand.module_name,
                         debug_file=cand.debug_file,
                         debug_id=cand.debug_id,
                         status="failed",
                         detail=str(exc) or type(exc).__name__,
                     )
+                await _invoke_callback(on_item_done, res)
+                return res
 
         results = await asyncio.gather(*(_worker(c) for c in candidate_list))
 
@@ -2098,6 +2373,7 @@ __all__ = [
     "is_circuit_open",
     "is_negative_cached",
     "is_windows_system_module",
+    "normalize_debug_file_name",
     "parse_manual_ms_target",
     "reset_circuit_breaker",
     "select_windows_system_candidates",

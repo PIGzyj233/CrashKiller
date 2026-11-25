@@ -39,7 +39,7 @@ type CompatModule = Omit<LoadedModule, "filename"> & {
   filename?: string | null;
   module_name?: string | null;
 };
-type ModuleFilter = "all" | "loaded" | "missing" | "corrupt";
+type ModuleFilter = "all" | "loaded" | "missing" | "unreferenced" | "corrupt";
 
 function getThreadId(thread: CompatThread): number | undefined {
   return thread.id ?? thread.thread_id ?? undefined;
@@ -164,10 +164,13 @@ function getModuleStatus(mod: CompatModule): Exclude<ModuleFilter, "all"> {
   if (mod.corrupt_symbols) {
     return "corrupt";
   }
-  if (mod.missing_symbols || mod.loaded_symbols === false) {
+  if (mod.loaded_symbols === true) {
+    return "loaded";
+  }
+  if (mod.missing_symbols === true || mod.missing_symbols === undefined) {
     return "missing";
   }
-  return "loaded";
+  return "unreferenced";
 }
 
 export function StackTraceViewer({
@@ -334,14 +337,16 @@ export function StackTraceViewer({
   const moduleCounts = useMemo(() => {
     let loaded = 0;
     let missing = 0;
+    let unreferenced = 0;
     let corrupt = 0;
     for (const mod of modules) {
       const st = getModuleStatus(mod);
       if (st === "loaded") loaded += 1;
       else if (st === "missing") missing += 1;
+      else if (st === "unreferenced") unreferenced += 1;
       else corrupt += 1;
     }
-    return { loaded, missing, corrupt };
+    return { loaded, missing, unreferenced, corrupt };
   }, [modules]);
 
   const filteredModules = useMemo(() => {
@@ -1067,6 +1072,16 @@ export function StackTraceViewer({
                   { id: "all", label: t("stack.filterAll", { count: modules.length }) },
                   { id: "loaded", label: t("stack.filterLoaded", { count: moduleCounts.loaded }) },
                   { id: "missing", label: t("stack.filterMissing", { count: moduleCounts.missing }) },
+                  ...(moduleCounts.unreferenced > 0
+                    ? [
+                        {
+                          id: "unreferenced" as const,
+                          label: t("stack.filterUnreferenced", {
+                            count: moduleCounts.unreferenced,
+                          }),
+                        },
+                      ]
+                    : []),
                   { id: "corrupt", label: t("stack.filterCorrupt", { count: moduleCounts.corrupt }) },
                 ] as const
               ).map((pill) => (
@@ -1151,6 +1166,10 @@ export function StackTraceViewer({
                           ) : modStatus === "corrupt" ? (
                             <span className="inline-flex rounded border border-rose-200 bg-rose-50 px-2 py-0.5 text-[11px] font-medium text-rose-700">
                               {t("stack.statusCorrupt")}
+                            </span>
+                          ) : modStatus === "unreferenced" ? (
+                            <span className="inline-flex rounded border border-slate-200 bg-slate-100 px-2 py-0.5 text-[11px] font-medium text-slate-600">
+                              {t("stack.statusUnreferenced")}
                             </span>
                           ) : (
                             <span className="inline-flex rounded border border-amber-200 bg-amber-50 px-2 py-0.5 text-[11px] font-medium text-amber-800">

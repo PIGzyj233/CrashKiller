@@ -191,3 +191,47 @@ async def test_resymbolicate_missing_reserves_only_eligible_reports(
             )) == "TRIAGING"
     finally:
         await dispatcher.drain_and_cancel()
+
+
+async def test_resymbolicate_reports_skipped_active_count(
+    async_engine: AsyncEngine, test_settings: Settings, storage_manager: StorageManager,
+) -> None:
+    factory = async_sessionmaker(async_engine, expire_on_commit=False, autoflush=False)
+    dispatcher = TaskDispatcher(
+        test_settings, storage_manager, InMemoryEventBus(), factory, arq_pool=FlakyQueue(),
+    )
+    try:
+        async with factory() as session:
+            project = Project(key="active-skip", name="Active Skip", api_key_hash="placeholder")
+            session.add(project)
+            await session.flush()
+            idle = CrashReport(
+                project_id=project.id,
+                status="ANALYZED",
+                app_version="1",
+                dump_path="idle.dmp",
+                missing_symbols_json=[{"debug_id": "EXPECTED"}],
+            )
+            active = CrashReport(
+                project_id=project.id,
+                status="PARSING",
+                app_version="1",
+                dump_path="active.dmp",
+                missing_symbols_json=[{"debug_id": "EXPECTED"}],
+            )
+            session.add_all([idle, active])
+            await session.commit()
+
+            request = ResymbolicateRequest(project_id=project.id, missing_only=True)
+            first = await resymbolicate_crashes(request, session, dispatcher, storage_manager)
+            assert first.queued_count == 1
+            assert first.crash_ids == [idle.id]
+            assert first.skipped_active_count == 1
+            assert first.active_crash_ids == [active.id]
+
+            second = await resymbolicate_crashes(request, session, dispatcher, storage_manager)
+            assert second.queued_count == 0
+            assert second.skipped_active_count == 2
+            assert set(second.active_crash_ids) == {idle.id, active.id}
+    finally:
+        await dispatcher.drain_and_cancel()

@@ -3,6 +3,7 @@ import { AlertTriangle, CheckCircle2, CloudDownload, Loader2, X } from "lucide-r
 import { ApiError, syncPublicSymbols } from "../api/client";
 import type { PublicSymbolSyncResponse } from "../api/types";
 import { useAppI18n } from "../i18n";
+import { isValidMsSyncDebugId } from "../utils/symbolIdentity";
 
 export interface PublicSymbolSyncModalProps {
   isOpen: boolean;
@@ -70,7 +71,7 @@ export function PublicSymbolSyncModal({
       setErrorMessage(t("symbols.syncModalErrName"));
       return;
     }
-    if (trimmedDebugId.length < 32) {
+    if (!isValidMsSyncDebugId(trimmedDebugId)) {
       setErrorMessage(t("symbols.syncModalErrDebugId"));
       return;
     }
@@ -109,6 +110,9 @@ export function PublicSymbolSyncModal({
     (firstItem.status === "imported" ||
       firstItem.status === "upgraded" ||
       firstItem.status === "cached_hit");
+  const queuedCount = lastResult?.resymbolicate_queued_count ?? 0;
+  const skippedActiveCount =
+    lastResult?.resymbolicate_skipped_active_count ?? 0;
 
   return (
     <div
@@ -185,14 +189,27 @@ export function PublicSymbolSyncModal({
                   </div>
                   {firstItem.detail && <div>{firstItem.detail}</div>}
                   {isSuccess && (
-                    <div>
-                      {firstItem.has_pe_unwind
-                        ? t("symbols.peUnwindOk")
-                        : t("symbols.peUnwindMissing")}
-                      {lastResult && lastResult.resymbolicate_queued_count > 0
-                        ? ` · ${t("symbols.resymQueuedPrefix")}${lastResult.resymbolicate_queued_count}${t("symbols.resymQueuedSuffix")}`
-                        : ""}
-                    </div>
+                    <>
+                      <div>
+                        {firstItem.has_pe_unwind
+                          ? t("symbols.peUnwindOk")
+                          : t("symbols.peUnwindMissing")}
+                        {queuedCount > 0
+                          ? ` · ${t("symbols.resymQueuedPrefix")}${queuedCount}${t("symbols.resymQueuedSuffix")}`
+                          : ""}
+                      </div>
+                      {skippedActiveCount > 0 && (
+                        <div className="font-medium text-amber-800">
+                          {queuedCount > 0
+                            ? t("symbols.resymPartialSkippedNote", {
+                                count: skippedActiveCount,
+                              })
+                            : t("symbols.syncModalResymSkippedActive", {
+                                count: skippedActiveCount,
+                              })}
+                        </div>
+                      )}
+                    </>
                   )}
                 </div>
               </div>
@@ -286,7 +303,7 @@ export function PublicSymbolSyncModal({
               onClick={onClose}
               className="rounded-md border border-slate-300 bg-white px-3.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100 disabled:opacity-50"
             >
-              {t("common.cancel")}
+              {lastResult ? t("common.close") : t("common.cancel")}
             </button>
             <button
               type="submit"

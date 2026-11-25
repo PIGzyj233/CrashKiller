@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import {
   keepPreviousData,
@@ -21,6 +21,7 @@ import {
   RefreshCw,
   RotateCcw,
   Search,
+  Square,
   Terminal,
   Trash2,
   Upload,
@@ -29,18 +30,21 @@ import {
 import {
   ApiError,
   deleteSymbol,
+  getResymbolicateStatus,
   getSymSrvBaseUrl,
-  listMissingSymbols,
+  listMissingSymbolsWithTotal,
   listSymbols,
   resymbolicate,
-  syncPublicSymbols,
+  syncPublicSymbolsStream,
 } from "../api/client";
 import type {
   MissingSymbolQueueItem,
+  PublicSymbolSyncItemResult,
   PublicSymbolSyncItemStatus,
   PublicSymbolSyncRequest,
   PublicSymbolSyncResponse,
   ResymbolicateRequest,
+  ResymbolicateStatusResponse,
   SymbolRead,
   SymbolScope,
 } from "../api/types";
@@ -51,8 +55,55 @@ import {
   type UploadSymbolTargetHint,
 } from "../components/UploadModal";
 import { useAppI18n } from "../i18n";
+import {
+  buildMsSyncTarget,
+  canAutoSyncMissingWindowsItem,
+  canMsSyncMissingItem,
+} from "../utils/symbolIdentity";
 
 const PAGE_SIZE = 25;
+
+interface LiveSyncProgressState {
+  total: number;
+  completed: number;
+  alreadyCached: number;
+  imported: number;
+  upgraded: number;
+  cachedHit: number;
+  notFound: number;
+  skipped: number;
+  failed: number;
+  circuitOpen: boolean;
+  activeModules: string[];
+  results: PublicSymbolSyncItemResult[];
+}
+
+interface CancelledSyncInfo {
+  completed: number;
+  total: number;
+  imported: number;
+  upgraded: number;
+  projectId?: string;
+  results: PublicSymbolSyncItemResult[];
+}
+
+interface TrackedResymState {
+  mode: "queued" | "active_busy";
+  projectId?: string;
+  crashIds: string[];
+  debugId?: string;
+  status: ResymbolicateStatusResponse | null;
+  skippedActiveCount?: number;
+}
+
+function isTrackedResymFinished(state: TrackedResymState): boolean {
+  if (!state.status) {
+    return false;
+  }
+  return state.mode === "active_busy"
+    ? state.status.pending + state.status.parsing + state.status.triaging === 0
+    : state.status.done;
+}
 
 function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes < 0) {
@@ -130,6 +181,15 @@ export function SymbolsPage() {
     null,
   );
   const [activeSyncKey, setActiveSyncKey] = useState<string | null>(null);
+  const [isSyncRunning, setIsSyncRunning] = useState(false);
+  const [syncProgress, setSyncProgress] =
+    useState<LiveSyncProgressState | null>(null);
+  const [syncError, setSyncError] = useState<string | null>(null);
+  const [syncCancelledInfo, setSyncCancelledInfo] =
+    useState<CancelledSyncInfo | null>(null);
+  const syncAbortRef = useRef<AbortController | null>(null);
+  const lastSyncInvalidateRef = useRef<number>(0);
+
   const [selectedMissingKeys, setSelectedMissingKeys] = useState<Set<string>>(
     () => new Set(),
   );
@@ -137,7 +197,11 @@ export function SymbolsPage() {
     queued_count: number;
     crash_ids: string[];
     debug_id?: string;
+    skipped_active_count?: number;
   } | null>(null);
+  const [trackedResym, setTrackedResym] = useState<TrackedResymState | null>(
+    null,
+  );
   const [syncFeedback, setSyncFeedback] =
     useState<PublicSymbolSyncResponse | null>(null);
   const [copiedText, setCopiedText] = useState<string | null>(null);
@@ -242,36 +306,40 @@ export function SymbolsPage() {
       "missing-symbols",
       {
         project_id: selectedProjectId || "",
-        limit: 100,
+        limit: 500,
         offset: 0,
       },
     ],
     queryFn: () =>
-      listMissingSymbols({
+      listMissingSymbolsWithTotal({
         project_id: selectedProjectId || undefined,
-        limit: 100,
+        limit: 500,
         offset: 0,
       }),
   });
 
   const sortedMissingItems = useMemo(
     () =>
-      [...(missingQuery.data ?? [])].sort(
+      [...(missingQuery.data?.items ?? [])].sort(
         (a, b) => b.crash_count - a.crash_count,
       ),
-    [missingQuery.data],
+    [missingQuery.data?.items],
   );
+  const missingTotalCount =
+    missingQuery.data?.total ?? sortedMissingItems.length;
 
   const missingRowKey = (item: MissingSymbolQueueItem) =>
     `${item.debug_file.toLowerCase()}::${item.debug_id.toUpperCase()}`;
 
   const selectableMissingItems = useMemo(
+    () => sortedMissingItems.filter((item) => canMsSyncMissingItem(item)),
+    [sortedMissingItems],
+  );
+
+  const uncachedWindowsMissingCount = useMemo(
     () =>
-      sortedMissingItems.filter(
-        (item) =>
-          item.debug_file.toLowerCase().endsWith(".pdb") &&
-          item.debug_id.length >= 32,
-      ),
+      sortedMissingItems.filter((item) => canAutoSyncMissingWindowsItem(item))
+        .length,
     [sortedMissingItems],
   );
 
@@ -304,46 +372,406 @@ export function SymbolsPage() {
     },
   });
 
+  const invalidateSymbolViews = useCallback(() => {
+    void queryClient.invalidateQueries({ queryKey: ["symbols"] });
+    void queryClient.invalidateQueries({ queryKey: ["missing-symbols"] });
+    void queryClient.invalidateQueries({ queryKey: ["crashes"] });
+    void queryClient.invalidateQueries({ queryKey: ["dashboard"] });
+  }, [queryClient]);
+
+  const startTrackingResym = useCallback(
+    (
+      crashIds: string[],
+      opts?: {
+        mode?: "queued" | "active_busy";
+        projectId?: string;
+        debugId?: string;
+        skippedActiveCount?: number;
+      },
+    ) => {
+      const uniqueIds = Array.from(new Set(crashIds.filter(Boolean))).slice(
+        0,
+        200,
+      );
+      if (uniqueIds.length === 0) {
+        return;
+      }
+      const mode = opts?.mode ?? "queued";
+      setResymFeedback(null);
+      setTrackedResym({
+        mode,
+        projectId: opts?.projectId,
+        crashIds: uniqueIds,
+        debugId: opts?.debugId,
+        skippedActiveCount: opts?.skippedActiveCount,
+        status:
+          mode === "active_busy"
+            ? null
+            : {
+                total: uniqueIds.length,
+                pending: uniqueIds.length,
+                parsing: 0,
+                triaging: 0,
+                analyzed: 0,
+                failed: 0,
+                completed: 0,
+                in_progress: uniqueIds.length,
+                done: false,
+              },
+      });
+    },
+    [],
+  );
+
+  const clearFinishedResymFeedback = useCallback(() => {
+    setTrackedResym((prev) =>
+      prev && isTrackedResymFinished(prev) ? null : prev,
+    );
+    setResymFeedback(null);
+  }, []);
+
+  const applyAutoResymTracking = useCallback(
+    (opts: {
+      crashIds?: string[];
+      activeCrashIds?: string[];
+      skippedActiveCount?: number;
+      projectId?: string;
+      debugId?: string;
+    }) => {
+      const queuedIds = opts.crashIds ?? [];
+      const activeIds = opts.activeCrashIds ?? [];
+      const skippedActive = opts.skippedActiveCount ?? 0;
+
+      if (queuedIds.length > 0) {
+        startTrackingResym(queuedIds, {
+          mode: "queued",
+          projectId: opts.projectId,
+          debugId: opts.debugId,
+          skippedActiveCount: skippedActive,
+        });
+      } else if (skippedActive > 0) {
+        if (activeIds.length > 0) {
+          startTrackingResym(activeIds, {
+            mode: "active_busy",
+            projectId: opts.projectId,
+            debugId: opts.debugId,
+            skippedActiveCount: skippedActive,
+          });
+        } else {
+          clearFinishedResymFeedback();
+          setResymFeedback({
+            queued_count: 0,
+            crash_ids: [],
+            debug_id: opts.debugId,
+            skipped_active_count: skippedActive,
+          });
+        }
+      } else {
+        clearFinishedResymFeedback();
+      }
+    },
+    [clearFinishedResymFeedback, startTrackingResym],
+  );
+
+  useEffect(() => {
+    return () => {
+      syncAbortRef.current?.abort();
+    };
+  }, []);
+
+  const trackedCrashIdsKey = trackedResym?.crashIds.join(",") ?? "";
+  const trackedResymMode = trackedResym?.mode ?? "queued";
+  const trackedResymPollFinished = trackedResym
+    ? isTrackedResymFinished(trackedResym)
+    : true;
+
+  useEffect(() => {
+    if (!trackedCrashIdsKey || trackedResymPollFinished) {
+      return;
+    }
+    const crashIds = trackedCrashIdsKey.split(",").filter(Boolean);
+    if (crashIds.length === 0) {
+      return;
+    }
+    let cancelled = false;
+    let lastSig = "";
+    let timerId: number | null = null;
+
+    const poll = async () => {
+      try {
+        const st = await getResymbolicateStatus(crashIds);
+        if (cancelled) return;
+        const pollDone =
+          trackedResymMode === "active_busy"
+            ? st.pending + st.parsing + st.triaging === 0
+            : st.done;
+        setTrackedResym((prev) =>
+          prev &&
+          prev.crashIds.join(",") === trackedCrashIdsKey &&
+          prev.mode === trackedResymMode
+            ? {
+                ...prev,
+                status: st,
+              }
+            : prev,
+        );
+        const sig = `${st.completed}:${st.pending}:${st.parsing}:${st.triaging}:${st.failed}`;
+        if (sig !== lastSig || pollDone) {
+          lastSig = sig;
+          invalidateSymbolViews();
+        }
+        if (!pollDone && !cancelled) {
+          timerId = window.setTimeout(() => {
+            void poll();
+          }, 1500);
+        }
+      } catch {
+        if (!cancelled) {
+          timerId = window.setTimeout(() => {
+            void poll();
+          }, 3000);
+        }
+      }
+    };
+
+    const initialDelayMs = trackedResymMode === "active_busy" ? 0 : 400;
+    timerId = window.setTimeout(() => {
+      void poll();
+    }, initialDelayMs);
+
+    return () => {
+      cancelled = true;
+      if (timerId !== null) {
+        window.clearTimeout(timerId);
+      }
+    };
+  }, [
+    trackedCrashIdsKey,
+    trackedResymMode,
+    trackedResymPollFinished,
+    invalidateSymbolViews,
+  ]);
+
   const resymMutation = useMutation({
     mutationFn: (payload: ResymbolicateRequest) => resymbolicate(payload),
     onMutate: (vars) => {
       setActiveResymDebugId(vars.debug_id ?? "__ALL__");
-      setResymFeedback(null);
+      clearFinishedResymFeedback();
     },
     onSuccess: (data, vars) => {
-      setResymFeedback({
-        queued_count: data.queued_count,
-        crash_ids: data.crash_ids,
-        debug_id: vars.debug_id,
-      });
-      void queryClient.invalidateQueries({ queryKey: ["missing-symbols"] });
-      void queryClient.invalidateQueries({ queryKey: ["crashes"] });
-      void queryClient.invalidateQueries({ queryKey: ["dashboard"] });
+      if (data.crash_ids.length > 0) {
+        startTrackingResym(data.crash_ids, {
+          mode: "queued",
+          projectId: vars.project_id,
+          debugId: vars.debug_id,
+          skippedActiveCount: data.skipped_active_count,
+        });
+      } else if ((data.skipped_active_count ?? 0) > 0) {
+        const busyIds =
+          data.active_crash_ids && data.active_crash_ids.length > 0
+            ? data.active_crash_ids
+            : vars.crash_ids && vars.crash_ids.length > 0
+              ? vars.crash_ids
+              : Array.from(
+                  new Set(
+                    sortedMissingItems.flatMap((it) => it.affected_crash_ids),
+                  ),
+                );
+        if (busyIds.length > 0) {
+          startTrackingResym(busyIds, {
+            mode: "active_busy",
+            projectId: vars.project_id,
+            debugId: vars.debug_id,
+            skippedActiveCount: data.skipped_active_count,
+          });
+        } else {
+          setResymFeedback({
+            queued_count: 0,
+            crash_ids: [],
+            debug_id: vars.debug_id,
+            skipped_active_count: data.skipped_active_count,
+          });
+        }
+      } else {
+        setResymFeedback({
+          queued_count: data.queued_count,
+          crash_ids: data.crash_ids,
+          debug_id: vars.debug_id,
+          skipped_active_count: data.skipped_active_count,
+        });
+      }
+      invalidateSymbolViews();
     },
     onSettled: () => {
       setActiveResymDebugId(null);
     },
   });
 
-  const syncMutation = useMutation({
-    mutationFn: (vars: { key: string; payload: PublicSymbolSyncRequest }) =>
-      syncPublicSymbols(vars.payload),
-    onMutate: (vars) => {
-      setActiveSyncKey(vars.key);
-      setSyncFeedback(null);
-    },
-    onSuccess: (data) => {
-      setSyncFeedback(data);
+  const handleStartSync = async (
+    key: string,
+    payload: PublicSymbolSyncRequest,
+  ) => {
+    if (isSyncRunning) return;
+    syncAbortRef.current?.abort();
+    const controller = new AbortController();
+    syncAbortRef.current = controller;
+    lastSyncInvalidateRef.current = Date.now();
+
+    setActiveSyncKey(key);
+    setIsSyncRunning(true);
+    setSyncError(null);
+    setSyncFeedback(null);
+    setSyncCancelledInfo(null);
+    clearFinishedResymFeedback();
+    if (resymMutation.isError) {
+      resymMutation.reset();
+    }
+    const initialTotal =
+      payload.mode === "targets" ? (payload.targets?.length ?? 0) : 0;
+    setSyncProgress({
+      total: initialTotal,
+      completed: 0,
+      alreadyCached: 0,
+      imported: 0,
+      upgraded: 0,
+      cachedHit: 0,
+      notFound: 0,
+      skipped: 0,
+      failed: 0,
+      circuitOpen: false,
+      activeModules: [],
+      results: [],
+    });
+
+    let latestCompleted = 0;
+    let latestTotal = initialTotal;
+    let latestImported = 0;
+    let latestUpgraded = 0;
+    let latestResults: PublicSymbolSyncItemResult[] = [];
+
+    try {
+      const summary = await syncPublicSymbolsStream(payload, {
+        signal: controller.signal,
+        onEvent: (evt) => {
+          if (evt.type === "start") {
+            latestTotal = evt.total;
+            latestCompleted = evt.completed;
+            latestImported = evt.imported;
+            latestUpgraded = evt.upgraded;
+            latestResults = [];
+            setSyncProgress({
+              total: evt.total,
+              completed: evt.completed,
+              alreadyCached: evt.already_cached,
+              imported: evt.imported,
+              upgraded: evt.upgraded,
+              cachedHit: evt.cached_hit,
+              notFound: evt.not_found,
+              skipped: evt.skipped,
+              failed: evt.failed,
+              circuitOpen: Boolean(evt.circuit_open),
+              activeModules: evt.active_modules ?? [],
+              results: [],
+            });
+          } else if (evt.type === "item_start") {
+            latestTotal = evt.total;
+            latestCompleted = evt.completed;
+            latestImported = evt.imported;
+            latestUpgraded = evt.upgraded;
+            setSyncProgress((prev) => ({
+              total: evt.total,
+              completed: evt.completed,
+              alreadyCached: evt.already_cached,
+              imported: evt.imported,
+              upgraded: evt.upgraded,
+              cachedHit: evt.cached_hit,
+              notFound: evt.not_found,
+              skipped: evt.skipped,
+              failed: evt.failed,
+              circuitOpen: Boolean(evt.circuit_open),
+              activeModules: evt.active_modules ?? [evt.current.debug_file],
+              results: prev?.results ?? [],
+            }));
+          } else if (evt.type === "progress") {
+            latestTotal = evt.total;
+            latestCompleted = evt.completed;
+            latestImported = evt.imported;
+            latestUpgraded = evt.upgraded;
+            latestResults = [evt.item, ...latestResults];
+            setSyncProgress((prev) => ({
+              total: evt.total,
+              completed: evt.completed,
+              alreadyCached: evt.already_cached,
+              imported: evt.imported,
+              upgraded: evt.upgraded,
+              cachedHit: evt.cached_hit,
+              notFound: evt.not_found,
+              skipped: evt.skipped,
+              failed: evt.failed,
+              circuitOpen: Boolean(evt.circuit_open),
+              activeModules: evt.active_modules ?? [],
+              results: [evt.item, ...(prev?.results ?? [])],
+            }));
+            const now = Date.now();
+            if (
+              (evt.item.status === "imported" ||
+                evt.item.status === "upgraded") &&
+              now - lastSyncInvalidateRef.current >= 2000
+            ) {
+              lastSyncInvalidateRef.current = now;
+              void queryClient.invalidateQueries({ queryKey: ["symbols"] });
+              void queryClient.invalidateQueries({
+                queryKey: ["missing-symbols"],
+              });
+            }
+          }
+        },
+      });
+
+      setSyncFeedback(summary);
+      setSyncProgress(null);
       setSelectedMissingKeys(new Set());
-      void queryClient.invalidateQueries({ queryKey: ["symbols"] });
-      void queryClient.invalidateQueries({ queryKey: ["missing-symbols"] });
-      void queryClient.invalidateQueries({ queryKey: ["crashes"] });
-      void queryClient.invalidateQueries({ queryKey: ["dashboard"] });
-    },
-    onSettled: () => {
+      invalidateSymbolViews();
+      applyAutoResymTracking({
+        crashIds: summary.resymbolicate_crash_ids,
+        activeCrashIds: summary.resymbolicate_active_crash_ids,
+        skippedActiveCount: summary.resymbolicate_skipped_active_count,
+        projectId: payload.project_id,
+      });
+    } catch (err) {
+      if (
+        controller.signal.aborted ||
+        (err instanceof DOMException && err.name === "AbortError")
+      ) {
+        setSyncCancelledInfo({
+          completed: latestCompleted,
+          total: latestTotal,
+          imported: latestImported,
+          upgraded: latestUpgraded,
+          projectId: payload.project_id,
+          results: latestResults,
+        });
+        setSyncProgress(null);
+        invalidateSymbolViews();
+      } else {
+        setSyncError(
+          err instanceof ApiError ? err.message : t("symbols.syncFailed"),
+        );
+        setSyncProgress(null);
+        invalidateSymbolViews();
+      }
+    } finally {
+      if (syncAbortRef.current === controller) {
+        syncAbortRef.current = null;
+      }
+      setIsSyncRunning(false);
       setActiveSyncKey(null);
-    },
-  });
+    }
+  };
+
+  const handleCancelSync = () => {
+    syncAbortRef.current?.abort();
+  };
 
   const handleCopy = (text: string) => {
     if (typeof navigator !== "undefined" && navigator.clipboard) {
@@ -371,6 +799,35 @@ export function SymbolsPage() {
         return t("symbols.syncStatusFailed");
     }
   };
+
+  const renderSyncResultItem = (
+    item: PublicSymbolSyncItemResult,
+    idx: number,
+  ) => (
+    <li
+      key={`${item.debug_file.toLowerCase()}-${item.debug_id.toUpperCase()}-${idx}`}
+      className="flex flex-wrap items-center gap-2 font-mono text-[11px]"
+    >
+      <span className="font-semibold text-slate-900">{item.debug_file}</span>
+      <span className="text-slate-500">{item.debug_id}</span>
+      <span
+        className={`rounded-full px-2 py-0.5 font-sans text-[10px] font-medium ${
+          item.status === "imported" ||
+          item.status === "upgraded" ||
+          item.status === "cached_hit"
+            ? "bg-emerald-100 text-emerald-800"
+            : item.status === "not_found" || item.status === "skipped"
+              ? "bg-amber-100 text-amber-800"
+              : "bg-rose-100 text-rose-800"
+        }`}
+      >
+        {renderSyncStatusLabel(item.status)}
+      </span>
+      {item.detail && (
+        <span className="font-sans text-slate-600">{item.detail}</span>
+      )}
+    </li>
+  );
 
   const renderSourceBadge = (source?: string) => {
     if (source === "msdl") {
@@ -416,6 +873,16 @@ export function SymbolsPage() {
   const scopeLabel = selectedProject
     ? `${selectedProject.name} (${selectedProject.key})`
     : selectedProjectId || t("nav.allProjects");
+
+  const hasGlobalStatusBanner = Boolean(
+    (isSyncRunning && syncProgress) ||
+      (!isSyncRunning && syncCancelledInfo) ||
+      syncFeedback ||
+      syncError ||
+      trackedResym ||
+      resymFeedback ||
+      resymMutation.isError,
+  );
 
   return (
     <div className="space-y-6">
@@ -509,14 +976,439 @@ export function SymbolsPage() {
             }`}
           >
             {t("symbols.tabMissingQueue")}
-            {sortedMissingItems.length > 0 && (
+            {missingTotalCount > 0 && (
               <span className="ml-2 rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 font-mono text-xs font-semibold text-amber-700">
-                {sortedMissingItems.length}
+                {missingTotalCount}
               </span>
             )}
           </button>
         </nav>
       </div>
+
+      {/* Global Sync & Re-symbolication Progress / Feedback Banners (visible across all tabs) */}
+      {hasGlobalStatusBanner && (
+        <div className="space-y-3">
+          {isSyncRunning && syncProgress && (
+            <div className="rounded-xl border border-sky-300 bg-sky-50/80 px-4 py-3.5 text-xs text-sky-950 shadow-sm">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2 font-semibold text-sky-900">
+                  <Loader2 className="h-4 w-4 animate-spin text-sky-600" />
+                  <span>{t("symbols.syncProgressTitle")}</span>
+                  {syncProgress.total > 0 && (
+                    <span className="font-mono text-sky-700">
+                      {t("symbols.syncProgressCount", {
+                        completed: syncProgress.completed,
+                        total: syncProgress.total,
+                        percent: Math.min(
+                          100,
+                          Math.round(
+                            (syncProgress.completed / syncProgress.total) * 100,
+                          ),
+                        ),
+                      })}
+                    </span>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  onClick={handleCancelSync}
+                  className="inline-flex items-center gap-1 rounded-md border border-sky-300 bg-white px-2.5 py-1 text-[11px] font-medium text-sky-800 hover:bg-sky-100"
+                >
+                  <Square className="h-3 w-3 fill-current" />
+                  {t("symbols.syncCancelBtn")}
+                </button>
+              </div>
+
+              <div className="mt-2.5 h-2 w-full overflow-hidden rounded-full bg-sky-200/80">
+                <div
+                  className="h-full rounded-full bg-sky-600 transition-all duration-300"
+                  style={{
+                    width:
+                      syncProgress.total > 0
+                        ? `${Math.min(100, Math.round((syncProgress.completed / syncProgress.total) * 100))}%`
+                        : "15%",
+                  }}
+                />
+              </div>
+
+              <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-[11px] text-sky-900">
+                <div>
+                  {t("symbols.syncSummaryCounts", {
+                    imported: syncProgress.imported,
+                    upgraded: syncProgress.upgraded,
+                    cached: syncProgress.cachedHit,
+                    notFound: syncProgress.notFound,
+                    skipped: syncProgress.skipped,
+                    failed: syncProgress.failed,
+                  })}
+                </div>
+                {syncProgress.alreadyCached > 0 && (
+                  <span className="rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[10px] font-medium text-emerald-700">
+                    {t("symbols.syncProgressAlreadyCached", {
+                      count: syncProgress.alreadyCached,
+                    })}
+                  </span>
+                )}
+              </div>
+
+              {syncProgress.activeModules.length > 0 && (
+                <div className="mt-1.5 truncate font-mono text-[11px] text-sky-700">
+                  {t("symbols.syncProgressActive", {
+                    modules: syncProgress.activeModules.join(", "),
+                  })}
+                </div>
+              )}
+
+              {syncProgress.results.length > 0 && (
+                <ul className="ck-scrollbar mt-2.5 max-h-44 space-y-1 overflow-y-auto border-t border-sky-200/70 pt-2 pr-1">
+                  {syncProgress.results.map((item, idx) =>
+                    renderSyncResultItem(item, idx),
+                  )}
+                </ul>
+              )}
+            </div>
+          )}
+
+          {!isSyncRunning && syncCancelledInfo && (
+            <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-900">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span>
+                  {t("symbols.syncCancelledNotice", {
+                    completed: syncCancelledInfo.completed,
+                    total: syncCancelledInfo.total,
+                    imported:
+                      syncCancelledInfo.imported + syncCancelledInfo.upgraded,
+                  })}
+                </span>
+                <div className="flex items-center gap-2">
+                  {syncCancelledInfo.imported + syncCancelledInfo.upgraded >
+                    0 && (
+                    <button
+                      type="button"
+                      disabled={resymMutation.isPending}
+                      onClick={() =>
+                        resymMutation.mutate({
+                          project_id: syncCancelledInfo.projectId,
+                          missing_only: true,
+                        })
+                      }
+                      className="inline-flex items-center gap-1 rounded-md bg-indigo-600 px-2.5 py-1 text-[11px] font-medium text-white hover:bg-indigo-700 disabled:opacity-50"
+                    >
+                      <RefreshCw className="h-3 w-3" />
+                      {t("symbols.syncCancelledResymBtn")}
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => setSyncCancelledInfo(null)}
+                    className="rounded p-1 hover:bg-amber-100"
+                  >
+                    <X className="h-4 w-4" />
+                  </button>
+                </div>
+              </div>
+              {syncCancelledInfo.results.length > 0 && (
+                <ul className="ck-scrollbar mt-2 max-h-40 space-y-1 overflow-y-auto border-t border-amber-200/70 pt-2 pr-1">
+                  {syncCancelledInfo.results.map((item, idx) =>
+                    renderSyncResultItem(item, idx),
+                  )}
+                </ul>
+              )}
+            </div>
+          )}
+
+          {syncFeedback && (
+            <div className="rounded-xl border border-sky-200 bg-sky-50/70 px-4 py-3 text-xs text-sky-950">
+              <div className="flex items-start justify-between gap-2">
+                <div className="space-y-1">
+                  <div className="font-semibold">
+                    {t("symbols.syncSummaryTitle")}
+                  </div>
+                  <div>
+                    {syncFeedback.results.length === 0
+                      ? t("symbols.syncNoEligibleTargets")
+                      : t("symbols.syncSummaryCounts", {
+                          imported: syncFeedback.imported,
+                          upgraded: syncFeedback.upgraded,
+                          cached: syncFeedback.cached_hit,
+                          notFound: syncFeedback.not_found,
+                          skipped: syncFeedback.skipped,
+                          failed: syncFeedback.failed,
+                        })}
+                    {syncFeedback.resymbolicate_queued_count > 0 && (
+                      <span className="ml-2 font-medium text-emerald-700">
+                        · {t("symbols.resymQueuedPrefix")}
+                        {syncFeedback.resymbolicate_queued_count}
+                        {t("symbols.resymQueuedSuffix")}
+                      </span>
+                    )}
+                    {(syncFeedback.resymbolicate_skipped_active_count ?? 0) >
+                      0 && (
+                      <span className="ml-2 font-medium text-amber-800">
+                        ·{" "}
+                        {syncFeedback.resymbolicate_queued_count > 0
+                          ? t("symbols.resymPartialSkippedNote", {
+                              count:
+                                syncFeedback.resymbolicate_skipped_active_count ??
+                                0,
+                            })
+                          : t("symbols.syncSummaryResymSkippedActive", {
+                              count:
+                                syncFeedback.resymbolicate_skipped_active_count ??
+                                0,
+                            })}
+                      </span>
+                    )}
+                  </div>
+                  {syncFeedback.circuit_open && (
+                    <div className="text-amber-800">
+                      {t("symbols.syncCircuitWarning")}
+                    </div>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setSyncFeedback(null)}
+                  className="rounded p-1 hover:bg-sky-100"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+              {syncFeedback.results.length > 0 && (
+                <ul className="ck-scrollbar mt-2 max-h-56 space-y-1 overflow-y-auto border-t border-sky-200/70 pt-2 pr-1">
+                  {syncFeedback.results.map((item, idx) =>
+                    renderSyncResultItem(item, idx),
+                  )}
+                </ul>
+              )}
+            </div>
+          )}
+
+          {syncError && (
+            <div className="flex items-center justify-between gap-2 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-xs text-rose-700">
+              <span>{syncError}</span>
+              <button
+                type="button"
+                onClick={() => setSyncError(null)}
+                className="rounded p-1 hover:bg-rose-100"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+          )}
+
+          {trackedResym &&
+            (() => {
+              const st = trackedResym.status;
+              const isBusyMode = trackedResym.mode === "active_busy";
+              const busyChecking = isBusyMode && st === null;
+              const busyParsing =
+                isBusyMode && st !== null && st.pending + st.parsing > 0;
+              const busyTriaging =
+                isBusyMode &&
+                st !== null &&
+                st.pending + st.parsing === 0 &&
+                st.triaging > 0;
+              const busyNowIdle =
+                isBusyMode &&
+                st !== null &&
+                st.pending + st.parsing + st.triaging === 0;
+              const queuedDone = !isBusyMode && Boolean(st?.done);
+              const toneClass = queuedDone
+                ? "border-emerald-200 bg-emerald-50 text-emerald-950"
+                : busyChecking || busyTriaging || busyNowIdle
+                  ? "border-amber-200 bg-amber-50 text-amber-950"
+                  : "border-indigo-200 bg-indigo-50/80 text-indigo-950";
+
+              return (
+                <div
+                  className={`rounded-xl border px-4 py-3 text-xs ${toneClass}`}
+                >
+                  <div className="flex flex-wrap items-start justify-between gap-2">
+                    <div className="space-y-1">
+                      <div className="flex items-center gap-2 font-semibold">
+                        {queuedDone ? (
+                          <CheckCircle2 className="h-4 w-4 text-emerald-600" />
+                        ) : busyNowIdle ? (
+                          <AlertTriangle className="h-4 w-4 text-amber-600" />
+                        ) : (
+                          <Loader2
+                            className={`h-4 w-4 animate-spin ${
+                              busyChecking || busyTriaging
+                                ? "text-amber-600"
+                                : "text-indigo-600"
+                            }`}
+                          />
+                        )}
+                        <span>
+                          {!isBusyMode
+                            ? queuedDone && st
+                              ? t("symbols.resymCompletedTitle", {
+                                  completed: st.completed,
+                                  total: st.total,
+                                })
+                              : t("symbols.resymProgressTitle")
+                            : busyChecking || !st
+                              ? t("symbols.resymActiveSkippedNotice", {
+                                  count: trackedResym.crashIds.length,
+                                })
+                              : busyParsing
+                                ? t("symbols.resymBusyParsingTitle", {
+                                    total: st.total,
+                                  })
+                                : busyTriaging
+                                  ? t("symbols.resymBusyTriagingTitle", {
+                                      triaging: st.triaging,
+                                    })
+                                  : t("symbols.resymBusyIdleTitle", {
+                                      total: st.total,
+                                    })}
+                          {queuedDone &&
+                            st &&
+                            st.failed > 0 &&
+                            t("symbols.resymCompletedFailedSuffix", {
+                              failed: st.failed,
+                            })}
+                          {queuedDone &&
+                            st &&
+                            st.triaging > 0 &&
+                            t("symbols.resymCompletedTriagingSuffix", {
+                              triaging: st.triaging,
+                            })}
+                        </span>
+                      </div>
+                      {st && ((!isBusyMode && !st.done) || busyParsing) && (
+                        <div>
+                          {t("symbols.resymProgressCount", {
+                            completed: st.completed,
+                            total: st.total,
+                            pending: st.pending,
+                            parsing: st.parsing,
+                          })}
+                        </div>
+                      )}
+                      {busyTriaging && (
+                        <div>{t("symbols.resymBusyTriagingHint")}</div>
+                      )}
+                      {!isBusyMode &&
+                        (trackedResym.skippedActiveCount ?? 0) > 0 && (
+                          <div className="text-amber-800">
+                            {t("symbols.resymPartialSkippedNote", {
+                              count: trackedResym.skippedActiveCount ?? 0,
+                            })}
+                          </div>
+                        )}
+                      <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
+                        <span>{t("symbols.resymIdsLabel")}</span>
+                        {trackedResym.crashIds.slice(0, 6).map((cid, i) => (
+                          <span key={cid}>
+                            {i > 0 ? ", " : ""}
+                            <Link
+                              to={`/crashes/${encodeURIComponent(cid)}`}
+                              className="font-mono underline"
+                            >
+                              {cid.slice(0, 8)}
+                            </Link>
+                          </span>
+                        ))}
+                        {trackedResym.crashIds.length > 6 && (
+                          <span>
+                            {t("symbols.moreCrashes", {
+                              count: trackedResym.crashIds.length - 6,
+                            })}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      {busyNowIdle && (
+                        <button
+                          type="button"
+                          disabled={resymMutation.isPending}
+                          onClick={() =>
+                            resymMutation.mutate({
+                              project_id: trackedResym.projectId,
+                              debug_id: trackedResym.debugId,
+                              crash_ids: trackedResym.crashIds,
+                            })
+                          }
+                          className="inline-flex items-center gap-1 rounded-md bg-indigo-600 px-2.5 py-1 text-[11px] font-medium text-white hover:bg-indigo-700 disabled:opacity-50"
+                        >
+                          <RefreshCw className="h-3 w-3" />
+                          {t("symbols.resymRetryNowBtn")}
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setTrackedResym(null);
+                          setResymFeedback(null);
+                        }}
+                        className="rounded p-1 hover:bg-black/5"
+                      >
+                        <X className="h-4 w-4" />
+                      </button>
+                    </div>
+                  </div>
+                  {st &&
+                    ((!isBusyMode && !st.done) || busyParsing) &&
+                    st.total > 0 && (
+                      <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-indigo-200/80">
+                        <div
+                          className="h-full rounded-full bg-indigo-600 transition-all duration-300"
+                          style={{
+                            width: `${Math.max(
+                              10,
+                              Math.min(
+                                100,
+                                Math.round((st.completed / st.total) * 100),
+                              ),
+                            )}%`,
+                          }}
+                        />
+                      </div>
+                    )}
+                </div>
+              );
+            })()}
+
+          {resymFeedback && (
+            <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-900">
+              <div>
+                {(resymFeedback.skipped_active_count ?? 0) > 0
+                  ? t("symbols.syncSummaryResymSkippedActive", {
+                      count: resymFeedback.skipped_active_count ?? 0,
+                    })
+                  : t("symbols.resymNoneEligible")}
+              </div>
+              <button
+                type="button"
+                onClick={() => setResymFeedback(null)}
+                className="rounded p-1 hover:bg-amber-100"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+          )}
+
+          {resymMutation.isError && (
+            <div className="flex items-center justify-between gap-2 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-xs text-rose-700">
+              <span>
+                {resymMutation.error instanceof ApiError
+                  ? resymMutation.error.message
+                  : t("symbols.resymFailed")}
+              </span>
+              <button
+                type="button"
+                onClick={() => resymMutation.reset()}
+                className="rounded p-1 hover:bg-rose-100"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* TAB 1: SYMBOL INVENTORY */}
       {activeTab === "inventory" && (
@@ -1101,43 +1993,30 @@ export function SymbolsPage() {
 
               <button
                 type="button"
-                disabled={
-                  sortedMissingItems.length === 0 || syncMutation.isPending
-                }
+                disabled={sortedMissingItems.length === 0 || isSyncRunning}
                 onClick={() => {
                   if (selectedMissingItems.length > 0) {
-                    syncMutation.mutate({
-                      key: "__SELECTED__",
-                      payload: {
-                        mode: "targets",
-                        targets: selectedMissingItems.map((it) => ({
-                          module_name: it.module_name,
-                          debug_file: it.debug_file,
-                          debug_id: it.debug_id,
-                          code_file: it.code_file,
-                          code_id: it.code_id,
-                        })),
-                        project_id: selectedProjectId || undefined,
-                        force: true,
-                        auto_resymbolicate: true,
-                      },
+                    void handleStartSync("__SELECTED__", {
+                      mode: "targets",
+                      targets: selectedMissingItems.map((it) =>
+                        buildMsSyncTarget(it),
+                      ),
+                      project_id: selectedProjectId || undefined,
+                      force: true,
+                      auto_resymbolicate: true,
                     });
                   } else {
-                    syncMutation.mutate({
-                      key: "__MISSING_WINDOWS__",
-                      payload: {
-                        mode: "missing_windows",
-                        project_id: selectedProjectId || undefined,
-                        force: true,
-                        auto_resymbolicate: true,
-                        max_targets: 20,
-                      },
+                    void handleStartSync("__MISSING_WINDOWS__", {
+                      mode: "missing_windows",
+                      project_id: selectedProjectId || undefined,
+                      force: true,
+                      auto_resymbolicate: true,
                     });
                   }
                 }}
                 className="inline-flex items-center gap-1.5 rounded-md border border-sky-300 bg-sky-50 px-3 py-1.5 text-xs font-medium text-sky-800 hover:bg-sky-100 disabled:opacity-50"
               >
-                {syncMutation.isPending &&
+                {isSyncRunning &&
                 (activeSyncKey === "__SELECTED__" ||
                   activeSyncKey === "__MISSING_WINDOWS__") ? (
                   <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -1148,7 +2027,11 @@ export function SymbolsPage() {
                   ? t("symbols.syncSelectedBtn", {
                       count: selectedMissingItems.length,
                     })
-                  : t("symbols.syncSystemMissingBtn")}
+                  : uncachedWindowsMissingCount > 0
+                    ? t("symbols.syncSystemMissingBtnCount", {
+                        count: uncachedWindowsMissingCount,
+                      })
+                    : t("symbols.syncSystemMissingBtn")}
               </button>
 
               <button
@@ -1183,131 +2066,15 @@ export function SymbolsPage() {
             </div>
           </div>
 
-          {syncFeedback && (
-            <div className="rounded-xl border border-sky-200 bg-sky-50/70 px-4 py-3 text-xs text-sky-950">
-              <div className="flex items-start justify-between gap-2">
-                <div className="space-y-1">
-                  <div className="font-semibold">
-                    {t("symbols.syncSummaryTitle")}
-                  </div>
-                  <div>
-                    {t("symbols.syncSummaryCounts", {
-                      imported: syncFeedback.imported,
-                      upgraded: syncFeedback.upgraded,
-                      cached: syncFeedback.cached_hit,
-                      notFound: syncFeedback.not_found,
-                      failed: syncFeedback.failed,
-                    })}
-                    {syncFeedback.resymbolicate_queued_count > 0 && (
-                      <span className="ml-2 font-medium text-emerald-700">
-                        · {t("symbols.resymQueuedPrefix")}
-                        {syncFeedback.resymbolicate_queued_count}
-                        {t("symbols.resymQueuedSuffix")}
-                      </span>
-                    )}
-                  </div>
-                  {syncFeedback.circuit_open && (
-                    <div className="text-amber-800">
-                      {t("symbols.syncCircuitWarning")}
-                    </div>
-                  )}
-                </div>
-                <button
-                  type="button"
-                  onClick={() => setSyncFeedback(null)}
-                  className="rounded p-1 hover:bg-sky-100"
-                >
-                  <X className="h-4 w-4" />
-                </button>
-              </div>
-              {syncFeedback.results.length > 0 && (
-                <ul className="mt-2 space-y-1 border-t border-sky-200/70 pt-2">
-                  {syncFeedback.results.slice(0, 8).map((item) => (
-                    <li
-                      key={`${item.debug_file}-${item.debug_id}`}
-                      className="flex flex-wrap items-center gap-2 font-mono text-[11px]"
-                    >
-                      <span className="font-semibold text-slate-900">
-                        {item.debug_file}
-                      </span>
-                      <span className="text-slate-500">{item.debug_id}</span>
-                      <span
-                        className={`rounded-full px-2 py-0.5 font-sans text-[10px] font-medium ${
-                          item.status === "imported" ||
-                          item.status === "upgraded" ||
-                          item.status === "cached_hit"
-                            ? "bg-emerald-100 text-emerald-800"
-                            : item.status === "not_found"
-                              ? "bg-amber-100 text-amber-800"
-                              : "bg-rose-100 text-rose-800"
-                        }`}
-                      >
-                        {renderSyncStatusLabel(item.status)}
-                      </span>
-                      {item.detail && (
-                        <span className="font-sans text-slate-600">
-                          {item.detail}
-                        </span>
-                      )}
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </div>
-          )}
-
-          {syncMutation.isError && (
-            <div className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-xs text-rose-700">
-              {syncMutation.error instanceof ApiError
-                ? syncMutation.error.message
-                : t("symbols.syncFailed")}
-            </div>
-          )}
-
-          {resymFeedback && (
-            <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-900">
-              <div>
-                {t("symbols.resymQueuedPrefix")}
-                <strong className="font-semibold">
-                  {resymFeedback.queued_count}
-                </strong>
-                {t("symbols.resymQueuedSuffix")}
-                {resymFeedback.debug_id
-                  ? ` (debug_id: ${resymFeedback.debug_id})`
-                  : ""}
-                .
-                {resymFeedback.crash_ids.length > 0 && (
-                  <span className="ml-2 text-xs">
-                    {t("symbols.resymIdsLabel")}
-                    {resymFeedback.crash_ids.slice(0, 4).map((cid, i) => (
-                      <span key={cid}>
-                        {i > 0 ? ", " : ""}
-                        <Link
-                          to={`/crashes/${encodeURIComponent(cid)}`}
-                          className="font-mono underline"
-                        >
-                          {cid.slice(0, 8)}
-                        </Link>
-                      </span>
-                    ))}
-                  </span>
-                )}
-              </div>
-              <button
-                type="button"
-                onClick={() => setResymFeedback(null)}
-                className="rounded p-1 hover:bg-emerald-100"
-              >
-                <X className="h-4 w-4" />
-              </button>
-            </div>
-          )}
-
-          {resymMutation.isError && (
-            <div className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-xs text-rose-700">
-              {resymMutation.error instanceof ApiError
-                ? resymMutation.error.message
-                : t("symbols.resymFailed")}
+          {missingTotalCount > sortedMissingItems.length && (
+            <div className="flex items-center gap-2 rounded-xl border border-slate-200 bg-slate-50 px-4 py-2.5 text-xs text-slate-600">
+              <AlertCircle className="h-4 w-4 shrink-0 text-slate-500" />
+              <span>
+                {t("symbols.missingQueueTruncatedNote", {
+                  shown: sortedMissingItems.length,
+                  total: missingTotalCount,
+                })}
+              </span>
             </div>
           )}
 
@@ -1337,6 +2104,9 @@ export function SymbolsPage() {
                       <input
                         type="checkbox"
                         aria-label={t("symbols.selectAllMissingAria")}
+                        disabled={
+                          selectableMissingItems.length === 0 || isSyncRunning
+                        }
                         checked={
                           selectableMissingItems.length > 0 &&
                           selectedMissingItems.length ===
@@ -1355,7 +2125,7 @@ export function SymbolsPage() {
                             setSelectedMissingKeys(new Set());
                           }
                         }}
-                        className="h-3.5 w-3.5 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+                        className="h-3.5 w-3.5 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500 disabled:opacity-40"
                       />
                     </th>
                     <th className="px-4 py-3">
@@ -1395,14 +2165,12 @@ export function SymbolsPage() {
                   ) : (
                     sortedMissingItems.map((item: MissingSymbolQueueItem) => {
                       const rowKey = missingRowKey(item);
-                      const canMsSync =
-                        item.debug_file.toLowerCase().endsWith(".pdb") &&
-                        item.debug_id.length >= 32;
+                      const canMsSync = canMsSyncMissingItem(item);
                       const isRowPending =
                         resymMutation.isPending &&
                         activeResymDebugId === item.debug_id;
                       const isRowSyncing =
-                        syncMutation.isPending && activeSyncKey === rowKey;
+                        isSyncRunning && activeSyncKey === rowKey;
                       const visibleCrashIds = item.affected_crash_ids.slice(
                         0,
                         4,
@@ -1415,7 +2183,7 @@ export function SymbolsPage() {
                           <td className="px-3 py-3">
                             <input
                               type="checkbox"
-                              disabled={!canMsSync || syncMutation.isPending}
+                              disabled={!canMsSync || isSyncRunning}
                               checked={selectedMissingKeys.has(rowKey)}
                               aria-label={t("symbols.selectMissingRowAria", {
                                 file: item.debug_file || item.module_name,
@@ -1533,26 +2301,15 @@ export function SymbolsPage() {
                               {canMsSync && (
                                 <button
                                   type="button"
-                                  disabled={syncMutation.isPending}
+                                  disabled={isSyncRunning}
                                   onClick={() =>
-                                    syncMutation.mutate({
-                                      key: rowKey,
-                                      payload: {
-                                        mode: "targets",
-                                        targets: [
-                                          {
-                                            module_name: item.module_name,
-                                            debug_file: item.debug_file,
-                                            debug_id: item.debug_id,
-                                            code_file: item.code_file,
-                                            code_id: item.code_id,
-                                          },
-                                        ],
-                                        project_id:
-                                          selectedProjectId || undefined,
-                                        force: true,
-                                        auto_resymbolicate: true,
-                                      },
+                                    void handleStartSync(rowKey, {
+                                      mode: "targets",
+                                      targets: [buildMsSyncTarget(item)],
+                                      project_id:
+                                        selectedProjectId || undefined,
+                                      force: true,
+                                      auto_resymbolicate: true,
                                     })
                                   }
                                   className="inline-flex items-center gap-1 rounded-md border border-sky-300 bg-sky-50 px-2.5 py-1 text-xs font-medium text-sky-800 hover:bg-sky-100 disabled:opacity-50"
@@ -1777,11 +2534,15 @@ export function SymbolsPage() {
         defaultProjectKey={selectedProject?.key}
         defaultSymbolScope={uploadDefaultScope}
         symbolTargetHint={uploadTargetHint}
-        onSuccess={() => {
-          void queryClient.invalidateQueries({ queryKey: ["symbols"] });
-          void queryClient.invalidateQueries({ queryKey: ["missing-symbols"] });
-          void queryClient.invalidateQueries({ queryKey: ["crashes"] });
-          void queryClient.invalidateQueries({ queryKey: ["dashboard"] });
+        onSuccess={(result) => {
+          invalidateSymbolViews();
+          if (result.mode === "symbol") {
+            applyAutoResymTracking({
+              crashIds: result.resymbolicateCrashIds,
+              activeCrashIds: result.resymbolicateActiveCrashIds,
+              skippedActiveCount: result.resymbolicateSkippedActiveCount,
+            });
+          }
         }}
       />
 
@@ -1789,11 +2550,18 @@ export function SymbolsPage() {
       <PublicSymbolSyncModal
         isOpen={isSyncModalOpen}
         onClose={() => setIsSyncModalOpen(false)}
-        onSynced={() => {
-          void queryClient.invalidateQueries({ queryKey: ["symbols"] });
-          void queryClient.invalidateQueries({ queryKey: ["missing-symbols"] });
-          void queryClient.invalidateQueries({ queryKey: ["crashes"] });
-          void queryClient.invalidateQueries({ queryKey: ["dashboard"] });
+        onSynced={(res) => {
+          invalidateSymbolViews();
+          if (!isSyncRunning) {
+            setSyncFeedback(null);
+            setSyncCancelledInfo(null);
+            setSyncError(null);
+          }
+          applyAutoResymTracking({
+            crashIds: res.resymbolicate_crash_ids,
+            activeCrashIds: res.resymbolicate_active_crash_ids,
+            skippedActiveCount: res.resymbolicate_skipped_active_count,
+          });
         }}
       />
     </div>
