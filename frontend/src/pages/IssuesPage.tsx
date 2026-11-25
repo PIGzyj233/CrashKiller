@@ -1,25 +1,12 @@
-import { useEffect, useMemo, useState, type FormEvent } from "react";
-import { Link, useSearchParams } from "react-router-dom";
+import { useEffect, useMemo, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import {
   keepPreviousData,
   useMutation,
   useQuery,
   useQueryClient,
 } from "@tanstack/react-query";
-import {
-  AlertTriangle,
-  ArrowRightLeft,
-  Check,
-  ChevronLeft,
-  ChevronRight,
-  Copy,
-  GitMerge,
-  Layers,
-  Pin,
-  Plus,
-  Search,
-  X,
-} from "lucide-react";
+import { Layers, Plus, X } from "lucide-react";
 import {
   ApiError,
   batchTransitionIssues,
@@ -30,52 +17,22 @@ import {
   transitionIssue,
   updateIssue,
 } from "../api/client";
-import type {
-  CrashClusterRead,
-  IssueRead,
-  IssueStatus,
-  SignatureFrameItem,
-} from "../api/types";
+import type { IssueRead, IssueStatus } from "../api/types";
 import {
-  ISSUE_STATUSES,
   IssueTransitionModal,
-  IssueTransitionSplitButton,
-  STATUS_BADGE_CLASSES,
   type IssueTransitionModalSubmitPayload,
   type TransitionActionConfig,
 } from "../components/IssueStatusWorkflow";
 import { useProjectContext } from "../components/Layout";
 import { useAppI18n } from "../i18n";
-
-const PAGE_SIZE = 25;
-
-function formatSignatureFrames(
-  frames: SignatureFrameItem[],
-  fallbackText?: string | null,
-): string {
-  if (!Array.isArray(frames) || frames.length === 0) {
-    return fallbackText || "—";
-  }
-  const formatted = frames.slice(0, 4).map((frame) => {
-    if (typeof frame === "string") {
-      return frame;
-    }
-    const mod = frame.module ? `${frame.module}!` : "";
-    const fn = frame.function || "<unknown>";
-    return `${mod}${fn}`;
-  });
-  return formatted.join(" ← ");
-}
-
-function parsePatternLines(raw: string): string[] {
-  return raw
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0);
-}
+import { ClustersTabPanel } from "./issues/ClustersTabPanel";
+import { CreateIssueModal } from "./issues/CreateIssueModal";
+import { IssuesTabPanel } from "./issues/IssuesTabPanel";
+import { MergeIssuesModal } from "./issues/MergeIssuesModal";
+import { PAGE_SIZE } from "./issues/utils";
 
 export function IssuesPage() {
-  const { t, formatDateTime, formatNumber, formatIssueStatus } = useAppI18n();
+  const { t, formatIssueStatus } = useAppI18n();
   const { projects, selectedProject, selectedProjectId } = useProjectContext();
   const [searchParams, setSearchParams] = useSearchParams();
   const queryClient = useQueryClient();
@@ -120,17 +77,9 @@ export function IssuesPage() {
 
   // Create issue modal state
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
-  const [newProjectId, setNewProjectId] = useState("");
-  const [newTitle, setNewTitle] = useState("");
-  const [newStatus, setNewStatus] = useState<IssueStatus>("NEW");
-  const [newComponent, setNewComponent] = useState("");
-  const [newFixedInVersion, setNewFixedInVersion] = useState("");
-  const [newRootCause, setNewRootCause] = useState("");
-  const [newLogPatternsText, setNewLogPatternsText] = useState("");
-  const [newIsAmbiguous, setNewIsAmbiguous] = useState(false);
-  const [newIsPinned, setNewIsPinned] = useState(false);
+  const [createResetNonce, setCreateResetNonce] = useState(0);
 
-  // Feedback / copy / transition state
+  // Feedback / transition state
   const [pinningIssueId, setPinningIssueId] = useState<number | null>(null);
   const [transitioningIssueId, setTransitioningIssueId] = useState<
     number | null
@@ -140,7 +89,6 @@ export function IssuesPage() {
     | { mode: "batch"; targetStatus: IssueStatus }
     | null
   >(null);
-  const [copiedHash, setCopiedHash] = useState<string | null>(null);
   const [actionFeedback, setActionFeedback] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
 
@@ -162,17 +110,6 @@ export function IssuesPage() {
     debouncedComponent,
     pinnedOnly,
   ]);
-
-  useEffect(() => {
-    if (
-      isCreateModalOpen &&
-      !selectedProjectId &&
-      !newProjectId &&
-      projects.length > 0
-    ) {
-      setNewProjectId(projects[0].id);
-    }
-  }, [isCreateModalOpen, selectedProjectId, newProjectId, projects]);
 
   useEffect(() => {
     setClustersPage(0);
@@ -266,14 +203,7 @@ export function IssuesPage() {
     mutationFn: createIssue,
     onSuccess: (created) => {
       setIsCreateModalOpen(false);
-      setNewTitle("");
-      setNewStatus("NEW");
-      setNewComponent("");
-      setNewFixedInVersion("");
-      setNewRootCause("");
-      setNewLogPatternsText("");
-      setNewIsAmbiguous(false);
-      setNewIsPinned(false);
+      setCreateResetNonce((n) => n + 1);
       setActionError(null);
       setActionFeedback(
         t("issues.createdFeedback", { id: created.id, title: created.title }),
@@ -431,31 +361,9 @@ export function IssuesPage() {
     });
   };
 
-  const effectiveCreateProjectId =
-    selectedProjectId || newProjectId || projects[0]?.id || "";
-
   const openCreateModal = () => {
-    setNewProjectId(selectedProjectId || projects[0]?.id || "");
     createMutation.reset();
     setIsCreateModalOpen(true);
-  };
-
-  const handleCreateSubmit = (e: FormEvent) => {
-    e.preventDefault();
-    if (!effectiveCreateProjectId || !newTitle.trim()) {
-      return;
-    }
-    createMutation.mutate({
-      project_id: effectiveCreateProjectId,
-      title: newTitle.trim(),
-      status: newStatus,
-      component: newComponent.trim() || null,
-      fixed_in_version: newFixedInVersion.trim() || null,
-      root_cause: newRootCause.trim() || null,
-      log_patterns_json: parsePatternLines(newLogPatternsText),
-      is_ambiguous_stack: newIsAmbiguous,
-      is_pinned: newIsPinned,
-    });
   };
 
   const handleRowTransitionAction = (
@@ -511,25 +419,12 @@ export function IssuesPage() {
     }
   };
 
-  const handleCopyHash = (hash: string) => {
-    if (typeof navigator !== "undefined" && navigator.clipboard) {
-      void navigator.clipboard.writeText(hash);
-      setCopiedHash(hash);
-      window.setTimeout(() => setCopiedHash(null), 1500);
-    }
-  };
-
   const scopeLabel = selectedProject
     ? `${selectedProject.name} (${selectedProject.key})`
     : selectedProjectId || t("nav.allProjects");
 
-  const issuesFrom = issuesTotal === 0 ? 0 : issuesPage * PAGE_SIZE + 1;
-  const issuesTo = Math.min(issuesTotal, (issuesPage + 1) * PAGE_SIZE);
-
   const clustersList = clustersQuery.data?.items ?? [];
   const clustersTotal = clustersQuery.data?.total ?? 0;
-  const clustersFrom = clustersTotal === 0 ? 0 : clustersPage * PAGE_SIZE + 1;
-  const clustersTo = Math.min(clustersTotal, (clustersPage + 1) * PAGE_SIZE);
 
   return (
     <div className="space-y-6">
@@ -562,7 +457,7 @@ export function IssuesPage() {
         </div>
       </div>
 
-      {/* Feedback Banner */}
+      {/* Feedback Banners */}
       {actionFeedback && (
         <div className="flex items-center justify-between rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-2.5 text-sm text-emerald-800">
           <span>{actionFeedback}</span>
@@ -630,839 +525,106 @@ export function IssuesPage() {
         </nav>
       </div>
 
-      {/* ISSUES TAB */}
       {activeTab === "issues" && (
-        <div className="space-y-4">
-          {/* Filter Bar */}
-          <div className="flex flex-wrap items-center gap-3 rounded-xl border border-slate-200 bg-white p-3.5 shadow-sm">
-            <div className="relative min-w-[220px] flex-1">
-              <Search className="pointer-events-none absolute left-3 top-2.5 h-4 w-4 text-slate-400" />
-              <input
-                type="text"
-                value={searchInput}
-                onChange={(e) => setSearchInput(e.target.value)}
-                placeholder={t("issues.searchPlaceholder")}
-                className="h-9 w-full rounded-md border border-slate-300 pl-9 pr-3 text-sm text-slate-900 placeholder:text-slate-400 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-              />
-            </div>
-
-            <select
-              aria-label={t("issues.filterStatusAria")}
-              value={statusFilter}
-              onChange={(e) =>
-                setStatusFilter(e.target.value as "" | IssueStatus)
-              }
-              className="h-9 rounded-md border border-slate-300 bg-white px-3 text-sm text-slate-800 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-            >
-              <option value="">{t("issues.allStatuses")}</option>
-              {ISSUE_STATUSES.map((st) => (
-                <option key={st} value={st}>
-                  {formatIssueStatus(st)}
-                </option>
-              ))}
-            </select>
-
-            <input
-              type="text"
-              value={componentInput}
-              onChange={(e) => setComponentInput(e.target.value)}
-              placeholder={t("issues.componentPlaceholder")}
-              aria-label={t("issues.filterComponentAria")}
-              className="h-9 w-40 rounded-md border border-slate-300 px-3 text-sm text-slate-900 placeholder:text-slate-400 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-            />
-
-            <button
-              type="button"
-              onClick={() => setPinnedOnly((prev) => !prev)}
-              className={`inline-flex h-9 items-center gap-1.5 rounded-md border px-3 text-sm font-medium transition-colors ${
-                pinnedOnly
-                  ? "border-amber-300 bg-amber-50 text-amber-800"
-                  : "border-slate-300 bg-white text-slate-700 hover:bg-slate-50"
-              }`}
-            >
-              <Pin className="h-3.5 w-3.5" />
-              {t("issues.pinnedOnly")}
-            </button>
-
-            {(searchInput || statusFilter || componentInput || pinnedOnly) && (
-              <button
-                type="button"
-                onClick={() => {
-                  setSearchInput("");
-                  setStatusFilter("");
-                  setComponentInput("");
-                  setPinnedOnly(false);
-                }}
-                className="h-9 rounded-md px-2.5 text-xs font-medium text-slate-600 hover:bg-slate-100 hover:text-slate-900"
-              >
-                {t("common.reset")}
-              </button>
-            )}
-          </div>
-
-          {/* Multi-select Batch Action Bar */}
-          {selectedIssueIds.length >= 1 && (
-            <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-indigo-200 bg-indigo-50 px-4 py-2.5 text-sm">
-              <div className="flex flex-wrap items-center gap-2 text-indigo-900">
-                <ArrowRightLeft className="h-4 w-4 text-indigo-600" />
-                <span className="font-medium">
-                  {t("issues.selectedCount", {
-                    count: selectedIssueIds.length,
-                  })}
-                </span>
-                {selectedIssueIds.length >= 2 && hasCrossProjectSelection && (
-                  <span className="rounded bg-rose-100 px-2 py-0.5 text-xs font-medium text-rose-700">
-                    {t("issues.crossProjectWarning")}
-                  </span>
-                )}
-              </div>
-              <div className="flex flex-wrap items-center gap-2">
-                <button
-                  type="button"
-                  onClick={() => setSelectedIssuesMap(new Map())}
-                  className="rounded-md border border-indigo-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50"
-                >
-                  {t("common.clear")}
-                </button>
-                <button
-                  type="button"
-                  onClick={openBatchTransitionModal}
-                  className="inline-flex items-center gap-1.5 rounded-md border border-indigo-300 bg-white px-3 py-1 text-xs font-medium text-indigo-700 hover:bg-indigo-100/60"
-                >
-                  <ArrowRightLeft className="h-3.5 w-3.5" />
-                  {t("issues.batchTransitionButton")}
-                </button>
-                {selectedIssueIds.length >= 2 && (
-                  <button
-                    type="button"
-                    disabled={hasCrossProjectSelection}
-                    onClick={openMergeModal}
-                    className="inline-flex items-center gap-1.5 rounded-md bg-indigo-600 px-3 py-1 text-xs font-medium text-white hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50"
-                  >
-                    <GitMerge className="h-3.5 w-3.5" />
-                    {t("issues.mergeButton", {
-                      count: selectedIssueIds.length,
-                    })}
-                  </button>
-                )}
-              </div>
-            </div>
-          )}
-
-          {/* Issues Error */}
-          {issuesQuery.isError && (
-            <div className="flex items-center justify-between rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800">
-              <span>
-                {issuesQuery.error instanceof Error
-                  ? issuesQuery.error.message
-                  : t("issues.loadIssuesFailed")}
-              </span>
-              <button
-                type="button"
-                onClick={() => void issuesQuery.refetch()}
-                className="rounded border border-rose-300 bg-white px-2.5 py-1 text-xs font-medium text-rose-700"
-              >
-                {t("common.retry")}
-              </button>
-            </div>
-          )}
-
-          {/* Issues Table */}
-          <div className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
-            <div className="overflow-x-auto">
-              <table className="min-w-full divide-y divide-slate-200 text-left text-sm">
-                <thead className="bg-slate-50 text-xs font-medium uppercase tracking-wider text-slate-500">
-                  <tr>
-                    <th className="w-10 px-4 py-3">
-                      <input
-                        type="checkbox"
-                        aria-label={t("issues.selectAllAria")}
-                        checked={allOnPageSelected}
-                        onChange={toggleSelectAllOnPage}
-                        className="h-4 w-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
-                      />
-                    </th>
-                    <th className="px-4 py-3">{t("issues.colIssue")}</th>
-                    <th className="whitespace-nowrap px-4 py-3">
-                      {t("issues.colStatus")}
-                    </th>
-                    <th className="whitespace-nowrap px-4 py-3">
-                      {t("issues.colComponent")}
-                    </th>
-                    <th className="whitespace-nowrap px-4 py-3">
-                      {t("issues.colCrashes")}
-                    </th>
-                    <th className="whitespace-nowrap px-4 py-3">
-                      {t("issues.colLastSeen")}
-                    </th>
-                    <th className="whitespace-nowrap px-4 py-3 text-right">
-                      {t("issues.colActions")}
-                    </th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100">
-                  {issuesQuery.isPending ? (
-                    <tr>
-                      <td
-                        colSpan={7}
-                        className="px-4 py-10 text-center text-sm text-slate-500"
-                      >
-                        {t("issues.loadingIssues")}
-                      </td>
-                    </tr>
-                  ) : issuesList.length === 0 ? (
-                    <tr>
-                      <td
-                        colSpan={7}
-                        className="px-4 py-12 text-center text-sm text-slate-500"
-                      >
-                        {t("issues.emptyIssues")}
-                      </td>
-                    </tr>
-                  ) : (
-                    issuesList.map((issue: IssueRead) => {
-                      const project = projectById.get(issue.project_id);
-                      const isSelected = selectedIssuesMap.has(issue.id);
-                      return (
-                        <tr
-                          key={issue.id}
-                          className={`hover:bg-slate-50 ${
-                            isSelected ? "bg-indigo-50/40" : ""
-                          }`}
-                        >
-                          <td className="px-4 py-3">
-                            <input
-                              type="checkbox"
-                              aria-label={t("issues.selectIssueAria", {
-                                id: issue.id,
-                              })}
-                              checked={isSelected}
-                              onChange={() => toggleSelectIssue(issue)}
-                              className="h-4 w-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
-                            />
-                          </td>
-                          <td className="px-4 py-3">
-                            <div className="flex flex-wrap items-center gap-2">
-                              <Link
-                                to={`/issues/${issue.id}`}
-                                className="font-medium text-slate-900 hover:text-indigo-600 hover:underline"
-                              >
-                                <span className="mr-1.5 font-mono text-xs text-slate-500">
-                                  #{issue.id}
-                                </span>
-                                {issue.title}
-                              </Link>
-                              {!selectedProjectId && project && (
-                                <span className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[11px] text-slate-600">
-                                  {project.key}
-                                </span>
-                              )}
-                              {issue.is_ambiguous_stack && (
-                                <span className="rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[11px] font-medium text-amber-700">
-                                  {t("issues.ambiguousStackBadge")}
-                                </span>
-                              )}
-                              {issue.fixed_in_version && (
-                                <span className="rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 font-mono text-[11px] text-emerald-700">
-                                  {t("issues.fixedVersionBadge", {
-                                    version: issue.fixed_in_version,
-                                  })}
-                                </span>
-                              )}
-                            </div>
-                            {issue.root_cause && (
-                              <p className="mt-0.5 line-clamp-1 text-xs text-slate-500">
-                                {issue.root_cause}
-                              </p>
-                            )}
-                          </td>
-                          <td className="whitespace-nowrap px-4 py-3">
-                            <span
-                              className={`inline-flex whitespace-nowrap rounded-full border px-2.5 py-0.5 text-xs font-medium ${
-                                STATUS_BADGE_CLASSES[issue.status]
-                              }`}
-                            >
-                              {formatIssueStatus(issue.status)}
-                            </span>
-                          </td>
-                          <td className="px-4 py-3 text-xs text-slate-600">
-                            {issue.component || "—"}
-                          </td>
-                          <td className="whitespace-nowrap px-4 py-3 font-mono text-xs font-semibold text-slate-800">
-                            {formatNumber(issue.crash_count)}
-                          </td>
-                          <td
-                            className="whitespace-nowrap px-4 py-3 text-xs text-slate-600"
-                            title={t("issues.firstSeenTitle", {
-                              time: formatDateTime(issue.first_seen_at),
-                            })}
-                          >
-                            {formatDateTime(issue.last_seen_at)}
-                          </td>
-                          <td className="whitespace-nowrap px-4 py-3 text-right">
-                            <div className="inline-flex items-center justify-end gap-1.5">
-                              <IssueTransitionSplitButton
-                                currentStatus={issue.status}
-                                issueId={issue.id}
-                                size="sm"
-                                isPending={
-                                  transitionMutation.isPending &&
-                                  transitioningIssueId === issue.id
-                                }
-                                onSelectAction={(action) =>
-                                  handleRowTransitionAction(issue, action)
-                                }
-                              />
-                              <button
-                                type="button"
-                                disabled={
-                                  pinMutation.isPending &&
-                                  pinningIssueId === issue.id
-                                }
-                                onClick={() =>
-                                  pinMutation.mutate({
-                                    id: issue.id,
-                                    isPinned: !issue.is_pinned,
-                                  })
-                                }
-                                title={
-                                  issue.is_pinned
-                                    ? t("issues.unpinTitle")
-                                    : t("issues.pinTitle")
-                                }
-                                aria-label={
-                                  issue.is_pinned
-                                    ? t("issues.unpinAria", { id: issue.id })
-                                    : t("issues.pinAria", { id: issue.id })
-                                }
-                                className={`inline-flex items-center gap-1 whitespace-nowrap rounded-md border px-2 py-1 text-xs font-medium transition-colors ${
-                                  issue.is_pinned
-                                    ? "border-amber-300 bg-amber-50 text-amber-800 hover:bg-amber-100"
-                                    : "border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
-                                }`}
-                              >
-                                <Pin className="h-3.5 w-3.5" />
-                                {issue.is_pinned
-                                  ? t("issues.pinned")
-                                  : t("issues.pin")}
-                              </button>
-                            </div>
-                          </td>
-                        </tr>
-                      );
-                    })
-                  )}
-                </tbody>
-              </table>
-            </div>
-
-            {/* Pagination Footer */}
-            <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-200 bg-slate-50 px-4 py-3 text-xs text-slate-600">
-              <span>
-                {t("common.showingRange", {
-                  from: issuesFrom,
-                  to: issuesTo,
-                  total: formatNumber(issuesTotal),
-                })}
-              </span>
-              <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  disabled={issuesPage === 0}
-                  onClick={() => setIssuesPage((p) => Math.max(0, p - 1))}
-                  className="inline-flex items-center gap-1 rounded-md border border-slate-300 bg-white px-2.5 py-1 font-medium text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  <ChevronLeft className="h-3.5 w-3.5" />
-                  {t("common.previous")}
-                </button>
-                <button
-                  type="button"
-                  disabled={(issuesPage + 1) * PAGE_SIZE >= issuesTotal}
-                  onClick={() => setIssuesPage((p) => p + 1)}
-                  className="inline-flex items-center gap-1 rounded-md border border-slate-300 bg-white px-2.5 py-1 font-medium text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  {t("common.next")}
-                  <ChevronRight className="h-3.5 w-3.5" />
-                </button>
-              </div>
-            </div>
-          </div>
-        </div>
+        <IssuesTabPanel
+          searchInput={searchInput}
+          onSearchInputChange={setSearchInput}
+          statusFilter={statusFilter}
+          onStatusFilterChange={setStatusFilter}
+          componentInput={componentInput}
+          onComponentInputChange={setComponentInput}
+          pinnedOnly={pinnedOnly}
+          onTogglePinnedOnly={() => setPinnedOnly((prev) => !prev)}
+          onResetFilters={() => {
+            setSearchInput("");
+            setStatusFilter("");
+            setComponentInput("");
+            setPinnedOnly(false);
+          }}
+          selectedProjectId={selectedProjectId}
+          projectById={projectById}
+          issuesList={issuesList}
+          issuesTotal={issuesTotal}
+          issuesPage={issuesPage}
+          onPageChange={setIssuesPage}
+          isPending={issuesQuery.isPending}
+          isError={issuesQuery.isError}
+          error={issuesQuery.error}
+          onRetry={() => void issuesQuery.refetch()}
+          selectedIssuesMap={selectedIssuesMap}
+          selectedIssueIds={selectedIssueIds}
+          hasCrossProjectSelection={hasCrossProjectSelection}
+          allOnPageSelected={allOnPageSelected}
+          onToggleSelectAllOnPage={toggleSelectAllOnPage}
+          onToggleSelectIssue={toggleSelectIssue}
+          onClearSelection={() => setSelectedIssuesMap(new Map())}
+          onOpenBatchTransitionModal={openBatchTransitionModal}
+          onOpenMergeModal={openMergeModal}
+          isTransitionPending={transitionMutation.isPending}
+          transitioningIssueId={transitioningIssueId}
+          onRowTransitionAction={handleRowTransitionAction}
+          isPinPending={pinMutation.isPending}
+          pinningIssueId={pinningIssueId}
+          onTogglePin={(issue) =>
+            pinMutation.mutate({
+              id: issue.id,
+              isPinned: !issue.is_pinned,
+            })
+          }
+        />
       )}
 
-      {/* CLUSTERS TAB */}
       {activeTab === "clusters" && (
-        <div className="space-y-4">
-          <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-200 bg-white p-3.5 shadow-sm">
-            <label className="inline-flex cursor-pointer items-center gap-2 text-sm text-slate-700">
-              <input
-                type="checkbox"
-                checked={unassignedOnly}
-                onChange={(e) => setUnassignedOnly(e.target.checked)}
-                className="h-4 w-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
-              />
-              {t("issues.unassignedOnly")}
-            </label>
-            <span className="text-xs text-slate-500">
-              {t("issues.clustersHint")}
-            </span>
-          </div>
-
-          {clustersQuery.isError && (
-            <div className="flex items-center justify-between rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800">
-              <span>
-                {clustersQuery.error instanceof Error
-                  ? clustersQuery.error.message
-                  : t("issues.loadClustersFailed")}
-              </span>
-              <button
-                type="button"
-                onClick={() => void clustersQuery.refetch()}
-                className="rounded border border-rose-300 bg-white px-2.5 py-1 text-xs font-medium text-rose-700"
-              >
-                {t("common.retry")}
-              </button>
-            </div>
-          )}
-
-          <div className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
-            <div className="overflow-x-auto">
-              <table className="min-w-full divide-y divide-slate-200 text-left text-sm">
-                <thead className="bg-slate-50 text-xs font-medium uppercase tracking-wider text-slate-500">
-                  <tr>
-                    <th className="px-4 py-3">
-                      {t("issues.colSignatureHash")}
-                    </th>
-                    <th className="px-4 py-3">{t("issues.colException")}</th>
-                    <th className="px-4 py-3">
-                      {t("issues.colSignatureFrames")}
-                    </th>
-                    <th className="px-4 py-3">{t("issues.colCrashes")}</th>
-                    <th className="px-4 py-3">
-                      {t("issues.colAssignedIssue")}
-                    </th>
-                    <th className="px-4 py-3 text-right">
-                      {t("issues.colExplore")}
-                    </th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100">
-                  {clustersQuery.isPending ? (
-                    <tr>
-                      <td
-                        colSpan={6}
-                        className="px-4 py-10 text-center text-sm text-slate-500"
-                      >
-                        {t("issues.loadingClusters")}
-                      </td>
-                    </tr>
-                  ) : clustersList.length === 0 ? (
-                    <tr>
-                      <td
-                        colSpan={6}
-                        className="px-4 py-12 text-center text-sm text-slate-500"
-                      >
-                        {t("issues.emptyClusters")}
-                      </td>
-                    </tr>
-                  ) : (
-                    clustersList.map((cluster: CrashClusterRead) => {
-                      const project = projectById.get(cluster.project_id);
-                      return (
-                        <tr key={cluster.id} className="hover:bg-slate-50">
-                          <td className="px-4 py-3">
-                            <div className="flex items-center gap-1.5">
-                              <code className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-xs text-slate-800">
-                                {cluster.signature_hash.slice(0, 12)}
-                              </code>
-                              <button
-                                type="button"
-                                onClick={() =>
-                                  handleCopyHash(cluster.signature_hash)
-                                }
-                                className="rounded p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-700"
-                                title={t("issues.copyHashTitle")}
-                              >
-                                {copiedHash === cluster.signature_hash ? (
-                                  <Check className="h-3.5 w-3.5 text-emerald-600" />
-                                ) : (
-                                  <Copy className="h-3.5 w-3.5" />
-                                )}
-                              </button>
-                            </div>
-                            {!selectedProjectId && project && (
-                              <div className="mt-1 font-mono text-[11px] text-slate-500">
-                                {project.key}
-                              </div>
-                            )}
-                          </td>
-                          <td className="px-4 py-3 font-mono text-xs text-slate-700">
-                            {cluster.exception_type || "—"}
-                          </td>
-                          <td className="max-w-md px-4 py-3 font-mono text-xs text-slate-600">
-                            <div className="truncate">
-                              {formatSignatureFrames(
-                                cluster.signature_frames_json,
-                                cluster.signature_text,
-                              )}
-                            </div>
-                          </td>
-                          <td className="px-4 py-3 font-mono text-xs font-semibold text-slate-800">
-                            {formatNumber(cluster.crash_count)}
-                          </td>
-                          <td className="px-4 py-3 text-xs">
-                            {cluster.issue_id !== null ? (
-                              <Link
-                                to={`/issues/${cluster.issue_id}`}
-                                className="font-medium text-indigo-600 hover:underline"
-                              >
-                                {t("issues.issueRef", { id: cluster.issue_id })}
-                              </Link>
-                            ) : (
-                              <span className="inline-flex rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[11px] font-medium text-amber-700">
-                                {t("issues.unassignedBadge")}
-                              </span>
-                            )}
-                          </td>
-                          <td className="px-4 py-3 text-right text-xs">
-                            <Link
-                              to={`/crashes?cluster_id=${encodeURIComponent(
-                                cluster.id,
-                              )}`}
-                              className="font-medium text-indigo-600 hover:underline"
-                            >
-                              {t("issues.viewCrashes")}
-                            </Link>
-                          </td>
-                        </tr>
-                      );
-                    })
-                  )}
-                </tbody>
-              </table>
-            </div>
-
-            <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-200 bg-slate-50 px-4 py-3 text-xs text-slate-600">
-              <span>
-                {t("common.showingRange", {
-                  from: clustersFrom,
-                  to: clustersTo,
-                  total: formatNumber(clustersTotal),
-                })}
-              </span>
-              <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  disabled={clustersPage === 0}
-                  onClick={() => setClustersPage((p) => Math.max(0, p - 1))}
-                  className="inline-flex items-center gap-1 rounded-md border border-slate-300 bg-white px-2.5 py-1 font-medium text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  <ChevronLeft className="h-3.5 w-3.5" />
-                  {t("common.previous")}
-                </button>
-                <button
-                  type="button"
-                  disabled={(clustersPage + 1) * PAGE_SIZE >= clustersTotal}
-                  onClick={() => setClustersPage((p) => p + 1)}
-                  className="inline-flex items-center gap-1 rounded-md border border-slate-300 bg-white px-2.5 py-1 font-medium text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  {t("common.next")}
-                  <ChevronRight className="h-3.5 w-3.5" />
-                </button>
-              </div>
-            </div>
-          </div>
-        </div>
+        <ClustersTabPanel
+          unassignedOnly={unassignedOnly}
+          onUnassignedOnlyChange={setUnassignedOnly}
+          selectedProjectId={selectedProjectId}
+          projectById={projectById}
+          clustersList={clustersList}
+          clustersTotal={clustersTotal}
+          clustersPage={clustersPage}
+          onPageChange={setClustersPage}
+          isPending={clustersQuery.isPending}
+          isError={clustersQuery.isError}
+          error={clustersQuery.error}
+          onRetry={() => void clustersQuery.refetch()}
+        />
       )}
 
-      {/* Merge Issues Modal */}
-      {isMergeModalOpen && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4"
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="merge-modal-title"
-        >
-          <div className="w-full max-w-lg rounded-xl border border-slate-200 bg-white p-6 shadow-xl">
-            <div className="flex items-center justify-between">
-              <h2
-                id="merge-modal-title"
-                className="text-base font-semibold text-slate-900"
-              >
-                {t("issues.mergeModalTitle")}
-              </h2>
-              <button
-                type="button"
-                onClick={() => setIsMergeModalOpen(false)}
-                className="rounded p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-700"
-              >
-                <X className="h-4 w-4" />
-              </button>
-            </div>
-            <p className="mt-1 text-xs text-slate-500">
-              {t("issues.mergeModalDesc")}
-            </p>
+      <MergeIssuesModal
+        isOpen={isMergeModalOpen}
+        selectedIssues={selectedIssues}
+        mergeTargetId={mergeTargetId}
+        hasCrossProjectSelection={hasCrossProjectSelection}
+        isPending={mergeMutation.isPending}
+        errorMessage={
+          mergeMutation.isError
+            ? mergeMutation.error instanceof ApiError
+              ? mergeMutation.error.message
+              : t("issues.mergeFailed")
+            : null
+        }
+        onSelectTarget={setMergeTargetId}
+        onClose={() => setIsMergeModalOpen(false)}
+        onConfirm={handleConfirmMerge}
+      />
 
-            {mergeMutation.isError && (
-              <div className="mt-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700">
-                {mergeMutation.error instanceof ApiError
-                  ? mergeMutation.error.message
-                  : t("issues.mergeFailed")}
-              </div>
-            )}
-
-            <div className="mt-4 max-h-64 space-y-2 overflow-y-auto">
-              {selectedIssues.map((issue) => (
-                <label
-                  key={issue.id}
-                  className={`flex cursor-pointer items-start gap-3 rounded-lg border p-3 text-sm ${
-                    mergeTargetId === issue.id
-                      ? "border-indigo-500 bg-indigo-50/50"
-                      : "border-slate-200 hover:bg-slate-50"
-                  }`}
-                >
-                  <input
-                    type="radio"
-                    name="merge-target-issue"
-                    checked={mergeTargetId === issue.id}
-                    onChange={() => setMergeTargetId(issue.id)}
-                    className="mt-0.5 text-indigo-600 focus:ring-indigo-500"
-                  />
-                  <div className="min-w-0 flex-1">
-                    <div className="font-medium text-slate-900">
-                      #{issue.id} — {issue.title}
-                    </div>
-                    <div className="mt-0.5 text-xs text-slate-500">
-                      {t("issues.mergeItemMeta", {
-                        status: formatIssueStatus(issue.status),
-                        count: issue.crash_count,
-                      })}
-                    </div>
-                  </div>
-                </label>
-              ))}
-            </div>
-
-            <div className="mt-5 flex justify-end gap-2">
-              <button
-                type="button"
-                onClick={() => setIsMergeModalOpen(false)}
-                className="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50"
-              >
-                {t("common.cancel")}
-              </button>
-              <button
-                type="button"
-                disabled={
-                  mergeTargetId === null ||
-                  hasCrossProjectSelection ||
-                  mergeMutation.isPending
-                }
-                onClick={handleConfirmMerge}
-                className="inline-flex items-center gap-1.5 rounded-md bg-indigo-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-indigo-700 disabled:opacity-50"
-              >
-                <GitMerge className="h-4 w-4" />
-                {mergeMutation.isPending
-                  ? t("issues.merging")
-                  : t("issues.confirmMerge")}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Create Issue Modal */}
-      {isCreateModalOpen && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4"
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="create-issue-modal-title"
-        >
-          <div className="w-full max-w-xl rounded-xl border border-slate-200 bg-white p-6 shadow-xl">
-            <div className="flex items-center justify-between">
-              <h2
-                id="create-issue-modal-title"
-                className="text-base font-semibold text-slate-900"
-              >
-                {t("issues.createModalTitle")}
-              </h2>
-              <button
-                type="button"
-                onClick={() => setIsCreateModalOpen(false)}
-                className="rounded p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-700"
-              >
-                <X className="h-4 w-4" />
-              </button>
-            </div>
-
-            <form onSubmit={handleCreateSubmit} className="mt-4 space-y-4">
-              {createMutation.isError && (
-                <div className="flex items-center gap-2 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700">
-                  <AlertTriangle className="h-4 w-4 shrink-0" />
-                  <span>
-                    {createMutation.error instanceof ApiError
-                      ? createMutation.error.message
-                      : t("issues.createFailed")}
-                  </span>
-                </div>
-              )}
-
-              <div>
-                <label className="block text-xs font-medium text-slate-700">
-                  {t("issues.projectLabel")}
-                </label>
-                <select
-                  required
-                  disabled={Boolean(selectedProjectId)}
-                  value={effectiveCreateProjectId}
-                  onChange={(e) => setNewProjectId(e.target.value)}
-                  className="mt-1 h-9 w-full rounded-md border border-slate-300 bg-white px-3 text-sm text-slate-900 disabled:bg-slate-100"
-                >
-                  {projects.length === 0 && (
-                    <option value="">{t("issues.noProjectsAvailable")}</option>
-                  )}
-                  {projects.map((p) => (
-                    <option key={p.id} value={p.id}>
-                      {p.name} ({p.key})
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              <div>
-                <label className="block text-xs font-medium text-slate-700">
-                  {t("issues.titleLabel")}{" "}
-                  <span className="text-rose-500">*</span>
-                </label>
-                <input
-                  type="text"
-                  required
-                  value={newTitle}
-                  onChange={(e) => setNewTitle(e.target.value)}
-                  placeholder={t("issues.titlePlaceholder")}
-                  className="mt-1 h-9 w-full rounded-md border border-slate-300 px-3 text-sm text-slate-900"
-                />
-              </div>
-
-              <div className="grid gap-3 sm:grid-cols-3">
-                <div>
-                  <label className="block text-xs font-medium text-slate-700">
-                    {t("issues.statusLabel")}
-                  </label>
-                  <select
-                    value={newStatus}
-                    onChange={(e) =>
-                      setNewStatus(e.target.value as IssueStatus)
-                    }
-                    className="mt-1 h-9 w-full rounded-md border border-slate-300 bg-white px-2.5 text-sm text-slate-900"
-                  >
-                    {ISSUE_STATUSES.map((st) => (
-                      <option key={st} value={st}>
-                        {formatIssueStatus(st)}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-                <div>
-                  <label className="block text-xs font-medium text-slate-700">
-                    {t("issues.componentLabel")}
-                  </label>
-                  <input
-                    type="text"
-                    value={newComponent}
-                    onChange={(e) => setNewComponent(e.target.value)}
-                    placeholder={t("issues.componentExamplePlaceholder")}
-                    className="mt-1 h-9 w-full rounded-md border border-slate-300 px-3 text-sm text-slate-900"
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs font-medium text-slate-700">
-                    {t("issues.fixedInVersionLabel")}
-                  </label>
-                  <input
-                    type="text"
-                    value={newFixedInVersion}
-                    onChange={(e) => setNewFixedInVersion(e.target.value)}
-                    placeholder={t("issues.fixedInVersionPlaceholder")}
-                    className="mt-1 h-9 w-full rounded-md border border-slate-300 px-3 font-mono text-sm text-slate-900"
-                  />
-                </div>
-              </div>
-
-              <div>
-                <label className="block text-xs font-medium text-slate-700">
-                  {t("issues.rootCauseLabel")}
-                </label>
-                <textarea
-                  rows={3}
-                  value={newRootCause}
-                  onChange={(e) => setNewRootCause(e.target.value)}
-                  placeholder={t("issues.rootCausePlaceholder")}
-                  className="mt-1 w-full rounded-md border border-slate-300 p-2.5 text-sm text-slate-900"
-                />
-              </div>
-
-              <div>
-                <label className="block text-xs font-medium text-slate-700">
-                  {t("issues.logPatternsLabel")}
-                </label>
-                <textarea
-                  rows={2}
-                  value={newLogPatternsText}
-                  onChange={(e) => setNewLogPatternsText(e.target.value)}
-                  placeholder="FATAL:.*DeviceLost"
-                  className="mt-1 w-full rounded-md border border-slate-300 p-2.5 font-mono text-xs text-slate-900"
-                />
-              </div>
-
-              <div className="flex flex-wrap gap-4">
-                <label className="inline-flex items-center gap-2 text-xs text-slate-700">
-                  <input
-                    type="checkbox"
-                    checked={newIsAmbiguous}
-                    onChange={(e) => setNewIsAmbiguous(e.target.checked)}
-                    className="h-4 w-4 rounded border-slate-300 text-indigo-600"
-                  />
-                  {t("issues.ambiguousStackCheckbox")}
-                </label>
-                <label className="inline-flex items-center gap-2 text-xs text-slate-700">
-                  <input
-                    type="checkbox"
-                    checked={newIsPinned}
-                    onChange={(e) => setNewIsPinned(e.target.checked)}
-                    className="h-4 w-4 rounded border-slate-300 text-indigo-600"
-                  />
-                  {t("issues.pinIssueCheckbox")}
-                </label>
-              </div>
-
-              <div className="flex justify-end gap-2 pt-2">
-                <button
-                  type="button"
-                  onClick={() => setIsCreateModalOpen(false)}
-                  className="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-50"
-                >
-                  {t("common.cancel")}
-                </button>
-                <button
-                  type="submit"
-                  disabled={
-                    createMutation.isPending ||
-                    !effectiveCreateProjectId ||
-                    !newTitle.trim()
-                  }
-                  className="rounded-md bg-indigo-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-indigo-700 disabled:opacity-50"
-                >
-                  {createMutation.isPending
-                    ? t("common.creating")
-                    : t("issues.createIssueButton")}
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
+      <CreateIssueModal
+        isOpen={isCreateModalOpen}
+        projects={projects}
+        selectedProjectId={selectedProjectId}
+        resetNonce={createResetNonce}
+        isPending={createMutation.isPending}
+        errorMessage={
+          createMutation.isError
+            ? createMutation.error instanceof ApiError
+              ? createMutation.error.message
+              : t("issues.createFailed")
+            : null
+        }
+        onClose={() => setIsCreateModalOpen(false)}
+        onSubmit={(payload) => createMutation.mutate(payload)}
+      />
 
       <IssueTransitionModal
         isOpen={transitionModal !== null}
