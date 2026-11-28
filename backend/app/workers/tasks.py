@@ -5,15 +5,17 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from contextlib import AsyncExitStack, nullcontext
 from pathlib import Path
 from typing import Any
 
+from arq import Retry
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.config import Settings, get_settings
-from app.db.models import AIAnalysisRun, CrashJob, CrashReport
+from app.db.models import AIAnalysisRun, CrashJob, CrashLog, CrashReport
 from app.db.session import get_session_factory
 from app.services import (
     clustering,
@@ -23,20 +25,34 @@ from app.services import (
     symbol_service,
 )
 from app.services.ai_agent import AITriageAgent
+from app.services.crash_ingest import (
+    cleanup_staged_upload_dir,
+    is_staged_upload_path,
+    materialize_staged_crash_artifacts,
+)
 from app.services.events import EventBus, get_event_bus
+from app.services.missing_symbols import (
+    backfill_unindexed_missing_symbols,
+    build_missing_filter_clause,
+    sync_crash_missing_symbols,
+)
 from app.services.storage import StorageManager
 from app.workers.jobs import (
     ACTIVE_CRASH_STATUSES,
     CRASH_JOB_TIMEOUT_SECONDS,
+    IO_QUEUE_NAME,
     JOB_DELIVERY_TIMEOUT_SECONDS,
+    RECOVERY_BATCH_SIZE,
+    RECOVERY_MAX_BATCHES_PER_TICK,
     CrashJobClaim,
     CrashJobSuperseded,
+    _supports_queue_name_kwarg,
     claim_crash_job,
     crash_has_job,
     enqueue_crash_job,
     finish_crash_job,
     lock_current_crash_job,
-    pending_crash_jobs,
+    pending_crash_jobs_with_tasks,
     release_crash_job,
     stage_crash_job,
 )
@@ -62,6 +78,13 @@ def _effective_storage(ctx: dict[str, Any], effective_settings: Settings) -> Sto
     return StorageManager(data_dir=effective_settings.DATA_DIR, settings=effective_settings)
 
 
+def _use_split_queues(ctx: dict[str, Any]) -> bool:
+    settings: Settings | None = ctx.get("settings")
+    if settings is None:
+        settings = get_settings()
+    return bool(getattr(settings, "SPLIT_WORKER_QUEUES", False))
+
+
 async def _dispatch_ai_triage(ctx: dict[str, Any], crash_id: uuid.UUID) -> None:
     dispatcher = ctx.get("dispatcher")
     if dispatcher is not None:
@@ -69,7 +92,10 @@ async def _dispatch_ai_triage(ctx: dict[str, Any], crash_id: uuid.UUID) -> None:
         return
     redis_pool = ctx.get("redis")
     if redis_pool is not None:
-        await redis_pool.enqueue_job("ai_triage", str(crash_id))
+        kwargs: dict[str, Any] = {}
+        if _use_split_queues(ctx) and _supports_queue_name_kwarg(redis_pool.enqueue_job):
+            kwargs["_queue_name"] = IO_QUEUE_NAME
+        await redis_pool.enqueue_job("ai_triage", str(crash_id), **kwargs)
         return
     await ai_triage(ctx, str(crash_id))
 
@@ -84,13 +110,24 @@ async def _publish_status(
         logger.warning("Could not publish crash status %s for %s", status, crash_id, exc_info=True)
 
 
-async def _deliver_crash_job(ctx: dict[str, Any], job_id: uuid.UUID) -> None:
+async def _deliver_crash_job(
+    ctx: dict[str, Any],
+    job_id: uuid.UUID,
+    *,
+    task: str | None = None,
+) -> None:
     try:
         if (dispatcher := ctx.get("dispatcher")) is not None:
-            await dispatcher.kick_crash_jobs([job_id])
+            task_map = {job_id: task} if task is not None else None
+            await dispatcher.kick_crash_jobs([job_id], task_by_job_id=task_map)
         elif (redis_pool := ctx.get("redis")) is not None:
             async with asyncio.timeout(JOB_DELIVERY_TIMEOUT_SECONDS):
-                await enqueue_crash_job(redis_pool, job_id)
+                await enqueue_crash_job(
+                    redis_pool,
+                    job_id,
+                    task=task,
+                    split_queues=_use_split_queues(ctx),
+                )
     except Exception:
         logger.warning("Crash job %s remains pending after delivery failure", job_id, exc_info=True)
 
@@ -116,12 +153,15 @@ async def _dispatch_ms_symbol_fetch(
                 )
         elif (redis_pool := ctx.get("redis")) is not None:
             async with asyncio.timeout(JOB_DELIVERY_TIMEOUT_SECONDS):
+                enqueue_kwargs: dict[str, Any] = {"_job_id": f"msdl-crash:{crash_id}"}
+                if _use_split_queues(ctx) and _supports_queue_name_kwarg(redis_pool.enqueue_job):
+                    enqueue_kwargs["_queue_name"] = IO_QUEUE_NAME
                 await redis_pool.enqueue_job(
                     "fetch_ms_symbols",
                     str(crash_id),
                     str(project_id),
                     payload,
-                    _job_id=f"msdl-crash:{crash_id}",
+                    **enqueue_kwargs,
                 )
     except Exception:
         logger.warning(
@@ -150,15 +190,43 @@ async def _fail_crash(
     crash_id: uuid.UUID,
     message: str,
     claim: CrashJobClaim | None,
+    storage: StorageManager | None = None,
 ) -> dict[str, Any]:
     try:
-        async with session_factory() as session:
-            crash = await session.get(CrashReport, crash_id, with_for_update=claim is not None)
-            if crash is not None:
-                crash.status = "FAILED"
-                if claim is not None:
-                    await finish_crash_job(session, claim)
-                await session.commit()
+        async with AsyncExitStack() as stack:
+            if storage is not None:
+                await stack.enter_async_context(storage.storage_io_lock(exclusive=False))
+            async with session_factory() as session:
+                crash = await session.get(
+                    CrashReport,
+                    crash_id,
+                    with_for_update=claim is not None,
+                )
+                if crash is not None:
+                    crash.status = "FAILED"
+                    if storage is not None:
+                        await storage.ensure_usage_ledger(session, lock=True)
+                        freed_bytes, deleted_files = cleanup_staged_upload_dir(storage, crash_id)
+                        if is_staged_upload_path(crash.dump_path):
+                            crash.dump_path = None
+                        await session.execute(
+                            update(CrashLog)
+                            .where(
+                                CrashLog.crash_id == crash_id,
+                                CrashLog.staged_raw_path.is_not(None),
+                            )
+                            .values(staged_raw_path=None)
+                        )
+                        if freed_bytes > 0 or deleted_files > 0:
+                            await storage.commit_usage_deltas(
+                                session,
+                                {"staging": -freed_bytes},
+                                {"staging": -deleted_files},
+                                enforce_quota=False,
+                            )
+                    if claim is not None:
+                        await finish_crash_job(session, claim)
+                    await session.commit()
     except CrashJobSuperseded:
         return {"crash_id": str(crash_id), "status": "superseded"}
     await _publish_status(event_bus, crash_id, "FAILED", stage="failed", error=message)
@@ -166,20 +234,46 @@ async def _fail_crash(
 
 
 async def recover_crash_jobs(ctx: dict[str, Any]) -> None:
-    """Deliver outstanding jobs even when the API or Redis failed during the first enqueue."""
-    async with ctx["session_factory"]() as session:
-        job_ids = await pending_crash_jobs(session)
+    """Deliver outstanding jobs in bounded batches even after API or Redis delivery failures."""
+    split_queues = _use_split_queues(ctx)
     try:
         async with asyncio.timeout(JOB_DELIVERY_TIMEOUT_SECONDS):
-            for job_id in job_ids:
-                await enqueue_crash_job(ctx["redis"], job_id)
+            for batch_idx in range(RECOVERY_MAX_BATCHES_PER_TICK):
+                async with ctx["session_factory"]() as session:
+                    pairs = await pending_crash_jobs_with_tasks(
+                        session,
+                        offset=batch_idx * RECOVERY_BATCH_SIZE,
+                        limit=RECOVERY_BATCH_SIZE,
+                    )
+                if not pairs:
+                    break
+                for job_id, job_task in pairs:
+                    await enqueue_crash_job(
+                        ctx["redis"],
+                        job_id,
+                        task=job_task,
+                        split_queues=split_queues,
+                    )
+                if len(pairs) < RECOVERY_BATCH_SIZE:
+                    break
     except Exception:
         logger.warning("Could not recover pending crash jobs", exc_info=True)
+
+    try:
+        async with ctx["session_factory"]() as session:
+            await backfill_unindexed_missing_symbols(
+                session,
+                batch_size=200,
+                max_batches=1,
+                commit_per_batch=True,
+            )
+    except Exception:
+        logger.warning("Could not backfill unindexed missing symbols", exc_info=True)
 
 
 async def run_crash_job(ctx: dict[str, Any], job_id: str) -> dict[str, Any] | None:
     """Claim a single crash operation and relinquish the claim if work is interrupted."""
-    session_factory, _, event_bus = _resolve_ctx_defaults(ctx)
+    session_factory, base_settings, event_bus = _resolve_ctx_defaults(ctx)
     async with session_factory() as session:
         claim = await claim_crash_job(session, uuid.UUID(job_id))
     if claim is None:
@@ -195,8 +289,14 @@ async def run_crash_job(ctx: dict[str, Any], job_id: str) -> dict[str, Any] | No
                 claim=claim, resymbolication=claim.task == "resymbolicate",
             )
     except TimeoutError:
+        cleanup_storage = _effective_storage(ctx, base_settings)
         return await _fail_crash(
-            session_factory, event_bus, claim.crash_id, "Crash processing timed out", claim,
+            session_factory,
+            event_bus,
+            claim.crash_id,
+            "Crash processing timed out",
+            claim,
+            storage=cleanup_storage,
         )
     finally:
         try:
@@ -220,38 +320,112 @@ async def symbol_ingest(
     pid = uuid.UUID(str(project_id))
     pdb_path = Path(pdb_staged_path) if pdb_staged_path else None
     pe_path = Path(pe_staged_path) if pe_staged_path else None
+    cleanup_storage = _effective_storage(ctx, base_settings)
+    staging_root = cleanup_storage.partition_path("staging").resolve()
+    staging_symbol_uploads = (staging_root / "symbol_uploads").resolve()
+    symbol_upload_id: str | None = None
+    if pdb_path is not None:
+        try:
+            rel_parts = pdb_path.resolve().relative_to(staging_symbol_uploads).parts
+            if len(rel_parts) >= 2:
+                symbol_upload_id = rel_parts[0]
+        except (OSError, ValueError):
+            symbol_upload_id = None
 
+    preserve_for_retry = False
     try:
-        async with session_factory() as session:
-            effective_app = await settings_service.get_effective_app_settings(
-                session, base_settings=base_settings
-            )
-            eff_storage = _effective_storage(ctx, effective_app)
-            result = await symbol_service.ingest_symbol(
-                session=session,
-                storage=eff_storage,
-                settings=effective_app,
-                project_id=pid,
-                app_version=app_version,
-                pdb_filename=pdb_filename,
-                pdb_bytes_or_path=pdb_path,
-                pe_filename=pe_filename,
-                pe_bytes_or_path=pe_path,
-                exec_fn=ctx.get("exec_fn"),
-            )
-            await session.refresh(result.symbol)
-            return {
-                "symbol_id": str(result.symbol.id),
-                "debug_file": result.symbol.debug_file,
-                "debug_id": result.symbol.debug_id,
-                "has_pe_unwind": result.symbol.has_pe_unwind,
-                "deduplicated": result.deduplicated,
-                "upgraded": result.upgraded,
-            }
+        async with AsyncExitStack() as lease_stack:
+            if symbol_upload_id is not None:
+                await lease_stack.enter_async_context(
+                    cleanup_storage.async_staging_upload_lease("symupload", symbol_upload_id)
+                )
+            async with session_factory() as session:
+                effective_app = await settings_service.get_effective_app_settings(
+                    session, base_settings=base_settings
+                )
+                eff_storage = _effective_storage(ctx, effective_app)
+                result = await symbol_service.ingest_symbol(
+                    session=session,
+                    storage=eff_storage,
+                    settings=effective_app,
+                    project_id=pid,
+                    app_version=app_version,
+                    pdb_filename=pdb_filename,
+                    pdb_bytes_or_path=pdb_path,
+                    pe_filename=pe_filename,
+                    pe_bytes_or_path=pe_path,
+                    exec_fn=ctx.get("exec_fn"),
+                )
+                await session.refresh(result.symbol)
+                return {
+                    "symbol_id": str(result.symbol.id),
+                    "debug_file": result.symbol.debug_file,
+                    "debug_id": result.symbol.debug_id,
+                    "has_pe_unwind": result.symbol.has_pe_unwind,
+                    "deduplicated": result.deduplicated,
+                    "upgraded": result.upgraded,
+                }
+    except (asyncio.CancelledError, Retry):
+        # ARQ retries cancelled/Retry jobs on worker restart; preserve staged inputs and lease.
+        preserve_for_retry = True
+        raise
     finally:
-        for path in (pdb_path, pe_path):
-            if path is not None:
-                path.unlink(missing_ok=True)
+        if not preserve_for_retry:
+            freed_staged_bytes = 0
+            deleted_staged_files = 0
+            async with cleanup_storage.storage_io_lock(exclusive=False):
+                has_staging_files = any(
+                    path is not None
+                    and path.is_file()
+                    and path.resolve().is_relative_to(staging_root)
+                    for path in (pdb_path, pe_path)
+                )
+                cleanup_session_ctx = session_factory() if has_staging_files else nullcontext()
+                try:
+                    async with AsyncExitStack() as cleanup_stack:
+                        cleanup_session: AsyncSession | None = None
+                        if has_staging_files:
+                            cleanup_session = await cleanup_stack.enter_async_context(
+                                cleanup_session_ctx
+                            )
+                            await cleanup_storage.ensure_usage_ledger(cleanup_session, lock=True)
+
+                        for path in (pdb_path, pe_path):
+                            if path is not None:
+                                try:
+                                    in_staging = path.resolve().is_relative_to(staging_root)
+                                    if path.is_file() and in_staging:
+                                        freed_staged_bytes += path.stat().st_size
+                                        deleted_staged_files += 1
+                                    path.unlink(missing_ok=True)
+                                except OSError:
+                                    pass
+                        if symbol_upload_id is not None:
+                            lease_file = (
+                                staging_symbol_uploads / symbol_upload_id / ".tmp_lease.json"
+                            )
+                            try:
+                                lease_file.unlink(missing_ok=True)
+                            except OSError:
+                                pass
+                        for path in (pdb_path, pe_path):
+                            if path is not None and path.parent.exists():
+                                cleanup_storage._prune_empty_dirs(path.parent, staging_root)
+                        if cleanup_session is not None and (
+                            freed_staged_bytes > 0 or deleted_staged_files > 0
+                        ):
+                            await cleanup_storage.commit_usage_deltas(
+                                cleanup_session,
+                                {"staging": -freed_staged_bytes},
+                                {"staging": -deleted_staged_files},
+                                enforce_quota=False,
+                            )
+                            await cleanup_session.commit()
+                except Exception:
+                    logger.debug(
+                        "Could not decrement staging ledger after symbol_ingest",
+                        exc_info=True,
+                    )
 
 
 async def parse_crash(
@@ -318,6 +492,29 @@ async def parse_crash(
             if not dump_path:
                 raise ValueError(f"CrashReport {cid} has no dump_path")
 
+            # Stage 0: compress raw staged dump and index staged logs (idempotent no-op if done).
+            materialized = await materialize_staged_crash_artifacts(
+                session,
+                crash,
+                eff_storage,
+                eff_settings,
+            )
+            if materialized:
+                await session.refresh(crash)
+                if project is not None:
+                    await session.refresh(project)
+                dump_path = crash.dump_path
+                if not dump_path:
+                    raise ValueError(f"CrashReport {cid} has no dump_path after materialization")
+                await _publish_status(
+                    event_bus,
+                    cid,
+                    "PARSING",
+                    stage="logs_indexed",
+                    ai_verdict=ai_verdict_snapshot,
+                    error=None,
+                )
+
             # dump_parser.parse_dump owns staging directory creation and cleanup.
             parsed = await dump_parser.parse_dump(
                 dump_path,
@@ -327,6 +524,25 @@ async def parse_crash(
                 project_id=crash.project_id,
             )
 
+            # Account for any public Breakpad symbols downloaded directly by minidump-stackwalk.
+            if parsed.public_cache_changed:
+                async with eff_storage.public_cache_lock(exclusive=False):
+                    async with eff_storage.storage_io_lock(exclusive=True):
+                        await eff_storage.reconcile_partition_usage_single(
+                            session, "symbols/public_cache"
+                        )
+                        await session.commit()
+
+            # Lock crash row before persisting fresh parsed stacks/missing symbols so a
+            # concurrent legacy backfill cannot race and overwrite the fresh index.
+            await session.refresh(
+                crash,
+                attribute_names=["status", "missing_symbols_indexed"],
+                with_for_update=True,
+            )
+            if claim is not None:
+                await lock_current_crash_job(session, claim)
+
             crash.crash_reason = parsed.crash_reason
             crash.crash_address = parsed.crash_address
             if parsed.os_version and not existing_os_version:
@@ -334,6 +550,7 @@ async def parse_crash(
             crash.parsed_summary_json = parsed.parsed_summary_json
             crash.parsed_stacks_json = parsed.parsed_stacks_json
             crash.missing_symbols_json = parsed.missing_symbols_json
+            await sync_crash_missing_symbols(session, crash)
 
             proj_cfg = settings_service.resolve_project_settings(
                 effective,
@@ -396,7 +613,7 @@ async def parse_crash(
                 error=None,
             )
             if next_job_id is not None:
-                await _deliver_crash_job(ctx, next_job_id)
+                await _deliver_crash_job(ctx, next_job_id, task="ai_triage")
             else:
                 await _dispatch_ai_triage(ctx, cid)
             return {
@@ -424,7 +641,10 @@ async def parse_crash(
     except Exception as exc:
         err_msg = str(exc) or type(exc).__name__
         logger.exception("parse_crash failed for %s: %s", cid, err_msg)
-        return await _fail_crash(session_factory, event_bus, cid, err_msg, claim)
+        cleanup_storage = _effective_storage(ctx, base_settings)
+        return await _fail_crash(
+            session_factory, event_bus, cid, err_msg, claim, storage=cleanup_storage
+        )
 
 
 async def ai_triage(
@@ -522,25 +742,27 @@ async def resymbolicate(
     candidate_ids: list[uuid.UUID] = []
 
     async with session_factory() as discovery_session:
-        stmt = select(CrashReport.id, CrashReport.missing_symbols_json).where(
+        target_debug_id = debug_id.strip().upper() if debug_id else None
+        project_uuid = uuid.UUID(str(project_id)) if project_id is not None else None
+        if target_debug_id is not None:
+            await backfill_unindexed_missing_symbols(
+                discovery_session,
+                project_id=project_uuid,
+                commit_per_batch=True,
+            )
+
+        stmt = select(CrashReport.id).where(
             CrashReport.dump_path.is_not(None),
             CrashReport.status.notin_(ACTIVE_CRASH_STATUSES),
         )
         if crash_ids is not None:
             stmt = stmt.where(CrashReport.id.in_([uuid.UUID(str(x)) for x in crash_ids]))
-        if project_id is not None:
-            stmt = stmt.where(CrashReport.project_id == uuid.UUID(str(project_id)))
+        if project_uuid is not None:
+            stmt = stmt.where(CrashReport.project_id == project_uuid)
+        if target_debug_id is not None:
+            stmt = stmt.where(build_missing_filter_clause({target_debug_id}))
 
-        rows = (await discovery_session.execute(stmt)).all()
-        target_debug_id = debug_id.strip().upper() if debug_id else None
-        for row_id, missing_json in rows:
-            if target_debug_id is not None and not any(
-                str(entry.get("debug_id") or "").strip().upper() == target_debug_id
-                for entry in (missing_json or [])
-                if isinstance(entry, dict)
-            ):
-                continue
-            candidate_ids.append(row_id)
+        candidate_ids = list((await discovery_session.scalars(stmt)).all())
 
     for cid in candidate_ids:
         result = await parse_crash(ctx, cid, resymbolication=True)
@@ -609,35 +831,34 @@ async def fetch_ms_symbols(
         and effective_app.MS_SYMBOL_AUTO_RESYMBOLICATE
     ):
         try:
-            async with eff_storage.shared_lock("capacity"):
-                async with session_factory() as session:
-                    has_ai_run = (
-                        await session.scalar(
-                            select(AIAnalysisRun.id)
-                            .where(AIAnalysisRun.crash_id == cid)
-                            .limit(1)
-                        )
-                        is not None
+            async with session_factory() as session:
+                has_ai_run = (
+                    await session.scalar(
+                        select(AIAnalysisRun.id)
+                        .where(AIAnalysisRun.crash_id == cid)
+                        .limit(1)
                     )
-                    reserved = await session.scalar(
-                        update(CrashReport)
-                        .where(
-                            CrashReport.id == cid,
-                            CrashReport.dump_path.is_not(None),
-                            CrashReport.status.notin_(ACTIVE_CRASH_STATUSES),
-                            ~crash_has_job(),
-                        )
-                        .values(status="PENDING")
-                        .returning(CrashReport.id)
+                    is not None
+                )
+                reserved = await session.scalar(
+                    update(CrashReport)
+                    .where(
+                        CrashReport.id == cid,
+                        CrashReport.dump_path.is_not(None),
+                        CrashReport.status.notin_(ACTIVE_CRASH_STATUSES),
+                        ~crash_has_job(),
                     )
-                    if reserved is not None:
-                        resym_job_id = stage_crash_job(
-                            session,
-                            cid,
-                            "resymbolicate",
-                            run_ai_override=False if has_ai_run else None,
-                        )
-                        await session.commit()
+                    .values(status="PENDING")
+                    .returning(CrashReport.id)
+                )
+                if reserved is not None:
+                    resym_job_id = stage_crash_job(
+                        session,
+                        cid,
+                        "resymbolicate",
+                        run_ai_override=False if has_ai_run else None,
+                    )
+                    await session.commit()
         except Exception:
             logger.warning(
                 "Could not schedule auto-resymbolicate for crash %s after MSDL import",
@@ -647,7 +868,7 @@ async def fetch_ms_symbols(
             resym_job_id = None
 
     if resym_job_id is not None:
-        await _deliver_crash_job(ctx, resym_job_id)
+        await _deliver_crash_job(ctx, resym_job_id, task="resymbolicate")
 
     return {
         **summary.to_dict(),

@@ -40,14 +40,19 @@ services:
         CARGO_MIRROR_URL: ${CARGO_MIRROR_URL:-}
         PIP_INDEX_URL: ${PIP_INDEX_URL:-}
     restart: unless-stopped
-    command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers ${UVICORN_WORKERS:-2}"
     env_file:
       - path: .env
         required: false
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://crashkiller:crashkiller@postgres:5432/crashkiller}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      SPLIT_WORKER_QUEUES: ${SPLIT_WORKER_QUEUES:-true}
       DATA_DIR: ${DATA_DIR:-/data}
+      UVICORN_WORKERS: ${UVICORN_WORKERS:-2}
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
+      DASHBOARD_CACHE_TTL_SECONDS: ${DASHBOARD_CACHE_TTL_SECONDS:-15}
       ADMIN_USERNAME: ${ADMIN_USERNAME:-}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
       ALLOW_UNAUTHENTICATED_SYMSRV: ${ALLOW_UNAUTHENTICATED_SYMSRV:-false}
@@ -76,20 +81,60 @@ services:
         CARGO_MIRROR_URL: ${CARGO_MIRROR_URL:-}
         PIP_INDEX_URL: ${PIP_INDEX_URL:-}
     restart: unless-stopped
-    command: arq app.workers.worker.WorkerSettings
+    command: >-
+      sh -c 'case "$$(printf %s "$${SPLIT_WORKER_QUEUES:-true}" | tr A-Z a-z)" in
+      false|0|no|off) exec arq app.workers.worker.WorkerSettings ;;
+      *) exec arq app.workers.worker.ComputeWorkerSettings ;; esac'
     env_file:
       - path: .env
         required: false
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://crashkiller:crashkiller@postgres:5432/crashkiller}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      SPLIT_WORKER_QUEUES: ${SPLIT_WORKER_QUEUES:-true}
       DATA_DIR: ${DATA_DIR:-/data}
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
       ADMIN_USERNAME: ""
       ADMIN_PASSWORD: ""
     volumes:
       - ${CRASHKILLER_DATA_PATH:-./data}:/data
-    mem_limit: 4608m
-    cpus: 4.0
+    mem_limit: 3072m
+    cpus: 3.0
+    depends_on:
+      api:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker-io:
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+      args:
+        DEBIAN_MIRROR: ${DEBIAN_MIRROR:-}
+        CARGO_MIRROR_URL: ${CARGO_MIRROR_URL:-}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-}
+    restart: unless-stopped
+    command: arq app.workers.worker.IOWorkerSettings
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://crashkiller:crashkiller@postgres:5432/crashkiller}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      SPLIT_WORKER_QUEUES: ${SPLIT_WORKER_QUEUES:-true}
+      DATA_DIR: ${DATA_DIR:-/data}
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
+      ADMIN_USERNAME: ""
+      ADMIN_PASSWORD: ""
+    volumes:
+      - ${CRASHKILLER_DATA_PATH:-./data}:/data
+    mem_limit: 1536m
+    cpus: 1.0
     depends_on:
       api:
         condition: service_healthy

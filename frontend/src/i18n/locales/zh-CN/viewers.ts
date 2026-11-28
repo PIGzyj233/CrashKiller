@@ -75,6 +75,7 @@ const zhCNViewers = {
   },
   log: {
     fetchLinesFailed: "获取日志行失败",
+    indexingInProgress: "日志正在后台索引中，请稍候自动刷新或点击重试。",
     noLinesInWindow: "该时间窗口内未找到日志行。",
     jumpedAroundTime: "已跳转至第 {{line}} 行（±{{sec}}s 窗口内共 {{count}} 行）",
     jumpAroundTimeFailed: "按时间戳跳转失败",

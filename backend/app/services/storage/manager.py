@@ -34,7 +34,7 @@ class StorageManager(StorageIOMixin, StorageQuotaMixin):
         force_emergency: bool = False,
     ) -> dict[str, Any]:
         """Run TTL + LRU garbage collection while protecting pinned crashes & issues."""
-        async with self.shared_lock("capacity"):
+        async with self.shared_lock("gc"):
             return await self._run_gc(session, force_emergency)
 
     async def _run_gc(

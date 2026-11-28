@@ -41,6 +41,7 @@ export interface CrashLogRead {
   raw_size: number;
   compressed_size: number;
   total_lines: number;
+  is_indexing?: boolean;
   digest_json?: LogDigest | null;
 }
 
@@ -51,6 +52,7 @@ export interface LogSummaryResponse {
   raw_size: number;
   compressed_size: number;
   total_lines: number;
+  is_indexing?: boolean;
   digest: LogDigest;
 }
 

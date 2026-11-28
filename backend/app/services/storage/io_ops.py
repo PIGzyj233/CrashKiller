@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
+import json
 import os
 import shutil
 import tempfile
+import threading
+import time
 import uuid
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, BinaryIO
+from typing import TYPE_CHECKING, Any, BinaryIO
 
 import zstandard as zstd
 
@@ -48,15 +51,134 @@ class StorageIOMixin:
     @asynccontextmanager
     async def shared_lock(self, purpose: str) -> AsyncIterator[None]:
         """Serialize storage operations across the API and workers sharing DATA_DIR."""
+        async with self.rw_lock(purpose, exclusive=True):
+            yield
+
+    @asynccontextmanager
+    async def rw_lock(self, purpose: str, *, exclusive: bool = False) -> AsyncIterator[None]:
+        """Cross-process POSIX reader-writer flock (LOCK_SH for readers, LOCK_EX for writers)."""
+        mode = (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB
         with (self.data_dir / f".{purpose}.lock").open("ab") as lock:
             while True:
                 try:
-                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(lock, mode)
                 except BlockingIOError:
-                    await asyncio.sleep(0.025)
+                    await asyncio.sleep(0.01)
                 else:
                     break
             yield
+
+    @asynccontextmanager
+    async def storage_io_lock(self, *, exclusive: bool = False) -> AsyncIterator[None]:
+        """Coordinate concurrent file+ledger writers (LOCK_SH) with reconciliation (LOCK_EX)."""
+        async with self.rw_lock("storage-io", exclusive=exclusive):
+            yield
+
+    @asynccontextmanager
+    async def project_sym_lock(self, *, exclusive: bool = False) -> AsyncIterator[None]:
+        """Coordinate project symbol publication (LOCK_SH) with project-symbol GC (LOCK_EX)."""
+        async with self.rw_lock("project-sym", exclusive=exclusive):
+            yield
+
+    @asynccontextmanager
+    async def public_cache_lock(self, *, exclusive: bool = False) -> AsyncIterator[None]:
+        """Coordinate public symbol publication (LOCK_SH) with public-cache GC (LOCK_EX)."""
+        async with self.rw_lock("public-cache", exclusive=exclusive):
+            yield
+
+    @asynccontextmanager
+    async def raw_symbol_lock(self, *, exclusive: bool = False) -> AsyncIterator[None]:
+        """Coordinate raw symbol archive publication (LOCK_SH) with raw-symbol GC (LOCK_EX)."""
+        async with self.rw_lock("raw-symbols", exclusive=exclusive):
+            yield
+
+    @contextmanager
+    def staging_upload_lease(self, kind: str, key: str) -> Iterator[None]:
+        """Hold a POSIX lease protecting an in-flight upload directory from GC before DB commit."""
+        root = self.partition_path("staging")
+        marker = root / f".tmp_{kind}_{key}.lock"
+        with marker.open("ab") as lease:
+            fcntl.flock(lease, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                marker.unlink(missing_ok=True)
+
+    @asynccontextmanager
+    async def async_staging_upload_lease(self, kind: str, key: str) -> AsyncIterator[None]:
+        """Non-blocking async POSIX lease protecting an in-flight upload directory from GC."""
+        root = self.partition_path("staging")
+        marker = root / f".tmp_{kind}_{key}.lock"
+        with marker.open("ab") as lease:
+            while True:
+                try:
+                    fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    await asyncio.sleep(0.01)
+                else:
+                    break
+            try:
+                yield
+            finally:
+                marker.unlink(missing_ok=True)
+
+    @staticmethod
+    def _staging_upload_lease_active(root: Path, kind: str, key: str) -> bool:
+        try:
+            with (root / f".tmp_{kind}_{key}.lock").open("rb") as lease:
+                fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except FileNotFoundError:
+            return False
+        except BlockingIOError:
+            return True
+        return False
+
+    def write_staging_queue_lease(
+        self,
+        rel_dir: str,
+        ttl_seconds: float,
+        *,
+        job_id: str | None = None,
+        queue_name: str | None = None,
+        mode: str | None = None,
+    ) -> Path:
+        """Write a .tmp_lease.json marker protecting a queued staging directory."""
+        dest = self.resolve_path(f"{rel_dir}/.tmp_lease.json")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        payload: dict[str, Any] = {
+            "expires_at": time.time() + max(1.0, float(ttl_seconds)),
+            "created_at": time.time(),
+            "pid": os.getpid(),
+        }
+        if job_id:
+            payload["job_id"] = job_id
+        if queue_name:
+            payload["queue_name"] = queue_name
+        if mode:
+            payload["mode"] = mode
+        dest.write_text(json.dumps(payload), encoding="utf-8")
+        return dest
+
+    @staticmethod
+    def _read_staging_queue_lease(dir_path: Path) -> dict[str, Any] | None:
+        lease_file = dir_path / ".tmp_lease.json"
+        if not lease_file.is_file():
+            return None
+        try:
+            data = json.loads(lease_file.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else None
+        except (OSError, ValueError, TypeError):
+            return None
+
+    @staticmethod
+    def _staging_queue_lease_active(dir_path: Path) -> bool:
+        data = StorageIOMixin._read_staging_queue_lease(dir_path)
+        if data is None:
+            return False
+        try:
+            return time.time() < float(data.get("expires_at", 0.0))
+        except (ValueError, TypeError):
+            return False
 
     @contextmanager
     def staging_workspace(self, prefix: str) -> Iterator[Path]:
@@ -183,6 +305,8 @@ class StorageIOMixin:
         self,
         src_path_or_stream: Path | str | BinaryIO,
         crash_id: uuid.UUID | str,
+        *,
+        cancel_event: threading.Event | None = None,
     ) -> tuple[str, int, int]:
         """Compress a minidump to dumps/<crash_id>/<crash_id>.dmp.zst atomically."""
         if isinstance(src_path_or_stream, (str, Path)) and "\x00" in str(src_path_or_stream):
@@ -211,6 +335,8 @@ class StorageIOMixin:
             nonlocal raw_size
             with compressor.stream_writer(dst_fh, closefd=False) as zw:
                 while True:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise StorageError("Dump compression cancelled")
                     buf = src_fh.read(65536)
                     if not buf:
                         break
@@ -220,6 +346,8 @@ class StorageIOMixin:
             os.fsync(dst_fh.fileno())
 
         try:
+            if cancel_event is not None and cancel_event.is_set():
+                raise StorageError("Dump compression cancelled")
             with tempfile.NamedTemporaryFile(
                 dir=dest.parent,
                 prefix=".tmp_",
@@ -231,6 +359,8 @@ class StorageIOMixin:
                         _copy(src_fh, tmp)
                 else:
                     _copy(src_path_or_stream, tmp)
+            if cancel_event is not None and cancel_event.is_set():
+                raise StorageError("Dump compression cancelled")
             compressed_size = tmp_path.stat().st_size
             os.replace(tmp_path, dest)
             tmp_path = None

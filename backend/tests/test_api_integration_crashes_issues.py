@@ -328,23 +328,26 @@ async def test_crash_upload_sanitizes_log_filenames_and_cleans_partial_artifacts
     assert "evil.log" in stored_names
     assert any(fname.endswith(".log") and fname != "evil.log" for fname in stored_names)
 
-    # Partial failure during log ingestion cleans up dumps/<crash_id> and logs/<crash_id>
+    # 1. Partial failure during upload staging cleans up staging/uploads/<crash_id> and returns 507
+    from app.services.storage.io_ops import StorageIOMixin
+
     dumps_dir = api_harness.data_dir / "dumps"
     logs_dir = api_harness.data_dir / "logs"
+    staging_dir = api_harness.data_dir / "staging"
     dumps_before = sorted(p.relative_to(api_harness.data_dir) for p in dumps_dir.rglob("*"))
     logs_before = sorted(p.relative_to(api_harness.data_dir) for p in logs_dir.rglob("*"))
 
-    orig_ingest = LogEngine.ingest_log
-    call_count = 0
+    orig_write_stream = StorageIOMixin.atomic_write_stream
+    stream_calls = 0
 
-    def _fail_second_log(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        nonlocal call_count
-        call_count += 1
-        if call_count >= 2:
-            raise OSError("Simulated disk write failure")
-        return orig_ingest(self, *args, **kwargs)
+    def _fail_third_stream(self, *args: Any, **kwargs: Any) -> tuple[Path, int]:
+        nonlocal stream_calls
+        stream_calls += 1
+        if stream_calls >= 3:
+            raise OSError("Simulated staging disk write failure")
+        return orig_write_stream(self, *args, **kwargs)
 
-    monkeypatch.setattr(LogEngine, "ingest_log", _fail_second_log)
+    monkeypatch.setattr(StorageIOMixin, "atomic_write_stream", _fail_third_stream)
     fail_resp = await client.post(
         "/api/v1/crashes/upload",
         headers={"X-API-Key": proj["api_key"]},
@@ -356,11 +359,42 @@ async def test_crash_upload_sanitizes_log_filenames_and_cleans_partial_artifacts
         ],
     )
     assert fail_resp.status_code == 507
+    assert sorted(p.relative_to(api_harness.data_dir) for p in dumps_dir.rglob("*")) == dumps_before
+    assert sorted(p.relative_to(api_harness.data_dir) for p in logs_dir.rglob("*")) == logs_before
+    assert not list(staging_dir.rglob("*"))
 
-    dumps_after = sorted(p.relative_to(api_harness.data_dir) for p in dumps_dir.rglob("*"))
-    logs_after = sorted(p.relative_to(api_harness.data_dir) for p in logs_dir.rglob("*"))
-    assert dumps_after == dumps_before
-    assert logs_after == logs_before
+    # 2. Partial failure during async worker log ingestion cleans up partial files & marks FAILED
+    monkeypatch.undo()
+    orig_ingest = LogEngine.ingest_log
+    call_count = 0
+
+    def _fail_second_log(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        nonlocal call_count
+        call_count += 1
+        if call_count >= 2:
+            raise OSError("Simulated worker log disk write failure")
+        return orig_ingest(self, *args, **kwargs)
+
+    monkeypatch.setattr(LogEngine, "ingest_log", _fail_second_log)
+    worker_fail_resp = await client.post(
+        "/api/v1/crashes/upload",
+        headers={"X-API-Key": proj["api_key"]},
+        data={"project_key": proj["key"], "app_version": "1.0.0"},
+        files=[
+            ("dump_file", ("partial2.dmp", b"MDMP_PARTIAL_2", "application/octet-stream")),
+            ("log_files", ("first.log", b"2026-11-22 10:00:00.000 INFO ok\n", "text/plain")),
+            ("log_files", ("second.log", b"2026-11-22 10:00:01.000 INFO fail\n", "text/plain")),
+        ],
+    )
+    assert worker_fail_resp.status_code == 202
+    failed_cid = worker_fail_resp.json()["crash_id"]
+    await _drain(api_harness)
+
+    failed_detail = (await client.get(f"/api/v1/crashes/{failed_cid}")).json()
+    assert failed_detail["status"] == "FAILED"
+    assert sorted(p.relative_to(api_harness.data_dir) for p in dumps_dir.rglob("*")) == dumps_before
+    assert sorted(p.relative_to(api_harness.data_dir) for p in logs_dir.rglob("*")) == logs_before
+    assert not list(staging_dir.rglob("*"))
 
 
 async def test_crash_session_id_upload_filter_related_logs_and_project_label(

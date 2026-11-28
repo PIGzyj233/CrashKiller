@@ -16,6 +16,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    false,
     text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -232,6 +233,20 @@ class CrashReport(Base):
         Index("ix_crash_reports_project_status_created", "project_id", "status", "created_at"),
         Index("ix_crash_reports_is_pinned_created", "is_pinned", "created_at"),
         Index("ix_crash_reports_project_session_created", "project_id", "session_id", "created_at"),
+        Index(
+            "ix_crash_reports_dump_created",
+            "created_at",
+            postgresql_where=text("dump_path IS NOT NULL"),
+            sqlite_where=text("dump_path IS NOT NULL"),
+        ),
+        Index(
+            "ix_crash_reports_missing_unindexed",
+            "id",
+            postgresql_where=text(
+                "missing_symbols_json IS NOT NULL AND missing_symbols_indexed = false"
+            ),
+            sqlite_where=text("missing_symbols_json IS NOT NULL AND missing_symbols_indexed = 0"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUIDType, primary_key=True, default=uuid.uuid4)
@@ -269,6 +284,12 @@ class CrashReport(Base):
         JSONBType,
         nullable=True,
     )
+    missing_symbols_indexed: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default=false(),
+    )
     ai_verdict: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
     ai_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
     is_human_verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
@@ -289,6 +310,11 @@ class CrashReport(Base):
         cascade="all, delete-orphan",
         passive_deletes=True,
         order_by="AIAnalysisRun.created_at.desc()",
+    )
+    missing_symbol_rows: Mapped[list[CrashMissingSymbol]] = relationship(
+        back_populates="crash_report",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
     )
 
 
@@ -314,6 +340,14 @@ class CrashJob(Base):
 
 class CrashLog(Base):
     __tablename__ = "crash_logs"
+    __table_args__ = (
+        Index(
+            "ix_crash_logs_zst_crash",
+            "crash_id",
+            postgresql_where=text("zst_path IS NOT NULL"),
+            sqlite_where=text("zst_path IS NOT NULL"),
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUIDType, primary_key=True, default=uuid.uuid4)
     crash_id: Mapped[uuid.UUID] = mapped_column(
@@ -325,12 +359,49 @@ class CrashLog(Base):
     filename: Mapped[str] = mapped_column(String(512), nullable=False)
     zst_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     idx_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    staged_raw_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     raw_size: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     compressed_size: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     total_lines: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     digest_json: Mapped[dict[str, Any]] = mapped_column(JSONBType, nullable=False, default=dict)
 
     crash_report: Mapped[CrashReport] = relationship(back_populates="logs")
+
+    @property
+    def is_indexing(self) -> bool:
+        """True while raw uploaded log is queued/being compressed into chunked zstd."""
+        return bool(self.staged_raw_path and not self.zst_path)
+
+
+class CrashMissingSymbol(Base):
+    """Normalized per-crash missing symbol rows for indexed queue & resymbolication queries."""
+
+    __tablename__ = "crash_missing_symbols"
+    __table_args__ = (
+        Index("ix_crash_missing_symbols_project_debug_id", "project_id", "debug_id"),
+        Index("ix_crash_missing_symbols_key", "debug_file_lower", "debug_id"),
+    )
+
+    crash_id: Mapped[uuid.UUID] = mapped_column(
+        UUIDType,
+        ForeignKey("crash_reports.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    debug_file_lower: Mapped[str] = mapped_column(String(255), primary_key=True)
+    debug_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        UUIDType,
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    debug_file: Mapped[str] = mapped_column(String(255), nullable=False)
+    module_name: Mapped[str] = mapped_column(String(255), nullable=False, default="unknown")
+    code_file: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    code_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    crash_time: Mapped[datetime] = mapped_column(TZDateTime, nullable=False, default=utcnow)
+
+    crash_report: Mapped[CrashReport] = relationship(back_populates="missing_symbol_rows")
 
 
 class AIAnalysisRun(Base):
@@ -373,3 +444,14 @@ class SystemSetting(Base):
         default=utcnow,
         onupdate=utcnow,
     )
+
+
+class StoragePartitionUsage(Base):
+    """Incremental byte and file count ledger per storage partition."""
+
+    __tablename__ = "storage_partition_usage"
+
+    partition: Mapped[str] = mapped_column(String(64), primary_key=True)
+    used_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    file_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    reconciled_at: Mapped[datetime | None] = mapped_column(TZDateTime, nullable=True)

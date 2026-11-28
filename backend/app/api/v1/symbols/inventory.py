@@ -86,69 +86,95 @@ async def delete_symbol(
     session: AsyncSession = Depends(get_db),
     storage: StorageManager = Depends(get_storage),
 ) -> Response:
-    sym = await session.get(Symbol, symbol_id)
-    if sym is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Symbol not found")
+    async with storage.storage_io_lock(exclusive=False):
+        # Follow global DB lock order: lock/initialize storage_partition_usage BEFORE locking
+        # the symbol row so delete_symbol and _store_symbol upgrades never deadlock on PG,
+        # and a first-ever deletion never scans post-unlink disk usage before subtracting.
+        await storage.ensure_usage_ledger(session, lock=True)
 
-    sym_path = sym.sym_path
-    sym_partition = (
-        "symbols/public_cache"
-        if sym.project_id is None or (sym_path or "").startswith("symbols/public_cache/")
-        else "symbols/sym"
-    )
-    raw_archive_path = sym.raw_archive_path
-    code_id = sym.code_id
-    code_file = sym.code_file
+        sym = await session.get(Symbol, symbol_id, with_for_update=True)
+        if sym is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Symbol not found")
 
-    await session.delete(sym)
-    await session.flush()
-
-    if sym_path:
-        sym_ref_count = int(
-            (
-                await session.execute(
-                    select(func.count()).select_from(Symbol).where(Symbol.sym_path == sym_path)
-                )
-            ).scalar_one()
+        sym_path = sym.sym_path
+        sym_partition = (
+            "symbols/public_cache"
+            if sym.project_id is None or (sym_path or "").startswith("symbols/public_cache/")
+            else "symbols/sym"
         )
-        if sym_ref_count == 0:
-            _unlink_and_prune(storage, sym_path, sym_partition)
+        raw_archive_path = sym.raw_archive_path
+        code_id = sym.code_id
+        code_file = sym.code_file
 
-    if raw_archive_path:
-        raw_ref_count = int(
-            (
-                await session.execute(
-                    select(func.count())
-                    .select_from(Symbol)
-                    .where(Symbol.raw_archive_path == raw_archive_path)
-                )
-            ).scalar_one()
-        )
-        if raw_ref_count == 0:
-            _unlink_and_prune(storage, raw_archive_path, "symbols/raw")
+        await session.delete(sym)
+        await session.flush()
 
-    if code_id and code_file:
-        pe_raw_rel = f"symbols/raw/{code_id}/{code_file}.zst"
-        pe_ref_count = int(
-            (
-                await session.execute(
-                    select(func.count())
-                    .select_from(Symbol)
-                    .where(
-                        or_(
-                            and_(
-                                Symbol.code_id == code_id,
-                                Symbol.code_file == code_file,
-                                Symbol.has_pe_unwind.is_(True),
-                            ),
-                            Symbol.raw_archive_path == pe_raw_rel,
+        byte_deltas: dict[str, int] = {}
+        file_deltas: dict[str, int] = {}
+
+        if sym_path:
+            sym_ref_count = int(
+                (
+                    await session.execute(
+                        select(func.count()).select_from(Symbol).where(Symbol.sym_path == sym_path)
+                    )
+                ).scalar_one()
+            )
+            if sym_ref_count == 0:
+                removed = _unlink_and_prune(storage, sym_path, sym_partition)
+                if removed > 0:
+                    byte_deltas[sym_partition] = byte_deltas.get(sym_partition, 0) - removed
+                    file_deltas[sym_partition] = file_deltas.get(sym_partition, 0) - 1
+
+        if raw_archive_path:
+            raw_ref_count = int(
+                (
+                    await session.execute(
+                        select(func.count())
+                        .select_from(Symbol)
+                        .where(Symbol.raw_archive_path == raw_archive_path)
+                    )
+                ).scalar_one()
+            )
+            if raw_ref_count == 0:
+                removed = _unlink_and_prune(storage, raw_archive_path, "symbols/raw")
+                if removed > 0:
+                    byte_deltas["symbols/raw"] = byte_deltas.get("symbols/raw", 0) - removed
+                    file_deltas["symbols/raw"] = file_deltas.get("symbols/raw", 0) - 1
+
+        if code_id and code_file:
+            pe_raw_rel = f"symbols/raw/{code_id}/{code_file}.zst"
+            pe_ref_count = int(
+                (
+                    await session.execute(
+                        select(func.count())
+                        .select_from(Symbol)
+                        .where(
+                            or_(
+                                and_(
+                                    Symbol.code_id == code_id,
+                                    Symbol.code_file == code_file,
+                                    Symbol.has_pe_unwind.is_(True),
+                                ),
+                                Symbol.raw_archive_path == pe_raw_rel,
+                            )
                         )
                     )
-                )
-            ).scalar_one()
-        )
-        if pe_ref_count == 0:
-            _unlink_and_prune(storage, pe_raw_rel, "symbols/raw")
+                ).scalar_one()
+            )
+            if pe_ref_count == 0:
+                removed = _unlink_and_prune(storage, pe_raw_rel, "symbols/raw")
+                if removed > 0:
+                    byte_deltas["symbols/raw"] = byte_deltas.get("symbols/raw", 0) - removed
+                    file_deltas["symbols/raw"] = file_deltas.get("symbols/raw", 0) - 1
 
-    await session.commit()
+        if byte_deltas or file_deltas:
+            await storage.commit_usage_deltas(
+                session,
+                byte_deltas,
+                file_deltas,
+                enforce_quota=False,
+            )
+
+        await session.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)

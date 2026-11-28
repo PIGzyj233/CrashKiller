@@ -112,8 +112,12 @@ async def _archive_raw_files(
 
     primary_rel: str | None = None
     total_raw_size = 0
+    raw_byte_delta = 0
+    raw_file_delta = 0
 
     if pdb_path is not None and rel_pdb is not None:
+        pdb_target = storage.resolve_path(rel_pdb)
+        old_pdb_size = pdb_target.stat().st_size if pdb_target.is_file() else 0
         try:
             archived = await asyncio.to_thread(storage.compress_raw_symbol, pdb_path, rel_pdb)
         except StorageError as exc:
@@ -121,8 +125,13 @@ async def _archive_raw_files(
         if archived is not None:
             primary_rel, sz = archived
             total_raw_size += sz
+            raw_byte_delta += sz - old_pdb_size
+            if old_pdb_size == 0:
+                raw_file_delta += 1
 
     if pe_path is not None and rel_pe is not None:
+        pe_target = storage.resolve_path(rel_pe)
+        old_pe_size = pe_target.stat().st_size if pe_target.is_file() else 0
         try:
             archived = await asyncio.to_thread(storage.compress_raw_symbol, pe_path, rel_pe)
         except StorageError as exc:
@@ -132,5 +141,16 @@ async def _archive_raw_files(
             if primary_rel is None:
                 primary_rel = rel_pe_out
             total_raw_size += sz
+            raw_byte_delta += sz - old_pe_size
+            if old_pe_size == 0:
+                raw_file_delta += 1
+
+    if raw_byte_delta != 0 or raw_file_delta != 0:
+        await storage.commit_usage_deltas(
+            session,
+            {"symbols/raw": raw_byte_delta},
+            {"symbols/raw": raw_file_delta},
+            enforce_quota=False,
+        )
 
     return primary_rel, total_raw_size

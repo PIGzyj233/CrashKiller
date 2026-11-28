@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -28,6 +29,7 @@ def ingest_log(
     chunk_size_bytes: int = 262144,
     zstd_level: int = 6,
     session_id: str | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> dict[str, Any]:
     """Stream-ingest a raw log into 256KB newline-aligned zstd frames + .idx.json."""
     cleaned_session_id = normalize_session_id(session_id)
@@ -194,9 +196,13 @@ def ingest_log(
         src_fh = input_path_or_stream
 
     try:
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("Log ingestion cancelled")
         with open(zst_tmp, "wb") as zst_fh:
             pending = bytearray()
             while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise RuntimeError("Log ingestion cancelled")
                 block = src_fh.read(65536)
                 if not block:
                     break
@@ -219,7 +225,7 @@ def ingest_log(
             _flush_chunk(zst_fh)
             zst_fh.flush()
             os.fsync(zst_fh.fileno())
-    except Exception:
+    except BaseException:
         if zst_tmp.exists():
             zst_tmp.unlink()
         raise
@@ -267,13 +273,17 @@ def ingest_log(
         idx_data["session_id"] = cleaned_session_id
 
     try:
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("Log ingestion cancelled")
         with open(idx_tmp, "w", encoding="utf-8") as idx_fh:
             json.dump(idx_data, idx_fh, ensure_ascii=False)
             idx_fh.flush()
             os.fsync(idx_fh.fileno())
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("Log ingestion cancelled")
         os.replace(zst_tmp, zst_dest)
         os.replace(idx_tmp, idx_dest)
-    except Exception:
+    except BaseException:
         for p in (zst_tmp, idx_tmp):
             if p.exists():
                 p.unlink()

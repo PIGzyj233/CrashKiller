@@ -20,6 +20,7 @@ export interface LogViewportProps {
   virtualItems: VirtualItem[];
   windowStart: number;
   currentLogLinesMap: Map<number, LogLine> | undefined;
+  isIndexing: boolean;
   activeGcError: LogGcError | null;
   activePageError: string | null;
   effectiveTotalLines: number;
@@ -42,6 +43,7 @@ export function LogViewport({
   virtualItems,
   windowStart,
   currentLogLinesMap,
+  isIndexing,
   activeGcError,
   activePageError,
   effectiveTotalLines,
@@ -74,6 +76,11 @@ export function LogViewport({
               {t("log.gcUnavailableDesc")}
             </p>
           </div>
+        </div>
+      ) : isIndexing ? (
+        <div className="flex h-[320px] flex-col items-center justify-center gap-2.5 px-6 text-center text-xs text-slate-300">
+          <RefreshCw className="h-5 w-5 animate-spin text-indigo-400" />
+          <span>{t("log.indexingInProgress")}</span>
         </div>
       ) : effectiveTotalLines === 0 ? (
         <div className="flex h-[320px] items-center justify-center px-6 text-center text-xs text-slate-400">

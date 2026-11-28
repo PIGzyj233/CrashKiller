@@ -36,6 +36,8 @@ async def cluster_crash(
     triage_mode: str | None = None,
     system_settings: dict[str, Any] | None = None,
     noise_rules: NoiseRules | dict[str, Any] | None = None,
+    *,
+    include_similar_issues: bool | None = None,
 ) -> ClusterResult:
     """Cluster a parsed CrashReport, reconcile counts, and decide AI triage eligibility."""
     rules = (
@@ -246,11 +248,18 @@ async def cluster_crash(
             crash_report.status = "ANALYZED"
             crash_report.ai_verdict = "KNOWN_ISSUE"
 
-    similar_issues = await recall_similar_issues(
-        session,
-        project.id,
-        top_10,
-        limit=5,
+    run_recall = (
+        include_similar_issues if include_similar_issues is not None else should_run_ai
+    )
+    similar_issues = (
+        await recall_similar_issues(
+            session,
+            project.id,
+            top_10,
+            limit=5,
+        )
+        if run_recall
+        else []
     )
     await session.flush()
 

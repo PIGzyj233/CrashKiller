@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-import shutil
+import os
 import uuid
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 from fastapi import (
     APIRouter,
@@ -61,14 +62,18 @@ from app.schemas.issue import CrashClusterRead, IssueRead
 from app.schemas.log import CrashLogRead
 from app.services import clustering
 from app.services.clustering import ClusteringError
+from app.services.crash_ingest import (
+    cleanup_staged_upload_dir,
+    stage_crash_upload_files,
+)
 from app.services.events import (
     TERMINAL_CRASH_STATUSES,
     EventBus,
     normalize_event_payload,
 )
-from app.services.log_engine import LogEngine, normalize_session_id
+from app.services.log_engine import normalize_session_id
 from app.services.storage import StorageCapacityError, StorageError, StorageManager
-from app.services.symbol_service import stream_decompressed_zst
+from app.services.symbol_service.symsrv import stream_decompressed_zst_handle
 from app.workers.jobs import ACTIVE_CRASH_STATUSES, crash_has_job, stage_crash_job
 from app.workers.worker import TaskDispatcher
 
@@ -110,15 +115,25 @@ def _sanitize_log_filename(raw_name: str | None, fallback: str) -> str:
     return name
 
 
-def _cleanup_crash_upload_artifacts(written_files: list[Path], crash_dirs: list[Path]) -> None:
-    for file_path in written_files:
-        try:
-            file_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-    for dir_path in crash_dirs:
-        if dir_path.exists():
-            shutil.rmtree(dir_path, ignore_errors=True)
+def _stream_open_raw_file(fh: BinaryIO, chunk_size: int = 65536) -> Iterator[bytes]:
+    try:
+        while True:
+            chunk = fh.read(chunk_size)
+            if not chunk:
+                break
+            yield chunk
+    finally:
+        fh.close()
+
+
+def _measure_upload_stream(stream: BinaryIO) -> int:
+    try:
+        pos = stream.tell()
+        size = stream.seek(0, os.SEEK_END)
+        stream.seek(pos)
+        return max(0, int(size))
+    except (OSError, AttributeError, ValueError):
+        return 0
 
 
 def _serialize_crash_detail(
@@ -294,117 +309,131 @@ async def upload_crash(
     effective_app, eff_storage = await get_effective_storage(session, storage, base_settings)
 
     crash_id = uuid.uuid4()
-    written_files: list[Path] = []
-    crash_dirs: list[Path] = [
-        eff_storage.resolve_path(f"dumps/{crash_id}"),
-        eff_storage.resolve_path(f"logs/{crash_id}"),
-    ]
-
-    upload_partitions = {"dumps": 1}
+    upload_headroom = {"dumps": 1}
     if log_files:
-        upload_partitions["logs"] = 1
-    async with eff_storage.shared_lock("capacity"):
-        try:
-            await eff_storage.require_capacity(session, upload_partitions)
+        upload_headroom["logs"] = 1
+
+    log_inputs: list[tuple[uuid.UUID, str, Any]] = []
+    for lf in log_files or []:
+        lid = uuid.uuid4()
+        safe_name = _sanitize_log_filename(lf.filename, f"{lid}.log")
+        log_inputs.append((lid, safe_name, lf.file))
+
+    reserved_bytes = _measure_upload_stream(dump_file.file) + sum(
+        _measure_upload_stream(stream) for _, _, stream in log_inputs
+    )
+    reserved_files = 1 + len(log_inputs)
+    reservation_committed = False
+
+    async with eff_storage.storage_io_lock(exclusive=False):
+        async with eff_storage.async_staging_upload_lease("upload", str(crash_id)):
             try:
-                dump_rel, dump_raw_size, dump_comp_size = await asyncio.to_thread(
-                    eff_storage.compress_dump,
-                    dump_file.file,
-                    crash_id,
+                await eff_storage.commit_usage_deltas(
+                    session,
+                    {"staging": max(1, reserved_bytes) if reserved_bytes > 0 else 0},
+                    {"staging": reserved_files},
+                    enforce_quota=True,
+                    extra_headroom_checks=upload_headroom,
                 )
-                written_files.append(eff_storage.resolve_path(dump_rel))
-            except OSError as exc:
-                raise HTTPException(
-                    status_code=status.HTTP_507_INSUFFICIENT_STORAGE,
-                    detail=f"Failed to store crash dump: {exc}",
-                ) from exc
-            except StorageError as exc:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=str(exc),
-                ) from exc
+                await session.commit()
+                reservation_committed = True
 
-            log_engine = LogEngine()
-            log_rows: list[CrashLog] = []
-            log_ids: list[uuid.UUID] = []
-
-            for lf in log_files or []:
-                log_id = uuid.uuid4()
-                rel_zst = f"logs/{crash_id}/{log_id}.log.zst"
-                rel_idx = f"logs/{crash_id}/{log_id}.idx.json"
-                zst_abs = eff_storage.resolve_path(rel_zst)
-                idx_abs = eff_storage.resolve_path(rel_idx)
-                zst_abs.parent.mkdir(parents=True, exist_ok=True)
-                written_files.extend([zst_abs, idx_abs])
                 try:
-                    ingest_res = await asyncio.to_thread(
-                        log_engine.ingest_log,
-                        lf.file,
-                        zst_abs,
-                        idx_abs,
-                        effective_app.LOG_CHUNK_SIZE_BYTES,
-                        effective_app.LOG_ZSTD_LEVEL,
-                        cleaned_session_id,
+                    staged = await asyncio.to_thread(
+                        stage_crash_upload_files,
+                        eff_storage,
+                        crash_id,
+                        dump_file.file,
+                        log_inputs,
                     )
                 except OSError as exc:
                     raise HTTPException(
                         status_code=status.HTTP_507_INSUFFICIENT_STORAGE,
-                        detail=f"Failed to store crash log: {exc}",
+                        detail=f"Failed to stage crash upload: {exc}",
+                    ) from exc
+                except StorageError as exc:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=str(exc),
                     ) from exc
 
-                safe_name = _sanitize_log_filename(lf.filename, f"{log_id}.log")
-                log_rows.append(
-                    CrashLog(
-                        id=log_id,
-                        crash_id=crash_id,
-                        filename=safe_name,
-                        zst_path=rel_zst,
-                        idx_path=rel_idx,
-                        raw_size=int(ingest_res["raw_size"]),
-                        compressed_size=int(ingest_res["compressed_size"]),
-                        total_lines=int(ingest_res["total_lines"]),
-                        digest_json=dict(ingest_res["digest_json"]),
-                    )
+                now = utcnow()
+                crash = CrashReport(
+                    id=crash_id,
+                    project_id=project.id,
+                    status="PENDING",
+                    app_version=cleaned_version,
+                    build_id=cleaned_build_id,
+                    os_version=cleaned_os_version,
+                    session_id=cleaned_session_id,
+                    dump_path=staged.dump_rel_path,
+                    dump_raw_size=staged.dump_raw_size,
+                    dump_compressed_size=0,
+                    crash_time=parsed_crash_time,
+                    created_at=now,
                 )
-                log_ids.append(log_id)
+                session.add(crash)
 
-            now = utcnow()
-            crash = CrashReport(
-                id=crash_id,
-                project_id=project.id,
-                status="PENDING",
-                app_version=cleaned_version,
-                build_id=cleaned_build_id,
-                os_version=cleaned_os_version,
-                session_id=cleaned_session_id,
-                dump_path=dump_rel,
-                dump_raw_size=dump_raw_size,
-                dump_compressed_size=dump_comp_size,
-                crash_time=parsed_crash_time,
-                created_at=now,
-            )
-            session.add(crash)
-            for log_row in log_rows:
-                session.add(log_row)
+                log_ids: list[uuid.UUID] = []
+                for item in staged.logs:
+                    session.add(
+                        CrashLog(
+                            id=item.log_id,
+                            crash_id=crash_id,
+                            filename=item.filename,
+                            zst_path=None,
+                            idx_path=None,
+                            staged_raw_path=item.rel_raw_path,
+                            raw_size=item.raw_size,
+                            compressed_size=0,
+                            total_lines=0,
+                            digest_json={},
+                        )
+                    )
+                    log_ids.append(item.log_id)
 
-            await session.flush()
-            job_id = stage_crash_job(session, crash_id, "parse_crash")
-            await session.flush()
-            await eff_storage.require_capacity(session, dict.fromkeys(upload_partitions, 0))
-            await session.commit()
-        except BaseException as exc:
-            _cleanup_crash_upload_artifacts(written_files, crash_dirs)
-            try:
-                await session.rollback()
-            except Exception:
-                pass
-            if isinstance(exc, StorageCapacityError):
-                raise HTTPException(
-                    status_code=status.HTTP_507_INSUFFICIENT_STORAGE, detail=str(exc)
-                ) from exc
-            raise
+                await session.flush()
+                job_id = stage_crash_job(session, crash_id, "parse_crash")
+                await session.flush()
 
-    await dispatcher.kick_crash_jobs([job_id])
+                byte_diff = staged.total_staged_bytes - reserved_bytes
+                file_diff = staged.total_staged_files - reserved_files
+                if byte_diff != 0 or file_diff != 0:
+                    await eff_storage.commit_usage_deltas(
+                        session,
+                        {"staging": byte_diff},
+                        {"staging": file_diff},
+                        enforce_quota=byte_diff > 0,
+                        extra_headroom_checks=upload_headroom if byte_diff > 0 else None,
+                    )
+                await session.commit()
+            except BaseException as exc:
+                cleanup_staged_upload_dir(eff_storage, crash_id)
+                try:
+                    await session.rollback()
+                except Exception:
+                    pass
+                if reservation_committed:
+                    try:
+                        await eff_storage.commit_usage_deltas(
+                            session,
+                            {"staging": -reserved_bytes},
+                            {"staging": -reserved_files},
+                            enforce_quota=False,
+                        )
+                        await session.commit()
+                    except Exception:
+                        try:
+                            await session.rollback()
+                        except Exception:
+                            pass
+                if isinstance(exc, StorageCapacityError):
+                    raise HTTPException(
+                        status_code=status.HTTP_507_INSUFFICIENT_STORAGE, detail=str(exc)
+                    ) from exc
+                raise
+
+    await dispatcher.kick_crash_jobs([job_id], task_by_job_id={job_id: "parse_crash"})
 
     return CrashUploadResponse(
         crash_id=crash_id,
@@ -565,18 +594,23 @@ async def stream_crash_events(
             if initial_payload["status"] in TERMINAL_CRASH_STATUSES:
                 return
 
+            keepalive_ticks = 0
             while True:
                 try:
                     raw_event = await sub.get(timeout=15.0)
                 except TimeoutError:
-                    current = await _read_crash_snapshot(request, crash_id)
-                    if current is not None and current["status"] in TERMINAL_CRASH_STATUSES:
-                        yield _format_sse_event(current)
-                        return
+                    keepalive_ticks += 1
+                    if keepalive_ticks % 4 == 0:
+                        current = await _read_crash_snapshot(request, crash_id)
+                        if current is not None and current["status"] in TERMINAL_CRASH_STATUSES:
+                            yield _format_sse_event(current)
+                            return
                     yield ": keepalive\n\n"
                     continue
                 except StopAsyncIteration:
                     return
+
+                keepalive_ticks = 0
 
                 normalized = normalize_event_payload(crash_id, raw_event)
                 if normalized.get("status") == "FAILED" and not normalized.get("error"):
@@ -608,63 +642,65 @@ async def reprocess_crash(
     storage: StorageManager = Depends(get_storage),
     dispatcher: TaskDispatcher = Depends(get_dispatcher),
 ) -> CrashReprocessResponse:
-    async with storage.shared_lock("capacity"):
-        crash = await session.get(CrashReport, crash_id)
-        if crash is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Crash report not found",
-            )
-
-        if crash.status in ACTIVE_CRASH_STATUSES:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=(
-                    f"Crash report is currently in-flight ({crash.status}) "
-                    "and cannot be reprocessed"
-                ),
-            )
-
-        if payload.mode == "full":
-            dump_ok = False
-            if crash.dump_path:
-                try:
-                    dump_ok = storage.resolve_path(crash.dump_path).is_file()
-                except StorageError:
-                    dump_ok = False
-            if not dump_ok:
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail="Crash dump has been evicted or is unavailable for full reprocess",
-                )
-        elif crash.parsed_stacks_json is None:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Crash report has no parsed stack trace for triage reprocess",
-            )
-
-        target_status: CrashStatusLiteral = "PENDING" if payload.mode == "full" else "TRIAGING"
-        upd = await session.execute(
-            update(CrashReport)
-            .where(
-                CrashReport.id == crash_id,
-                CrashReport.status.notin_(ACTIVE_CRASH_STATUSES),
-                ~crash_has_job(),
-            )
-            .values(status=target_status)
+    crash = await session.get(CrashReport, crash_id)
+    if crash is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Crash report not found",
         )
-        if (upd.rowcount or 0) == 0:
-            await session.rollback()
+
+    if crash.status in ACTIVE_CRASH_STATUSES:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Crash report is currently in-flight ({crash.status}) "
+                "and cannot be reprocessed"
+            ),
+        )
+
+    if payload.mode == "full":
+        dump_ok = False
+        if crash.dump_path:
+            try:
+                dump_ok = storage.resolve_path(crash.dump_path).is_file()
+            except StorageError:
+                dump_ok = False
+        if not dump_ok:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail="Crash report is currently in-flight and cannot be reprocessed",
+                detail="Crash dump has been evicted or is unavailable for full reprocess",
             )
-        if payload.mode == "full":
-            job_id = stage_crash_job(session, crash_id, "parse_crash", run_ai_override=True)
-        else:
-            job_id = stage_crash_job(session, crash_id, "ai_triage")
-        await session.commit()
-    await dispatcher.kick_crash_jobs([job_id])
+    elif crash.parsed_stacks_json is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Crash report has no parsed stack trace for triage reprocess",
+        )
+
+    target_status: CrashStatusLiteral = "PENDING" if payload.mode == "full" else "TRIAGING"
+    conditions = [
+        CrashReport.id == crash_id,
+        CrashReport.status.notin_(ACTIVE_CRASH_STATUSES),
+        ~crash_has_job(),
+    ]
+    if payload.mode == "full":
+        conditions.append(CrashReport.dump_path.is_not(None))
+    upd = await session.execute(
+        update(CrashReport).where(*conditions).values(status=target_status)
+    )
+    if (upd.rowcount or 0) == 0:
+        await session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Crash report is currently in-flight or evicted and cannot be reprocessed",
+        )
+    if payload.mode == "full":
+        reproc_task = "parse_crash"
+        job_id = stage_crash_job(session, crash_id, "parse_crash", run_ai_override=True)
+    else:
+        reproc_task = "ai_triage"
+        job_id = stage_crash_job(session, crash_id, "ai_triage")
+    await session.commit()
+    await dispatcher.kick_crash_jobs([job_id], task_by_job_id={job_id: reproc_task})
     return CrashReprocessResponse(crash_id=crash_id, status=target_status)
 
 
@@ -755,26 +791,55 @@ async def download_crash_artifact(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Crash dump artifact is unavailable or evicted by GC",
             )
+
+        def _try_open_dump(rel_path: str) -> BinaryIO | None:
+            try:
+                abs_path = storage.resolve_path(rel_path)
+            except StorageError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Crash dump artifact path invalid",
+                ) from exc
+            try:
+                return abs_path.open("rb")
+            except (FileNotFoundError, IsADirectoryError):
+                return None
+
+        active_dump_path = crash.dump_path
+        dump_fh = _try_open_dump(active_dump_path)
+        if dump_fh is None:
+            # Refresh once in case worker just finalized staged dump -> dumps/<id>.dmp.zst.
+            await session.refresh(crash, attribute_names=["dump_path"])
+            if not crash.dump_path:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Crash dump artifact is unavailable or evicted by GC",
+                )
+            active_dump_path = crash.dump_path
+            dump_fh = _try_open_dump(active_dump_path)
+            if dump_fh is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Crash dump artifact file missing on disk",
+                )
+
         try:
-            zst_path = storage.resolve_path(crash.dump_path)
-        except StorageError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Crash dump artifact path invalid",
-            ) from exc
-        if not zst_path.is_file():
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Crash dump artifact file missing on disk",
+            stream_iter = (
+                stream_decompressed_zst_handle(dump_fh)
+                if active_dump_path.endswith(".zst")
+                else _stream_open_raw_file(dump_fh)
             )
-        return StreamingResponse(
-            stream_decompressed_zst(zst_path),
-            status_code=status.HTTP_200_OK,
-            media_type="application/octet-stream",
-            headers={
-                "Content-Disposition": f'attachment; filename="{crash_id}.dmp"',
-            },
-        )
+            return StreamingResponse(
+                stream_iter,
+                status_code=status.HTTP_200_OK,
+                media_type="application/octet-stream",
+                headers={
+                    "Content-Disposition": f'attachment; filename="{crash_id}.dmp"',
+                },
+            )
+        except BaseException:
+            dump_fh.close()
+            raise
 
     if crash.parsed_stacks_json is None:
         raise HTTPException(

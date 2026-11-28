@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import CrashCluster, Issue
@@ -72,6 +72,10 @@ def _weighted_top10_jaccard(
     return numerator / denominator
 
 
+def _escape_like(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 async def recall_similar_issues(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -97,6 +101,7 @@ async def recall_similar_issues(
     issue_pg_trgm_scores: dict[int, float] = {}
 
     if is_pg:
+        cluster_limit = max(limit * 6, 30)
         if stack_query_text:
             sim_col = func.similarity(CrashCluster.signature_text, stack_query_text).label("sim")
             cluster_stmt = (
@@ -105,14 +110,71 @@ async def recall_similar_issues(
                 .where(
                     CrashCluster.project_id == project_id,
                     CrashCluster.issue_id.is_not(None),
+                    CrashCluster.signature_text.op("%")(stack_query_text),
                 )
                 .order_by(sim_col.desc(), Issue.crash_count.desc())
-                .limit(max(limit * 6, 30))
+                .limit(cluster_limit)
             )
-            for cluster, issue, sim in (await session.execute(cluster_stmt)).all():
+            matched_cluster_rows = (await session.execute(cluster_stmt)).all()
+            for cluster, issue, sim in matched_cluster_rows:
                 issues_by_id[issue.id] = issue
                 clusters_by_issue.setdefault(issue.id, []).append(cluster)
                 cluster_trgm_scores[cluster.id] = float(sim or 0.0)
+
+            # Also recall clusters sharing any top-10 frame via GIN-indexed ILIKE so
+            # high-Jaccard frame matches below the 0.3 pg_trgm % cutoff are preserved.
+            leading_keys: list[str] = []
+            for frame in top10_frames:
+                fk = _frame_key(frame).strip()
+                if fk and fk != "unknown!unknown" and fk not in leading_keys:
+                    leading_keys.append(fk)
+            if leading_keys:
+                overlap_clauses = [
+                    CrashCluster.signature_text.ilike(f"%{_escape_like(fk)}%", escape="\\")
+                    for fk in leading_keys
+                ]
+                overlap_stmt = (
+                    select(CrashCluster, Issue, sim_col)
+                    .join(Issue, CrashCluster.issue_id == Issue.id)
+                    .where(
+                        CrashCluster.project_id == project_id,
+                        CrashCluster.issue_id.is_not(None),
+                        or_(*overlap_clauses),
+                    )
+                    .order_by(
+                        sim_col.desc(),
+                        Issue.crash_count.desc(),
+                        Issue.last_seen_at.desc(),
+                    )
+                    .limit(cluster_limit)
+                )
+                for cluster, issue, sim in (await session.execute(overlap_stmt)).all():
+                    if cluster.id in cluster_trgm_scores:
+                        continue
+                    issues_by_id[issue.id] = issue
+                    clusters_by_issue.setdefault(issue.id, []).append(cluster)
+                    cluster_trgm_scores[cluster.id] = float(sim or 0.0)
+
+            if len(cluster_trgm_scores) < limit:
+                fallback_cluster_stmt = (
+                    select(CrashCluster, Issue)
+                    .join(Issue, CrashCluster.issue_id == Issue.id)
+                    .where(
+                        CrashCluster.project_id == project_id,
+                        CrashCluster.issue_id.is_not(None),
+                    )
+                    .order_by(Issue.crash_count.desc(), Issue.last_seen_at.desc())
+                    .limit(cluster_limit)
+                )
+                seen_cluster_ids = set(cluster_trgm_scores.keys())
+                for cluster, issue in (await session.execute(fallback_cluster_stmt)).all():
+                    if cluster.id in seen_cluster_ids:
+                        continue
+                    issues_by_id[issue.id] = issue
+                    clusters_by_issue.setdefault(issue.id, []).append(cluster)
+                    cluster_trgm_scores[cluster.id] = _trigram_similarity(
+                        stack_query_text, cluster.signature_text or ""
+                    )
         else:
             cluster_stmt = (
                 select(CrashCluster, Issue)
@@ -122,12 +184,13 @@ async def recall_similar_issues(
                     CrashCluster.issue_id.is_not(None),
                 )
                 .order_by(Issue.crash_count.desc(), Issue.last_seen_at.desc())
-                .limit(max(limit * 6, 30))
+                .limit(cluster_limit)
             )
             for cluster, issue in (await session.execute(cluster_stmt)).all():
                 issues_by_id[issue.id] = issue
                 clusters_by_issue.setdefault(issue.id, []).append(cluster)
 
+        issue_limit = max(limit * 4, 20)
         if trgm_query:
             issue_sim = func.greatest(
                 func.similarity(Issue.title, trgm_query),
@@ -135,19 +198,35 @@ async def recall_similar_issues(
             ).label("issue_sim")
             issue_stmt = (
                 select(Issue, issue_sim)
-                .where(Issue.project_id == project_id)
+                .where(
+                    Issue.project_id == project_id,
+                    or_(
+                        Issue.title.op("%")(trgm_query),
+                        Issue.root_cause.op("%")(trgm_query),
+                    ),
+                )
                 .order_by(issue_sim.desc(), Issue.crash_count.desc())
-                .limit(max(limit * 4, 20))
+                .limit(issue_limit)
             )
-            for issue, sim in (await session.execute(issue_stmt)).all():
+            matched_issue_rows = (await session.execute(issue_stmt)).all()
+            for issue, sim in matched_issue_rows:
                 issues_by_id[issue.id] = issue
                 issue_pg_trgm_scores[issue.id] = float(sim or 0.0)
+            if len(matched_issue_rows) < limit:
+                fallback_issue_stmt = (
+                    select(Issue)
+                    .where(Issue.project_id == project_id)
+                    .order_by(Issue.crash_count.desc(), Issue.last_seen_at.desc())
+                    .limit(issue_limit)
+                )
+                for issue in (await session.execute(fallback_issue_stmt)).scalars().all():
+                    issues_by_id.setdefault(issue.id, issue)
         else:
             issue_stmt = (
                 select(Issue)
                 .where(Issue.project_id == project_id)
                 .order_by(Issue.crash_count.desc(), Issue.last_seen_at.desc())
-                .limit(max(limit * 4, 20))
+                .limit(issue_limit)
             )
             for issue in (await session.execute(issue_stmt)).scalars().all():
                 issues_by_id[issue.id] = issue

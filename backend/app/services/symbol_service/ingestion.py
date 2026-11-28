@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import uuid
+from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any, BinaryIO
 
@@ -55,17 +56,17 @@ async def ingest_symbol(
 
     async with storage.shared_lock("symbol-conversion"):
         with storage.staging_workspace("sym") as staging_dir:
-            async with storage.shared_lock("capacity"):
-                incoming = _input_size(pdb_bytes_or_path) + _input_size(pe_bytes_or_path)
-                await storage.require_capacity(session, {"staging": incoming})
-                staged_pdb = await asyncio.to_thread(
-                    _stage_input, staging_dir, pdb_filename, pdb_bytes_or_path, "pdb"
-                )
-                if staged_pdb is not None and pe_filename == staged_pdb.name:
-                    raise SymbolConversionError("PDB and PE must have distinct filenames")
-                staged_pe = await asyncio.to_thread(
-                    _stage_input, staging_dir, pe_filename, pe_bytes_or_path, "pe"
-                )
+            incoming = _input_size(pdb_bytes_or_path) + _input_size(pe_bytes_or_path)
+            await storage.reserve_staging_scratch(session, staging_dir, incoming)
+            await session.commit()
+            staged_pdb = await asyncio.to_thread(
+                _stage_input, staging_dir, pdb_filename, pdb_bytes_or_path, "pdb"
+            )
+            if staged_pdb is not None and pe_filename == staged_pdb.name:
+                raise SymbolConversionError("PDB and PE must have distinct filenames")
+            staged_pe = await asyncio.to_thread(
+                _stage_input, staging_dir, pe_filename, pe_bytes_or_path, "pe"
+            )
 
             sym_bytes, pe_used = await run_dump_syms(
                 pdb_path=staged_pdb,
@@ -74,7 +75,11 @@ async def ingest_symbol(
                 exec_fn=exec_fn,
             )
             header = parse_sym_header(sym_bytes.decode("utf-8", errors="replace"))
-            async with storage.shared_lock("capacity"):
+            async with AsyncExitStack() as stack:
+                await stack.enter_async_context(storage.project_sym_lock(exclusive=False))
+                if settings.ARCHIVE_RAW_SYMBOLS:
+                    await stack.enter_async_context(storage.raw_symbol_lock(exclusive=False))
+                await stack.enter_async_context(storage.storage_io_lock(exclusive=False))
                 return await _store_symbol(
                     session,
                     storage,
@@ -107,6 +112,10 @@ async def _store_symbol(
     abs_sym_path = _resolve_in_partition(storage, "symbols/sym", rel_sym_path)
     _build_raw_archive_paths(storage, header, staged_pdb, staged_pe)
 
+    # Follow global DB lock order: lock storage_partition_usage BEFORE symbols rows
+    # so concurrent delete_symbol and _store_symbol upgrades can never deadlock on PostgreSQL.
+    await storage.ensure_usage_ledger(session, lock=True)
+
     existing_stmt = select(Symbol).where(
         and_(
             Symbol.project_id == project_id,
@@ -114,12 +123,14 @@ async def _store_symbol(
             Symbol.debug_id == header.debug_id,
         )
     )
+    bind = session.get_bind()
+    if bind is not None and bind.dialect.name == "postgresql":
+        existing_stmt = existing_stmt.with_for_update()
     existing = (await session.execute(existing_stmt)).scalar_one_or_none()
     now = utcnow()
 
     if existing is None:
         previous_size = abs_sym_path.stat().st_size if abs_sym_path.is_file() else 0
-        await storage.require_capacity(session, {"symbols/sym": len(sym_bytes) - previous_size})
         sym_row = Symbol(
             project_id=project_id,
             app_version=app_version,
@@ -140,6 +151,12 @@ async def _store_symbol(
             async with session.begin_nested():
                 session.add(sym_row)
                 await session.flush()
+                await storage.commit_usage_deltas(
+                    session,
+                    {"symbols/sym": len(sym_bytes) - previous_size},
+                    {"symbols/sym": 0 if previous_size else 1},
+                    enforce_quota=True,
+                )
         except IntegrityError:
             existing = (await session.execute(existing_stmt)).scalar_one()
         else:
@@ -172,7 +189,12 @@ async def _store_symbol(
             should_upgrade = True
     if should_upgrade:
         previous_size = abs_sym_path.stat().st_size if abs_sym_path.is_file() else 0
-        await storage.require_capacity(session, {"symbols/sym": len(sym_bytes) - previous_size})
+        await storage.commit_usage_deltas(
+            session,
+            {"symbols/sym": len(sym_bytes) - previous_size},
+            {"symbols/sym": 0 if previous_size else 1},
+            enforce_quota=True,
+        )
         await asyncio.to_thread(storage.atomic_write_bytes, rel_sym_path, sym_bytes)
         existing.app_version = app_version
         existing.module_name = header.module_name
@@ -198,7 +220,12 @@ async def _store_symbol(
         return SymbolIngestResult(symbol=existing, deduplicated=True, upgraded=True)
 
     if not abs_sym_path.exists():
-        await storage.require_capacity(session, {"symbols/sym": len(sym_bytes)})
+        await storage.commit_usage_deltas(
+            session,
+            {"symbols/sym": len(sym_bytes)},
+            {"symbols/sym": 1},
+            enforce_quota=True,
+        )
         await asyncio.to_thread(storage.atomic_write_bytes, rel_sym_path, sym_bytes)
         existing.sym_size = len(sym_bytes)
     existing.last_used_at = now
@@ -220,14 +247,14 @@ def _clear_msdl_negative_cache(storage: StorageManager, debug_file: str, debug_i
 
 def _unlink_public_sym_if_distinct(
     storage: StorageManager, old_rel: str | None, new_rel: str
-) -> None:
+) -> int:
     if not old_rel or old_rel == new_rel:
-        return
+        return 0
     try:
         old_abs = _resolve_in_partition(storage, "symbols/public_cache", old_rel)
-        old_abs.unlink(missing_ok=True)
+        return storage._safe_unlink(old_abs)
     except (SymbolConversionError, OSError):
-        pass
+        return 0
 
 
 async def store_public_symbol(
@@ -243,6 +270,7 @@ async def store_public_symbol(
     acquire_capacity_lock: bool = True,
 ) -> SymbolIngestResult:
     """Persist a global project-less, version-less symbol into symbols/public_cache and DB."""
+    _ = acquire_capacity_lock
 
     async def _persist() -> SymbolIngestResult:
         has_pe_unwind = header.has_unwind_records
@@ -252,6 +280,9 @@ async def store_public_symbol(
         abs_sym_path = _resolve_in_partition(storage, "symbols/public_cache", rel_sym_path)
         _build_raw_archive_paths(storage, header, staged_pdb, staged_pe)
 
+        # Follow global DB lock order: storage_partition_usage BEFORE symbols rows.
+        await storage.ensure_usage_ledger(session, lock=True)
+
         existing_stmt = select(Symbol).where(
             and_(
                 Symbol.project_id.is_(None),
@@ -259,14 +290,14 @@ async def store_public_symbol(
                 func.upper(Symbol.debug_id) == header.debug_id.upper(),
             )
         )
+        bind = session.get_bind()
+        if bind is not None and bind.dialect.name == "postgresql":
+            existing_stmt = existing_stmt.with_for_update()
         existing = (await session.execute(existing_stmt)).scalars().first()
         now = utcnow()
 
         if existing is None:
             previous_size = abs_sym_path.stat().st_size if abs_sym_path.is_file() else 0
-            await storage.require_capacity(
-                session, {"symbols/public_cache": len(sym_bytes) - previous_size}
-            )
             sym_row = Symbol(
                 project_id=None,
                 app_version=None,
@@ -288,6 +319,12 @@ async def store_public_symbol(
                 async with session.begin_nested():
                     session.add(sym_row)
                     await session.flush()
+                    await storage.commit_usage_deltas(
+                        session,
+                        {"symbols/public_cache": len(sym_bytes) - previous_size},
+                        {"symbols/public_cache": 0 if previous_size else 1},
+                        enforce_quota=True,
+                    )
             except IntegrityError:
                 existing = (await session.execute(existing_stmt)).scalars().first()
                 if existing is None:
@@ -334,8 +371,17 @@ async def store_public_symbol(
 
         if should_upgrade:
             previous_size = abs_sym_path.stat().st_size if abs_sym_path.is_file() else 0
-            await storage.require_capacity(
-                session, {"symbols/public_cache": len(sym_bytes) - previous_size}
+            old_distinct_size = (
+                current_path.stat().st_size
+                if existing.sym_path != rel_sym_path and current_path.is_file()
+                else 0
+            )
+            file_delta = (0 if previous_size else 1) - (1 if old_distinct_size else 0)
+            await storage.commit_usage_deltas(
+                session,
+                {"symbols/public_cache": len(sym_bytes) - previous_size - old_distinct_size},
+                {"symbols/public_cache": file_delta},
+                enforce_quota=True,
             )
             await asyncio.to_thread(storage.atomic_write_bytes, rel_sym_path, sym_bytes)
             _unlink_public_sym_if_distinct(storage, existing.sym_path, rel_sym_path)
@@ -366,7 +412,12 @@ async def store_public_symbol(
             return SymbolIngestResult(symbol=existing, deduplicated=True, upgraded=True)
 
         if not current_path.is_file():
-            await storage.require_capacity(session, {"symbols/public_cache": len(sym_bytes)})
+            await storage.commit_usage_deltas(
+                session,
+                {"symbols/public_cache": len(sym_bytes)},
+                {"symbols/public_cache": 1},
+                enforce_quota=True,
+            )
             await asyncio.to_thread(storage.atomic_write_bytes, rel_sym_path, sym_bytes)
             existing.sym_path = rel_sym_path
             existing.sym_size = len(sym_bytes)
@@ -378,10 +429,23 @@ async def store_public_symbol(
         await session.refresh(existing)
         return SymbolIngestResult(symbol=existing, deduplicated=True, upgraded=False)
 
-    if acquire_capacity_lock:
-        async with storage.shared_lock("capacity"):
-            return await _persist()
-    return await _persist()
+    # Striped per-symbol lock serializes concurrent lookup/measurement/upgrade of the
+    # same (debug_file, debug_id) while keeping distinct public symbols parallel.
+    symbol_digest = hashlib.sha256(
+        f"{header.debug_file.lower()}:{header.debug_id.upper()}".encode()
+    ).hexdigest()
+    stripe = int(symbol_digest[:8], 16) % 32
+    needs_raw_lock = bool(
+        settings.ARCHIVE_RAW_SYMBOLS and (staged_pdb is not None or staged_pe is not None)
+    )
+
+    async with AsyncExitStack() as stack:
+        await stack.enter_async_context(storage.shared_lock(f"pubsym-{stripe:02d}"))
+        await stack.enter_async_context(storage.public_cache_lock(exclusive=False))
+        if needs_raw_lock:
+            await stack.enter_async_context(storage.raw_symbol_lock(exclusive=False))
+        await stack.enter_async_context(storage.storage_io_lock(exclusive=False))
+        return await _persist()
 
 
 async def ingest_public_symbol(
@@ -406,52 +470,47 @@ async def ingest_public_symbol(
             raise SymbolConversionError(
                 "Cannot combine a pre-converted .sym file with a PE companion binary"
             )
-        async with storage.shared_lock("capacity"):
-            incoming = _input_size(pdb_bytes_or_path)
-            if incoming <= 0:
-                raise SymbolConversionError("Uploaded .sym file is empty")
-            if incoming > MAX_SYMBOL_OUTPUT_BYTES:
-                raise SymbolConversionError(
-                    "Uploaded .sym file exceeds the 128 MiB size limit"
-                )
-            if isinstance(pdb_bytes_or_path, bytes):
-                sym_bytes = pdb_bytes_or_path
-            elif isinstance(pdb_bytes_or_path, Path):
-                sym_bytes = await asyncio.to_thread(pdb_bytes_or_path.read_bytes)
-            else:
-                assert pdb_bytes_or_path is not None
-                pdb_bytes_or_path.seek(0)
-                sym_bytes = await asyncio.to_thread(
-                    pdb_bytes_or_path.read, MAX_SYMBOL_OUTPUT_BYTES + 1
-                )
-            if len(sym_bytes) > MAX_SYMBOL_OUTPUT_BYTES:
-                raise SymbolConversionError(
-                    "Uploaded .sym file exceeds the 128 MiB size limit"
-                )
-            header = parse_sym_header(sym_bytes.decode("utf-8", errors="replace"))
-            return await store_public_symbol(
-                session,
-                storage,
-                settings,
-                sym_bytes=sym_bytes,
-                header=header,
-                source=source,
-                acquire_capacity_lock=False,
+        incoming = _input_size(pdb_bytes_or_path)
+        if incoming <= 0:
+            raise SymbolConversionError("Uploaded .sym file is empty")
+        if incoming > MAX_SYMBOL_OUTPUT_BYTES:
+            raise SymbolConversionError("Uploaded .sym file exceeds the 128 MiB size limit")
+        if isinstance(pdb_bytes_or_path, bytes):
+            sym_bytes = pdb_bytes_or_path
+        elif isinstance(pdb_bytes_or_path, Path):
+            sym_bytes = await asyncio.to_thread(pdb_bytes_or_path.read_bytes)
+        else:
+            assert pdb_bytes_or_path is not None
+            pdb_bytes_or_path.seek(0)
+            sym_bytes = await asyncio.to_thread(
+                pdb_bytes_or_path.read, MAX_SYMBOL_OUTPUT_BYTES + 1
             )
+        if len(sym_bytes) > MAX_SYMBOL_OUTPUT_BYTES:
+            raise SymbolConversionError("Uploaded .sym file exceeds the 128 MiB size limit")
+        header = parse_sym_header(sym_bytes.decode("utf-8", errors="replace"))
+        return await store_public_symbol(
+            session,
+            storage,
+            settings,
+            sym_bytes=sym_bytes,
+            header=header,
+            source=source,
+            acquire_capacity_lock=False,
+        )
 
     async with storage.shared_lock("symbol-conversion"):
         with storage.staging_workspace("pubsym") as staging_dir:
-            async with storage.shared_lock("capacity"):
-                incoming = _input_size(pdb_bytes_or_path) + _input_size(pe_bytes_or_path)
-                await storage.require_capacity(session, {"staging": incoming})
-                staged_pdb = await asyncio.to_thread(
-                    _stage_input, staging_dir, pdb_filename, pdb_bytes_or_path, "pdb"
-                )
-                if staged_pdb is not None and pe_filename == staged_pdb.name:
-                    raise SymbolConversionError("PDB and PE must have distinct filenames")
-                staged_pe = await asyncio.to_thread(
-                    _stage_input, staging_dir, pe_filename, pe_bytes_or_path, "pe"
-                )
+            incoming = _input_size(pdb_bytes_or_path) + _input_size(pe_bytes_or_path)
+            await storage.reserve_staging_scratch(session, staging_dir, incoming)
+            await session.commit()
+            staged_pdb = await asyncio.to_thread(
+                _stage_input, staging_dir, pdb_filename, pdb_bytes_or_path, "pdb"
+            )
+            if staged_pdb is not None and pe_filename == staged_pdb.name:
+                raise SymbolConversionError("PDB and PE must have distinct filenames")
+            staged_pe = await asyncio.to_thread(
+                _stage_input, staging_dir, pe_filename, pe_bytes_or_path, "pe"
+            )
 
             sym_bytes, pe_used = await run_dump_syms(
                 pdb_path=staged_pdb,
@@ -460,18 +519,17 @@ async def ingest_public_symbol(
                 exec_fn=exec_fn,
             )
             header = parse_sym_header(sym_bytes.decode("utf-8", errors="replace"))
-            async with storage.shared_lock("capacity"):
-                return await store_public_symbol(
-                    session,
-                    storage,
-                    settings,
-                    sym_bytes=sym_bytes,
-                    header=header,
-                    source=source,
-                    staged_pdb=staged_pdb,
-                    staged_pe=staged_pe if pe_used and header.has_unwind_records else None,
-                    acquire_capacity_lock=False,
-                )
+            return await store_public_symbol(
+                session,
+                storage,
+                settings,
+                sym_bytes=sym_bytes,
+                header=header,
+                source=source,
+                staged_pdb=staged_pdb,
+                staged_pe=staged_pe if pe_used and header.has_unwind_records else None,
+                acquire_capacity_lock=False,
+            )
 
 
 def _scan_unindexed_public_syms(
@@ -524,54 +582,77 @@ async def reconcile_public_symbol_cache(
     if not pub_root.exists():
         return 0
 
-    existing_rows = (
+    # Fast read-only pre-check to avoid taking exclusive locks when disk and DB already match.
+    pre_rows = (
         await session.execute(
             select(Symbol.sym_path, Symbol.debug_file, Symbol.debug_id).where(
                 Symbol.project_id.is_(None)
             )
         )
     ).all()
-    known_paths = {row[0] for row in existing_rows if row[0]}
-    known_keys = {(row[1].lower(), row[2].upper()) for row in existing_rows}
-
-    discovered = await asyncio.to_thread(
+    pre_discovered = await asyncio.to_thread(
         _scan_unindexed_public_syms,
         pub_root,
         storage.data_dir,
-        known_paths,
-        known_keys,
+        {row[0] for row in pre_rows if row[0]},
+        {(row[1].lower(), row[2].upper()) for row in pre_rows},
     )
-    if not discovered:
+    if not pre_discovered:
         return 0
 
-    now = utcnow()
-    added = 0
-    for rel_path, size, header in discovered:
-        row = Symbol(
-            project_id=None,
-            app_version=None,
-            source="public_cache",
-            module_name=header.module_name,
-            debug_file=header.debug_file,
-            debug_id=header.debug_id,
-            code_file=header.code_file,
-            code_id=header.code_id,
-            has_pe_unwind=header.has_unwind_records,
-            sym_path=rel_path,
-            sym_size=size,
-            raw_archive_path=None,
-            raw_size=0,
-            last_used_at=now,
-            created_at=now,
-        )
-        try:
-            async with session.begin_nested():
-                session.add(row)
-                await session.flush()
-            added += 1
-        except IntegrityError:
-            continue
+    # Follow global lock order (public_cache_lock -> storage_io_lock -> DB inserts)
+    # so reconciliation can never deadlock with concurrent store_public_symbol uploads.
+    async with storage.public_cache_lock(exclusive=False):
+        async with storage.storage_io_lock(exclusive=True):
+            existing_rows = (
+                await session.execute(
+                    select(Symbol.sym_path, Symbol.debug_file, Symbol.debug_id).where(
+                        Symbol.project_id.is_(None)
+                    )
+                )
+            ).all()
+            known_paths = {row[0] for row in existing_rows if row[0]}
+            known_keys = {(row[1].lower(), row[2].upper()) for row in existing_rows}
 
-    if added > 0:
-        await session.commit()
-    return added
+            discovered = await asyncio.to_thread(
+                _scan_unindexed_public_syms,
+                pub_root,
+                storage.data_dir,
+                known_paths,
+                known_keys,
+            )
+            if not discovered:
+                return 0
+
+            now = utcnow()
+            added = 0
+            for rel_path, size, header in discovered:
+                row = Symbol(
+                    project_id=None,
+                    app_version=None,
+                    source="public_cache",
+                    module_name=header.module_name,
+                    debug_file=header.debug_file,
+                    debug_id=header.debug_id,
+                    code_file=header.code_file,
+                    code_id=header.code_id,
+                    has_pe_unwind=header.has_unwind_records,
+                    sym_path=rel_path,
+                    sym_size=size,
+                    raw_archive_path=None,
+                    raw_size=0,
+                    last_used_at=now,
+                    created_at=now,
+                )
+                try:
+                    async with session.begin_nested():
+                        session.add(row)
+                        await session.flush()
+                    added += 1
+                except IntegrityError:
+                    continue
+
+            if added > 0:
+                await storage.reconcile_usage(session)
+                await session.commit()
+            return added

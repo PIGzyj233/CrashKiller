@@ -85,6 +85,7 @@ const enUSViewers: DeepStringify<typeof zhCNViewers> = {
   },
   log: {
     fetchLinesFailed: "Failed to fetch log lines",
+    indexingInProgress: "Crash log is being indexed in the background. Please wait or retry shortly.",
     noLinesInWindow: "No log lines found within this time window.",
     jumpedAroundTime: "Jumped to L{{line}} ({{count}} lines in ±{{sec}}s window)",
     jumpAroundTimeFailed: "Failed to jump around timestamp",

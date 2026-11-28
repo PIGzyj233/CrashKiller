@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from collections.abc import Iterator
 from pathlib import Path
+from typing import BinaryIO
 
 import zstandard as zstd
 from sqlalchemy import and_, func, or_, select
@@ -113,13 +114,21 @@ async def resolve_symsrv_file(
     return None
 
 
-def stream_decompressed_zst(zst_path: Path, chunk_size: int = 65536) -> Iterator[bytes]:
-    """Yield decompressed byte chunks from a .zst archive with bounded memory."""
+def stream_decompressed_zst_handle(fh: BinaryIO, chunk_size: int = 65536) -> Iterator[bytes]:
+    """Yield decompressed byte chunks from an already-open .zst file handle and close it."""
     decompressor = zstd.ZstdDecompressor()
-    with open(zst_path, "rb") as fh:
+    try:
         with decompressor.stream_reader(fh) as reader:
             while True:
                 chunk = reader.read(chunk_size)
                 if not chunk:
                     break
                 yield chunk
+    finally:
+        fh.close()
+
+
+def stream_decompressed_zst(zst_path: Path, chunk_size: int = 65536) -> Iterator[bytes]:
+    """Yield decompressed byte chunks from a .zst archive with bounded memory."""
+    fh = open(zst_path, "rb")
+    yield from stream_decompressed_zst_handle(fh, chunk_size=chunk_size)

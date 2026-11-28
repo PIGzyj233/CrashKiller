@@ -1,11 +1,11 @@
-"""ARQ worker settings, lifecycle hooks, and memory:// / Redis task dispatcher."""
+"""ARQ worker settings (combined & split compute/IO), lifecycle hooks, and TaskDispatcher."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
 import uuid
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from typing import Any
 
 from arq import create_pool, cron, func
@@ -17,10 +17,16 @@ from app.db.session import dispose_engine, get_session_factory, init_db
 from app.services.events import EventBus, close_event_bus, get_event_bus
 from app.services.storage import StorageManager
 from app.workers.jobs import (
+    COMPUTE_QUEUE_NAME,
     CRASH_JOB_TIMEOUT_SECONDS,
+    IO_QUEUE_NAME,
     JOB_DELIVERY_TIMEOUT_SECONDS,
+    RECOVERY_BATCH_SIZE,
+    RECOVERY_MAX_BATCHES_PER_TICK,
+    _supports_queue_name_kwarg,
     enqueue_crash_job,
-    pending_crash_jobs,
+    pending_crash_jobs_with_tasks,
+    queue_for_worker_task,
 )
 from app.workers.tasks import (
     ai_triage,
@@ -34,6 +40,9 @@ from app.workers.tasks import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Active/queued symbol_ingest job IDs in memory:// mode so GC protects staged inputs.
+ACTIVE_MEMORY_SYMBOL_JOBS: set[str] = set()
 
 TASK_REGISTRY: dict[str, Callable[..., Awaitable[Any]]] = {
     "symbol_ingest": symbol_ingest,
@@ -74,11 +83,16 @@ async def shutdown(ctx: dict[str, Any]) -> None:
 
 
 class WorkerSettings:
-    """ARQ WorkerSettings consumed by `arq app.workers.worker.WorkerSettings`."""
+    """Combined all-in-one ARQ WorkerSettings (backwards-compatible default)."""
 
     redis_settings = parse_redis_settings()
+    queue_name = COMPUTE_QUEUE_NAME
     functions = [
-        symbol_ingest, parse_crash, ai_triage, resymbolicate, disk_gc,
+        symbol_ingest,
+        parse_crash,
+        ai_triage,
+        resymbolicate,
+        disk_gc,
         func(fetch_ms_symbols, keep_result=0),
         func(run_crash_job, keep_result=0),
     ]
@@ -93,8 +107,51 @@ class WorkerSettings:
     keep_result = 300
 
 
+class ComputeWorkerSettings:
+    """Dedicated CPU/subprocess ARQ worker: dump parsing, symbol conversion, GC, and recovery."""
+
+    redis_settings = parse_redis_settings()
+    queue_name = COMPUTE_QUEUE_NAME
+    functions = [
+        symbol_ingest,
+        parse_crash,
+        ai_triage,
+        resymbolicate,
+        disk_gc,
+        func(fetch_ms_symbols, keep_result=0),
+        func(run_crash_job, keep_result=0),
+    ]
+    cron_jobs = [
+        cron(disk_gc, minute={0, 15, 30, 45}),
+        cron(recover_crash_jobs, second=set(range(0, 60, 5)), run_at_startup=True),
+    ]
+    on_startup = startup
+    on_shutdown = shutdown
+    max_jobs = max(1, int(get_settings().COMPUTE_WORKER_MAX_JOBS))
+    job_timeout = CRASH_JOB_TIMEOUT_SECONDS
+    keep_result = 300
+
+
+class IOWorkerSettings:
+    """Dedicated network I/O ARQ worker: AI triage LLM calls and MSDL symbol downloads."""
+
+    redis_settings = parse_redis_settings()
+    queue_name = IO_QUEUE_NAME
+    functions = [
+        ai_triage,
+        func(fetch_ms_symbols, keep_result=0),
+        func(run_crash_job, keep_result=0),
+    ]
+    cron_jobs: list[Any] = []
+    on_startup = startup
+    on_shutdown = shutdown
+    max_jobs = max(1, int(get_settings().IO_WORKER_MAX_JOBS))
+    job_timeout = CRASH_JOB_TIMEOUT_SECONDS
+    keep_result = 300
+
+
 class TaskDispatcher:
-    """Unified task dispatcher supporting ARQ Redis and tracked in-process memory:// execution."""
+    """Unified task dispatcher supporting split ARQ Redis queues and isolated memory:// slots."""
 
     def __init__(
         self,
@@ -121,8 +178,16 @@ class TaskDispatcher:
         self.cab_exec_fn = cab_exec_fn
         self._memory_tasks: set[asyncio.Task[Any]] = set()
         self._memory_job_ids: set[str] = set()
-        self._memory_job_slots = asyncio.Semaphore(WorkerSettings.max_jobs)
+        compute_cap = max(1, int(getattr(settings, "COMPUTE_WORKER_MAX_JOBS", 4)))
+        io_cap = max(1, int(getattr(settings, "IO_WORKER_MAX_JOBS", 16)))
+        self._memory_compute_slots = asyncio.Semaphore(compute_cap)
+        self._memory_io_slots = asyncio.Semaphore(io_cap)
+        self._memory_job_slots = self._memory_compute_slots
         self._memory_recovery: asyncio.Task[None] | None = None
+
+    @property
+    def split_queues_enabled(self) -> bool:
+        return bool(getattr(self.settings, "SPLIT_WORKER_QUEUES", False))
 
     @property
     def is_memory_mode(self) -> bool:
@@ -136,12 +201,14 @@ class TaskDispatcher:
         self,
         fn: Callable[..., Awaitable[Any]],
         ctx: dict[str, Any],
+        is_io_bound: bool,
         *args: Any,
         **kwargs: Any,
     ) -> Any:
         try:
-            if fn is run_crash_job:
-                async with self._memory_job_slots:
+            if fn in {run_crash_job, ai_triage, fetch_ms_symbols, parse_crash, symbol_ingest}:
+                slots = self._memory_io_slots if is_io_bound else self._memory_compute_slots
+                async with slots:
                     return await fn(ctx, *args, **kwargs)
             return await fn(ctx, *args, **kwargs)
         except asyncio.CancelledError:
@@ -150,17 +217,36 @@ class TaskDispatcher:
             logger.exception("Unhandled error in memory:// background task %s", fn.__name__)
             return None
 
-    async def enqueue(self, task_name: str, *args: Any, **kwargs: Any) -> str | None:
+    async def enqueue(
+        self,
+        task_name: str,
+        *args: Any,
+        crash_task: str | None = None,
+        **kwargs: Any,
+    ) -> str | None:
         """Enqueue a named task via tracked asyncio.create_task (memory://) or ARQ Redis."""
         if task_name not in TASK_REGISTRY:
             raise ValueError(f"Unknown worker task: {task_name!r}")
 
+        is_io_bound = (
+            queue_for_worker_task(task_name, crash_task=crash_task, split_queues=True)
+            == IO_QUEUE_NAME
+        )
+        target_queue = queue_for_worker_task(
+            task_name,
+            crash_task=crash_task,
+            split_queues=self.split_queues_enabled,
+        )
+
         if self.is_memory_mode:
             fn = TASK_REGISTRY[task_name]
-            job_id: str | None = None
-            if task_name == "run_crash_job":
+            mem_kwargs = dict(kwargs)
+            explicit_job_id = mem_kwargs.pop("_job_id", None)
+            mem_kwargs.pop("_queue_name", None)
+            job_id: str | None = str(explicit_job_id) if explicit_job_id is not None else None
+            if job_id is None and task_name == "run_crash_job":
                 job_id = str(args[0])
-            elif task_name == "fetch_ms_symbols" and args:
+            elif job_id is None and task_name == "fetch_ms_symbols" and args:
                 job_id = f"msdl-crash:{args[0]}"
             if job_id is not None and job_id in self._memory_job_ids:
                 return None
@@ -180,8 +266,10 @@ class TaskDispatcher:
             if self.cab_exec_fn is not None:
                 ctx["cab_exec_fn"] = self.cab_exec_fn
 
+            if task_name == "symbol_ingest" and job_id is not None:
+                ACTIVE_MEMORY_SYMBOL_JOBS.add(job_id)
             task = asyncio.create_task(
-                self._run_memory_task(fn, ctx, *args, **kwargs),
+                self._run_memory_task(fn, ctx, is_io_bound, *args, **mem_kwargs),
                 name=f"crashkiller-task-{task_name}",
             )
             self._memory_tasks.add(task)
@@ -189,29 +277,47 @@ class TaskDispatcher:
             if job_id is not None:
                 self._memory_job_ids.add(job_id)
                 task.add_done_callback(lambda _: self._memory_job_ids.discard(job_id))
+                if task_name == "symbol_ingest":
+                    task.add_done_callback(lambda _: ACTIVE_MEMORY_SYMBOL_JOBS.discard(job_id))
             return task.get_name()
 
         pool = await self._get_arq_pool()
-        job = await pool.enqueue_job(task_name, *args, **kwargs)
+        enqueue_kwargs = dict(kwargs)
+        if self.split_queues_enabled and _supports_queue_name_kwarg(pool.enqueue_job):
+            enqueue_kwargs.setdefault("_queue_name", target_queue)
+        job = await pool.enqueue_job(task_name, *args, **enqueue_kwargs)
         return getattr(job, "job_id", None) if job is not None else None
 
     async def _get_arq_pool(self) -> ArqRedis:
         if self.arq_pool is None:
             async with self._pool_lock:
                 if self.arq_pool is None:
-                    self.arq_pool = await create_pool(parse_redis_settings(self.settings.REDIS_URL))
+                    self.arq_pool = await create_pool(
+                        parse_redis_settings(self.settings.REDIS_URL)
+                    )
                     self._owns_pool = True
         return self.arq_pool
 
-    async def kick_crash_jobs(self, job_ids: Iterable[uuid.UUID]) -> None:
+    async def kick_crash_jobs(
+        self,
+        job_ids: Iterable[uuid.UUID],
+        *,
+        task_by_job_id: Mapping[uuid.UUID, str] | None = None,
+    ) -> None:
         """Try immediate delivery. A persisted job remains visible to the recovery loop."""
         try:
             async with asyncio.timeout(JOB_DELIVERY_TIMEOUT_SECONDS):
                 for job_id in job_ids:
+                    job_task = task_by_job_id.get(job_id) if task_by_job_id else None
                     if self.is_memory_mode:
-                        await self.enqueue("run_crash_job", str(job_id))
+                        await self.enqueue("run_crash_job", str(job_id), crash_task=job_task)
                     else:
-                        await enqueue_crash_job(await self._get_arq_pool(), job_id)
+                        await enqueue_crash_job(
+                            await self._get_arq_pool(),
+                            job_id,
+                            task=job_task,
+                            split_queues=self.split_queues_enabled,
+                        )
         except Exception:
             logger.warning("Crash jobs remain pending after delivery failure", exc_info=True)
 
@@ -223,9 +329,21 @@ class TaskDispatcher:
         factory = self.session_factory or get_session_factory()
         while True:
             try:
-                async with factory() as session:
-                    job_ids = await pending_crash_jobs(session)
-                await self.kick_crash_jobs(job_ids)
+                for batch_idx in range(RECOVERY_MAX_BATCHES_PER_TICK):
+                    async with factory() as session:
+                        pairs = await pending_crash_jobs_with_tasks(
+                            session,
+                            offset=batch_idx * RECOVERY_BATCH_SIZE,
+                            limit=RECOVERY_BATCH_SIZE,
+                        )
+                    if not pairs:
+                        break
+                    await self.kick_crash_jobs(
+                        [jid for jid, _ in pairs],
+                        task_by_job_id=dict(pairs),
+                    )
+                    if len(pairs) < RECOVERY_BATCH_SIZE:
+                        break
             except Exception:
                 logger.warning("Could not recover pending crash jobs", exc_info=True)
             await asyncio.sleep(5)

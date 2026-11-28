@@ -17,6 +17,7 @@ class CrashLogRead(BaseModel):
     raw_size: int
     compressed_size: int
     total_lines: int
+    is_indexing: bool = False
     digest_json: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -27,6 +28,7 @@ class LogSummaryResponse(BaseModel):
     raw_size: int
     compressed_size: int
     total_lines: int
+    is_indexing: bool = False
     digest: dict[str, Any] = Field(default_factory=dict)
 
 

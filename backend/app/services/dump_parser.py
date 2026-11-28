@@ -40,6 +40,7 @@ class ParsedDumpResult:
     parsed_summary_json: dict[str, Any]
     parsed_stacks_json: dict[str, Any]
     missing_symbols_json: list[dict[str, Any]]
+    public_cache_changed: bool = False
 
 
 def _cross_platform_basename(path_str: str) -> str:
@@ -421,12 +422,20 @@ async def parse_dump(
         base_cmd = [settings.MINIDUMP_STACKWALK_BIN, "--json"]
         pub_cache = storage.partition_path("symbols/public_cache")
         pub_cache.mkdir(parents=True, exist_ok=True)
+        tracks_public_downloads = False
         if settings.ENABLE_PUBLIC_SYMBOLS:
             breakpad_urls, _ = split_public_symbol_urls(settings.PUBLIC_SYMBOL_URLS)
             if breakpad_urls:
+                tracks_public_downloads = True
                 for url in breakpad_urls:
                     base_cmd.extend(["--symbols-url", url])
                 base_cmd.extend(["--symbols-cache", str(pub_cache)])
+
+        pub_before: tuple[int, int] | None = None
+        if tracks_public_downloads:
+            pub_before = await asyncio.to_thread(
+                storage.partition_used_bytes, "symbols/public_cache"
+            )
 
         exec_callable = exec_fn or asyncio.create_subprocess_exec
 
@@ -499,7 +508,13 @@ async def parse_dump(
                 break
             raw_json = await _run_stackwalk(extra_sym_dirs=[alias_dir])
 
-        return normalize_stackwalk_json(raw_json)
+        result = normalize_stackwalk_json(raw_json)
+        if tracks_public_downloads and pub_before is not None:
+            pub_after = await asyncio.to_thread(
+                storage.partition_used_bytes, "symbols/public_cache"
+            )
+            result.public_cache_changed = pub_after != pub_before
+        return result
 
 
 __all__ = [

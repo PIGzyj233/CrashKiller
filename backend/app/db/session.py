@@ -21,7 +21,13 @@ _session_factory: async_sessionmaker[AsyncSession] | None = None
 _active_database_url: str | None = None
 
 
-def create_async_engine_from_url(database_url: str, echo: bool = False) -> AsyncEngine:
+def create_async_engine_from_url(
+    database_url: str,
+    echo: bool = False,
+    *,
+    pool_size: int | None = None,
+    max_overflow: int | None = None,
+) -> AsyncEngine:
     """Create an AsyncEngine configured appropriately for SQLite or PostgreSQL."""
     if "sqlite" in database_url:
         kwargs: dict[str, Any] = {
@@ -44,11 +50,14 @@ def create_async_engine_from_url(database_url: str, echo: bool = False) -> Async
 
         return engine
 
+    settings = get_settings()
+    eff_pool_size = max(1, int(settings.DB_POOL_SIZE if pool_size is None else pool_size))
+    eff_overflow = max(0, int(settings.DB_MAX_OVERFLOW if max_overflow is None else max_overflow))
     return create_async_engine(
         database_url,
         echo=echo,
-        pool_size=10,
-        max_overflow=20,
+        pool_size=eff_pool_size,
+        max_overflow=eff_overflow,
         pool_pre_ping=True,
         pool_recycle=1800,
     )

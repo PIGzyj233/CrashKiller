@@ -105,6 +105,7 @@ export function VirtualLogViewer({
     [onSelectLog, resolvedActiveLogId],
   );
 
+  const isActiveLogIndexing = Boolean(activeLog?.is_indexing);
   const totalLines = activeLog?.total_lines ?? 0;
   const sessionTotalLines = activeLog
     ? (sessionTotalByLog[activeLog.id] ?? activeSessionDigest?.match_count ?? 0)
@@ -132,7 +133,12 @@ export function VirtualLogViewer({
     getItemKey: (index) =>
       `${resolvedActiveLogId}:${activeMode}:${windowStart + index}`,
     useFlushSync: false,
-    enabled: Boolean(activeLog && effectiveTotalLines > 0 && !activeGcError),
+    enabled: Boolean(
+      activeLog &&
+        !isActiveLogIndexing &&
+        effectiveTotalLines > 0 &&
+        !activeGcError,
+    ),
   });
 
   useEffect(() => {
@@ -455,6 +461,7 @@ export function VirtualLogViewer({
           virtualItems={virtualItems}
           windowStart={windowStart}
           currentLogLinesMap={currentLogLinesMap}
+          isIndexing={isActiveLogIndexing}
           activeGcError={activeGcError}
           activePageError={activePageError}
           effectiveTotalLines={effectiveTotalLines}

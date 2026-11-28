@@ -58,6 +58,7 @@ export function triggerGC(forceEmergency = false): Promise<GCReport> {
 export interface GetDashboardParams {
   project_id?: string;
   days?: number;
+  refresh?: boolean;
 }
 
 export function getDashboard(

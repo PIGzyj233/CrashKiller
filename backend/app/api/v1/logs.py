@@ -32,6 +32,11 @@ def _resolve_log_paths(
     storage: StorageManager,
 ) -> tuple[Path, Path]:
     if not log_row.zst_path or not log_row.idx_path:
+        if log_row.staged_raw_path:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Crash log is still being indexed; retry shortly",
+            )
         raise HTTPException(
             status_code=status.HTTP_410_GONE,
             detail="Compressed log artifact has been evicted by GC",
@@ -103,6 +108,7 @@ async def get_log_summary(
         raw_size=log_row.raw_size,
         compressed_size=log_row.compressed_size,
         total_lines=log_row.total_lines,
+        is_indexing=log_row.is_indexing,
         digest=dict(log_row.digest_json or {}),
     )
 

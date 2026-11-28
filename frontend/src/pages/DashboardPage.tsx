@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { AlertTriangle, LayoutDashboard, RefreshCw } from "lucide-react";
 import { ApiError, getDashboard } from "../api/client";
@@ -21,15 +21,25 @@ export function DashboardPage() {
   const { projects, selectedProject, selectedProjectId, isLoadingProjects } =
     useProjectContext();
   const [days, setDays] = useState<DaysOption>(14);
+  const forceRefreshRef = useRef(false);
 
   const dashboardQuery = useQuery({
     queryKey: ["dashboard", selectedProjectId || "all", days],
-    queryFn: () =>
-      getDashboard({
+    queryFn: () => {
+      const shouldRefresh = forceRefreshRef.current;
+      forceRefreshRef.current = false;
+      return getDashboard({
         project_id: selectedProjectId || undefined,
         days,
-      }),
+        refresh: shouldRefresh ? true : undefined,
+      });
+    },
   });
+
+  const handleRefresh = () => {
+    forceRefreshRef.current = true;
+    void dashboardQuery.refetch();
+  };
 
   const scopeLabel = selectedProject
     ? `${selectedProject.name} (${selectedProject.key})`
@@ -150,7 +160,7 @@ export function DashboardPage() {
 
           <button
             type="button"
-            onClick={() => void dashboardQuery.refetch()}
+            onClick={handleRefresh}
             disabled={dashboardQuery.isFetching}
             className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 shadow-sm hover:bg-slate-50 disabled:opacity-60"
           >
@@ -173,7 +183,7 @@ export function DashboardPage() {
           </div>
           <button
             type="button"
-            onClick={() => void dashboardQuery.refetch()}
+            onClick={handleRefresh}
             className="rounded-md border border-rose-300 bg-white px-3 py-1 text-xs font-medium text-rose-700 hover:bg-rose-100"
           >
             {t("common.retry")}

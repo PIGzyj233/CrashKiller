@@ -221,7 +221,11 @@ export function useLogPageCache({
             }));
           } else {
             const msg =
-              err instanceof Error ? err.message : t("log.fetchLinesFailed");
+              err instanceof ApiError && err.status === 409
+                ? t("log.indexingInProgress")
+                : err instanceof Error
+                  ? err.message
+                  : t("log.fetchLinesFailed");
             failedPagesRef.current.set(key, msg);
             setPageErrorByLog((prev) => ({
               ...prev,
@@ -356,7 +360,11 @@ export function useLogPageCache({
             }));
           } else {
             const msg =
-              err instanceof Error ? err.message : t("log.fetchLinesFailed");
+              err instanceof ApiError && err.status === 409
+                ? t("log.indexingInProgress")
+                : err instanceof Error
+                  ? err.message
+                  : t("log.fetchLinesFailed");
             sessionFailedPagesRef.current.set(key, msg);
             setPageErrorByLog((prev) => ({
               ...prev,

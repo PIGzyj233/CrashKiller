@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any, BinaryIO
@@ -33,6 +34,7 @@ class LogEngine:
         chunk_size_bytes: int = 262144,
         zstd_level: int = 6,
         session_id: str | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> dict[str, Any]:
         """Stream-ingest a raw log into 256KB newline-aligned zstd frames + .idx.json."""
         return _ingest_log(
@@ -42,6 +44,7 @@ class LogEngine:
             chunk_size_bytes=chunk_size_bytes,
             zstd_level=zstd_level,
             session_id=session_id,
+            cancel_event=cancel_event,
         )
 
     def _load_idx(self, idx_path: Path | str) -> dict[str, Any]:

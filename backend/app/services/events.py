@@ -1,4 +1,4 @@
-"""Real-time SSE event bus abstraction (InMemory for tests/memory:// and Redis PubSub)."""
+"""Real-time SSE event bus (InMemory for memory:// and multiplexed Redis PubSub)."""
 
 from __future__ import annotations
 
@@ -6,11 +6,11 @@ import asyncio
 import inspect
 import json
 import logging
-import time
 import uuid
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
 from typing import Any
 
 import redis.asyncio as aioredis
@@ -240,23 +240,116 @@ class InMemoryEventBus(EventBus):
 
 
 class _RedisSubscription(EventSubscription):
-    """Redis PubSub-backed subscription."""
+    """Queue-backed subscription multiplexed onto a single shared Redis PubSub connection."""
 
     def __init__(
         self,
         bus: RedisEventBus,
         channel: str,
-        poll_interval: float,
+        max_queue_size: int = 256,
     ) -> None:
         self._bus = bus
         self._channel = channel
-        self._poll_interval = poll_interval
-        self._pubsub: Any = None
+        self._queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue(
+            maxsize=max(1, max_queue_size),
+        )
+        self._registered = False
         self._closed = False
-        self._bus._active_subscriptions.add(self)
+
+    def _enqueue(self, item: dict[str, Any] | None) -> None:
+        if self._queue.full():
+            try:
+                self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+        try:
+            self._queue.put_nowait(item)
+        except asyncio.QueueFull:
+            pass
+
+    async def _ensure_registered(self) -> None:
+        if self._closed or self._bus._closed:
+            raise StopAsyncIteration
+        if not self._registered:
+            await self._bus._register_subscription(self)
+            self._registered = True
+
+    async def __aenter__(self) -> EventSubscription:
+        try:
+            await self._ensure_registered()
+        except BaseException:
+            await self.close()
+            raise
+        return self
+
+    async def get(self, timeout: float | None = None) -> dict[str, Any]:
+        if not self._registered and not self._closed:
+            await self._ensure_registered()
+        if self._closed and self._queue.empty():
+            raise StopAsyncIteration
+        if timeout is None:
+            item = await self._queue.get()
+        else:
+            item = await asyncio.wait_for(self._queue.get(), timeout=timeout)
+        if item is None:
+            raise StopAsyncIteration
+        return item
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        was_registered = self._registered
+        self._registered = False
+        if was_registered or self in self._bus._active_subscriptions:
+            await self._bus._unregister_subscription(self)
+        self._enqueue(None)
+
+
+@dataclass
+class _ChannelSetup:
+    event: asyncio.Event = field(default_factory=asyncio.Event)
+    succeeded: bool = False
+    error: BaseException | None = None
+
+
+class RedisEventBus(EventBus):
+    """Multiplexed single-connection Redis PubSub event bus for API <-> Worker SSE."""
+
+    def __init__(
+        self,
+        redis_url: str,
+        *,
+        redis_client: Any = None,
+        poll_interval: float = 0.5,
+        max_queue_size: int = 256,
+    ) -> None:
+        self._redis_url = redis_url
+        self._redis: Any = redis_client
+        self._owns_client: bool = redis_client is None
+        self._poll_interval = max(0.01, float(poll_interval))
+        self._max_queue_size = max(1, int(max_queue_size))
+        self._active_subscriptions: set[_RedisSubscription] = set()
+        self._channel_subscribers: dict[str, set[_RedisSubscription]] = defaultdict(set)
+        self._channel_subscribed: set[str] = set()
+        self._channel_ready: dict[str, _ChannelSetup] = {}
+        self._pubsub: Any = None
+        self._reader_task: asyncio.Task[None] | None = None
+        self._state_lock = asyncio.Lock()
+        self._pubsub_op_lock = asyncio.Lock()
+        self._pending_subscribes: int = 0
+        self._closed = False
+
+    def _get_client(self) -> Any:
+        if self._redis is None:
+            self._redis = aioredis.from_url(self._redis_url, decode_responses=True)
+            self._owns_client = True
+        return self._redis
 
     @staticmethod
-    async def _close_pubsub(pubsub: Any) -> None:
+    async def _close_pubsub_obj(pubsub: Any) -> None:
+        if pubsub is None:
+            return
         aclose = getattr(pubsub, "aclose", None)
         if callable(aclose):
             res = aclose()
@@ -269,115 +362,321 @@ class _RedisSubscription(EventSubscription):
             if inspect.isawaitable(res):
                 await res
 
-    async def _ensure_subscribed(self) -> Any:
-        if self._closed or self._bus._closed:
-            raise StopAsyncIteration
-        if self._pubsub is None:
-            client = self._bus._get_client()
-            pubsub = client.pubsub()
-            try:
-                await pubsub.subscribe(self._channel)
-            except BaseException:
-                await self._close_pubsub(pubsub)
-                raise
-            if self._closed or self._bus._closed:
-                await self._close_pubsub(pubsub)
-                raise StopAsyncIteration
-            self._pubsub = pubsub
-        return self._pubsub
-
-    async def __aenter__(self) -> EventSubscription:
-        try:
-            await self._ensure_subscribed()
-        except BaseException:
-            self._bus._active_subscriptions.discard(self)
-            await self.close()
-            raise
-        return self
-
-    async def get(self, timeout: float | None = None) -> dict[str, Any]:
-        pubsub = await self._ensure_subscribed()
-        deadline = None if timeout is None else time.monotonic() + timeout
-
-        while not self._closed and not self._bus._closed:
-            if deadline is not None:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError("Timed out waiting for Redis PubSub event")
-                step_timeout = min(self._poll_interval, remaining)
-            else:
-                step_timeout = self._poll_interval
-
-            message = await pubsub.get_message(
-                ignore_subscribe_messages=True,
-                timeout=step_timeout,
+    def _start_reader_locked(self) -> None:
+        if self._reader_task is None or self._reader_task.done():
+            self._reader_task = asyncio.create_task(
+                self._reader_loop(),
+                name="crashkiller-redis-eventbus-reader",
             )
-            if message is None:
-                # Yield control briefly so fake/mock pubsubs returning None immediately
-                # don't spin tightly without yielding to other coroutines.
-                await asyncio.sleep(0)
-                continue
 
-            if message.get("type") not in (None, "message", "pmessage"):
-                continue
-
-            raw_data = message.get("data")
-            if isinstance(raw_data, bytes):
-                raw_data = raw_data.decode("utf-8", errors="replace")
-            if isinstance(raw_data, str):
-                try:
-                    parsed = json.loads(raw_data)
-                except json.JSONDecodeError:
-                    logger.warning("Ignoring non-JSON event on channel %s", self._channel)
-                    continue
-            elif isinstance(raw_data, dict):
-                parsed = raw_data
-            else:
-                continue
-
-            if isinstance(parsed, dict):
-                return parsed
-
-        raise StopAsyncIteration
-
-    async def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        self._bus._active_subscriptions.discard(self)
+    async def _teardown_shared_pubsub_locked(self) -> None:
+        reader = self._reader_task
+        self._reader_task = None
         pubsub = self._pubsub
         self._pubsub = None
-        if pubsub is not None:
+        self._channel_subscribed.clear()
+        if reader is not None and not reader.done() and reader is not asyncio.current_task():
+            reader.cancel()
+            await asyncio.gather(reader, return_exceptions=True)
+        await self._close_pubsub_obj(pubsub)
+
+    def _dispatch_message(self, message: dict[str, Any]) -> None:
+        if message.get("type") not in (None, "message", "pmessage"):
+            return
+        raw_data = message.get("data")
+        if isinstance(raw_data, bytes):
+            raw_data = raw_data.decode("utf-8", errors="replace")
+        if isinstance(raw_data, str):
             try:
-                await pubsub.unsubscribe(self._channel)
+                parsed = json.loads(raw_data)
+            except json.JSONDecodeError:
+                logger.warning("Ignoring non-JSON event on Redis PubSub")
+                return
+        elif isinstance(raw_data, dict):
+            parsed = raw_data
+        else:
+            return
+        if not isinstance(parsed, dict):
+            return
+
+        raw_channel = message.get("channel")
+        if isinstance(raw_channel, bytes):
+            channel = raw_channel.decode("utf-8", errors="replace")
+        elif isinstance(raw_channel, str) and raw_channel:
+            channel = raw_channel
+        elif parsed.get("crash_id"):
+            channel = crash_channel(str(parsed["crash_id"]))
+        else:
+            return
+
+        for sub in list(self._channel_subscribers.get(channel, ())):
+            sub._enqueue(dict(parsed))
+
+    async def _reader_loop(self) -> None:
+        backoff = 0.1
+        try:
+            while not self._closed and self._active_subscriptions:
+                pubsub = self._pubsub
+                if pubsub is None:
+                    await asyncio.sleep(backoff)
+                    backoff = min(2.0, backoff * 2.0)
+                    if self._closed or not self._active_subscriptions:
+                        return
+                    reconnected = await self._reconnect_pubsub()
+                    if reconnected:
+                        backoff = 0.1
+                    continue
+                try:
+                    message = await pubsub.get_message(
+                        ignore_subscribe_messages=True,
+                        timeout=self._poll_interval,
+                    )
+                    backoff = 0.1
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    if self._closed or not self._active_subscriptions:
+                        return
+                    logger.warning(
+                        "RedisEventBus reader error; reconnecting in %.2fs",
+                        backoff,
+                        exc_info=True,
+                    )
+                    async with self._state_lock:
+                        broken = self._pubsub
+                        self._pubsub = None
+                        self._channel_subscribed.clear()
+                        await self._close_pubsub_obj(broken)
+                    await asyncio.sleep(backoff)
+                    backoff = min(2.0, backoff * 2.0)
+                    reconnected = await self._reconnect_pubsub()
+                    if reconnected:
+                        backoff = 0.1
+                    continue
+
+                if message is None:
+                    await asyncio.sleep(0)
+                    continue
+                self._dispatch_message(message)
+        except asyncio.CancelledError:
+            raise
+
+    async def _reconnect_pubsub(self) -> bool:
+        async with self._pubsub_op_lock:
+            async with self._state_lock:
+                if self._closed or not self._active_subscriptions:
+                    return False
+                old = self._pubsub
+                self._pubsub = None
+                self._channel_subscribed.clear()
+                await self._close_pubsub_obj(old)
+                channels = list(self._channel_subscribers.keys())
+                if not channels:
+                    return False
+
+            new_pubsub: Any = None
+            try:
+                client = self._get_client()
+                new_pubsub = client.pubsub()
+                for ch in channels:
+                    await new_pubsub.subscribe(ch)
+            except asyncio.CancelledError:
+                await self._close_pubsub_obj(new_pubsub)
+                raise
             except Exception:
-                logger.debug("Ignoring unsubscribe error on %s", self._channel, exc_info=True)
-            finally:
-                await self._close_pubsub(pubsub)
+                await self._close_pubsub_obj(new_pubsub)
+                return False
 
+            extra_channels: list[str] = []
+            async with self._state_lock:
+                if self._closed or not self._active_subscriptions:
+                    await self._close_pubsub_obj(new_pubsub)
+                    return False
+                if self._pubsub is not None:
+                    await self._close_pubsub_obj(new_pubsub)
+                    return True
+                subscribed = set(channels)
+                extra_channels = [
+                    ch for ch in self._channel_subscribers if ch not in subscribed
+                ]
+                if not extra_channels:
+                    self._pubsub = new_pubsub
+                    self._channel_subscribed = set(channels)
+                    return True
 
-class RedisEventBus(EventBus):
-    """Redis PubSub-backed event bus for multi-process API <-> ARQ worker SSE."""
+            try:
+                for ch in extra_channels:
+                    await new_pubsub.subscribe(ch)
+            except asyncio.CancelledError:
+                await self._close_pubsub_obj(new_pubsub)
+                raise
+            except Exception:
+                await self._close_pubsub_obj(new_pubsub)
+                return False
 
-    def __init__(
-        self,
-        redis_url: str,
-        *,
-        redis_client: Any = None,
-        poll_interval: float = 0.5,
-    ) -> None:
-        self._redis_url = redis_url
-        self._redis: Any = redis_client
-        self._owns_client: bool = redis_client is None
-        self._poll_interval = poll_interval
-        self._active_subscriptions: set[_RedisSubscription] = set()
-        self._closed = False
+            async with self._state_lock:
+                if self._closed or not self._active_subscriptions:
+                    await self._close_pubsub_obj(new_pubsub)
+                    return False
+                if self._pubsub is not None:
+                    await self._close_pubsub_obj(new_pubsub)
+                    return True
+                self._pubsub = new_pubsub
+                self._channel_subscribed = set(channels) | set(extra_channels)
+            return True
 
-    def _get_client(self) -> Any:
-        if self._redis is None:
-            self._redis = aioredis.from_url(self._redis_url, decode_responses=True)
-            self._owns_client = True
-        return self._redis
+    async def _register_subscription(self, sub: _RedisSubscription) -> None:
+        channel = sub._channel
+
+        while True:
+            is_leader = False
+            setup: _ChannelSetup | None = None
+            pubsub: Any = None
+
+            async with self._state_lock:
+                if self._closed or sub._closed:
+                    raise StopAsyncIteration
+                self._active_subscriptions.add(sub)
+                self._channel_subscribers[channel].add(sub)
+                if channel in self._channel_subscribed and self._pubsub is not None:
+                    self._start_reader_locked()
+                    return
+                setup = self._channel_ready.get(channel)
+                if setup is None:
+                    setup = _ChannelSetup()
+                    self._channel_ready[channel] = setup
+                    self._pending_subscribes += 1
+                    is_leader = True
+
+            if is_leader:
+                assert setup is not None
+                try:
+                    # Serialize connection creation and SUBSCRIBE commands on the shared
+                    # redis-py PubSub instance so concurrent first subscribers never open
+                    # competing TCP connections and lose live messages.
+                    async with self._pubsub_op_lock:
+                        async with self._state_lock:
+                            if self._closed or sub._closed:
+                                raise StopAsyncIteration
+                            if self._pubsub is None:
+                                client = self._get_client()
+                                self._pubsub = client.pubsub()
+                            pubsub = self._pubsub
+                        await pubsub.subscribe(channel)
+                except BaseException as exc:
+                    async with self._state_lock:
+                        self._pending_subscribes = max(0, self._pending_subscribes - 1)
+                        subs = self._channel_subscribers.get(channel)
+                        if subs is not None:
+                            subs.discard(sub)
+                            if not subs:
+                                self._channel_subscribers.pop(channel, None)
+                        if self._channel_ready.get(channel) is setup:
+                            self._channel_ready.pop(channel, None)
+                        self._active_subscriptions.discard(sub)
+                        if not isinstance(exc, asyncio.CancelledError):
+                            setup.error = exc
+                        setup.event.set()
+                        if self._closed or (
+                            not self._active_subscriptions and self._pending_subscribes == 0
+                        ):
+                            await self._teardown_shared_pubsub_locked()
+                    raise
+
+                should_unsub = False
+                async with self._state_lock:
+                    self._pending_subscribes = max(0, self._pending_subscribes - 1)
+                    if self._pubsub is pubsub and not self._closed:
+                        self._channel_subscribed.add(channel)
+                        setup.succeeded = True
+                    if self._channel_ready.get(channel) is setup:
+                        self._channel_ready.pop(channel, None)
+                    setup.event.set()
+                    if self._closed or sub._closed:
+                        subs = self._channel_subscribers.get(channel)
+                        if subs is not None:
+                            subs.discard(sub)
+                            if not subs:
+                                self._channel_subscribers.pop(channel, None)
+                                self._channel_subscribed.discard(channel)
+                                should_unsub = True
+                        self._active_subscriptions.discard(sub)
+                    else:
+                        self._start_reader_locked()
+                        return
+
+                if should_unsub and pubsub is not None and not self._closed:
+                    async with self._pubsub_op_lock:
+                        if self._pubsub is pubsub and not self._closed:
+                            try:
+                                await pubsub.unsubscribe(channel)
+                            except Exception:
+                                pass
+                async with self._state_lock:
+                    if (
+                        (self._closed or not self._active_subscriptions)
+                        and self._pending_subscribes == 0
+                    ):
+                        await self._teardown_shared_pubsub_locked()
+                raise StopAsyncIteration
+
+            assert setup is not None
+            try:
+                await setup.event.wait()
+            except BaseException:
+                await self._unregister_subscription(sub)
+                raise
+
+            if setup.error is not None:
+                await self._unregister_subscription(sub)
+                raise setup.error
+
+            if setup.succeeded:
+                async with self._state_lock:
+                    if self._closed or sub._closed:
+                        subs = self._channel_subscribers.get(channel)
+                        if subs is not None:
+                            subs.discard(sub)
+                            if not subs:
+                                self._channel_subscribers.pop(channel, None)
+                        self._active_subscriptions.discard(sub)
+                        if not self._active_subscriptions and self._pending_subscribes == 0:
+                            await self._teardown_shared_pubsub_locked()
+                        raise StopAsyncIteration
+                    if channel in self._channel_subscribed and self._pubsub is not None:
+                        self._start_reader_locked()
+                        return
+            # Leader was cancelled before subscribing or pubsub reconnected; loop to promote
+            # this waiter to leader and subscribe the channel itself.
+
+    async def _unregister_subscription(self, sub: _RedisSubscription) -> None:
+        channel = sub._channel
+        should_unsub = False
+        pubsub: Any = None
+        async with self._state_lock:
+            subs = self._channel_subscribers.get(channel)
+            if subs is not None:
+                subs.discard(sub)
+                if not subs:
+                    self._channel_subscribers.pop(channel, None)
+                    self._channel_ready.pop(channel, None)
+                    was_subscribed = channel in self._channel_subscribed
+                    self._channel_subscribed.discard(channel)
+                    should_unsub = was_subscribed
+            self._active_subscriptions.discard(sub)
+            pubsub = self._pubsub
+
+        if should_unsub and pubsub is not None and not self._closed:
+            async with self._pubsub_op_lock:
+                if self._pubsub is pubsub and not self._closed:
+                    try:
+                        await pubsub.unsubscribe(channel)
+                    except Exception:
+                        logger.debug("Ignoring unsubscribe error on %s", channel, exc_info=True)
+
+        async with self._state_lock:
+            if not self._active_subscriptions and self._pending_subscribes == 0:
+                await self._teardown_shared_pubsub_locked()
 
     async def publish(
         self,
@@ -394,25 +693,36 @@ class RedisEventBus(EventBus):
         return _RedisSubscription(
             bus=self,
             channel=crash_channel(crash_id),
-            poll_interval=self._poll_interval,
+            max_queue_size=self._max_queue_size,
         )
 
     async def close(self) -> None:
         if self._closed:
             return
         self._closed = True
+        for setup in list(self._channel_ready.values()):
+            setup.event.set()
         for sub in list(self._active_subscriptions):
-            await sub.close()
+            sub._closed = True
+            sub._registered = False
+            sub._enqueue(None)
         self._active_subscriptions.clear()
-        if self._owns_client and self._redis is not None:
-            aclose = getattr(self._redis, "aclose", None)
-            if callable(aclose):
-                await aclose()
-            else:
-                close_fn = getattr(self._redis, "close", None)
-                if callable(close_fn):
-                    await close_fn()
-        self._redis = None
+        self._channel_subscribers.clear()
+        self._channel_subscribed.clear()
+        self._channel_ready.clear()
+
+        async with self._state_lock:
+            if self._pending_subscribes == 0:
+                await self._teardown_shared_pubsub_locked()
+            if self._owns_client and self._redis is not None:
+                aclose = getattr(self._redis, "aclose", None)
+                if callable(aclose):
+                    await aclose()
+                else:
+                    close_fn = getattr(self._redis, "close", None)
+                    if callable(close_fn):
+                        await close_fn()
+            self._redis = None
 
 
 _event_bus: EventBus | None = None

@@ -50,6 +50,8 @@ class Settings(BaseSettings):
     API_V1_PREFIX: str = "/api/v1"
     CORS_ORIGINS: StrList = []
     HTTP_PORT: int = 8080
+    UVICORN_WORKERS: int = 2
+    DASHBOARD_CACHE_TTL_SECONDS: int = 0
     ADMIN_USERNAME: str = ""
     ADMIN_PASSWORD: SecretStr = SecretStr("")
     ALLOW_UNAUTHENTICATED_SYMSRV: bool = False
@@ -61,9 +63,14 @@ class Settings(BaseSettings):
     DATABASE_URL: str = (
         "postgresql+asyncpg://crashkiller:crashkiller@postgres:5432/crashkiller"
     )
+    DB_POOL_SIZE: int = 5
+    DB_MAX_OVERFLOW: int = 10
 
-    # --- Redis ---
+    # --- Redis & Workers ---
     REDIS_URL: str = "redis://redis:6379/0"
+    SPLIT_WORKER_QUEUES: bool = False
+    COMPUTE_WORKER_MAX_JOBS: int = 4
+    IO_WORKER_MAX_JOBS: int = 16
 
     # --- Host Storage & Partition Layout ---
     CRASHKILLER_DATA_PATH: str = "./data"
